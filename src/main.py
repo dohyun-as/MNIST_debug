@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed, tqdm  # ✅ tqdm 추가
+from accelerate.utils import set_seed, tqdm  # tqdm from accelerate
 
 from diffusers import DDPMScheduler, DDIMScheduler
 from torchvision.utils import make_grid, save_image
@@ -63,6 +63,21 @@ def parse_args():
                         help="Number of diffusion steps for eval sampling.")
     parser.add_argument("--eval_num_samples_per_class", type=int, default=8,
                         help="How many samples to generate per class during eval.")
+
+    # accelerate 관련 옵션
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="no",
+        choices=["no", "fp16", "bf16"],
+        help="Accelerate mixed precision mode.",
+    )
+    parser.add_argument(
+        "--log_with",
+        type=str,
+        default=None,
+        help='Accelerate tracker backend, e.g. "tensorboard" or "wandb".',
+    )
 
     args = parser.parse_args()
     return args
@@ -130,11 +145,25 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    accelerator = Accelerator()
+    # Accelerator 설정: mixed_precision / grad_accum / tracker 백엔드까지 여기서 지정
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.grad_accum_steps,
+        log_with=args.log_with,
+    )
+
+    # 시드: 프로세스마다 다르게
     set_seed(args.seed + accelerator.process_index)
 
     if accelerator.is_main_process:
         print("Arguments:", args)
+
+    # 트래커 (원하면 tensorboard / wandb 등)
+    if accelerator.is_main_process and args.log_with is not None:
+        accelerator.init_trackers(
+            project_name="mnist_diffusion",
+            config=vars(args),
+        )
 
     # -----------------------
     # UNet config 로드
@@ -208,11 +237,11 @@ def main():
     device = accelerator.device
     global_step = 0
 
-    # 🔹 에폭 개수/스텝 수 정리
+    # 에폭/스텝 계산
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.grad_accum_steps)
     num_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # 🔹 HF 스타일 progress bar
+    # HF 스타일 progress bar (step 기준)
     progress_bar = tqdm(
         range(global_step, args.max_train_steps),
         disable=not accelerator.is_local_main_process,
@@ -274,13 +303,13 @@ def main():
                 }
                 progress_bar.set_postfix(**logs)
 
-                # (옵션) accelerator tracker로도 로깅 (init_trackers 안 했으면 그냥 no-op)
+                # 🔹 accelerator tracker 로깅 (tensorboard / wandb 등)
                 accelerator.log(
                     {"train/step_loss": avg_loss, "train/lr": optimizer.param_groups[0]["lr"]},
                     step=global_step,
                 )
 
-                # 기존 콘솔 로그도 유지 (간격 널널하게)
+                # 콘솔 로그 (간격 널널하게)
                 if accelerator.is_main_process and (global_step % args.log_every == 0):
                     print(
                         f"Step [{global_step}/{args.max_train_steps}] "

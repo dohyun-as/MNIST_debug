@@ -1,0 +1,21 @@
+{
+  "sample_size": 32,
+  "in_channels": 1,
+  "out_channels": 1,
+  "layers_per_block": 2,
+  "block_out_channels": [64, 128, 256, 256],
+  "down_block_types": [
+    "DownBlock2D",
+    "CrossAttnDownBlock2D",
+    "CrossAttnDownBlock2D",
+    "CrossAttnDownBlock2D"
+  ],
+  "up_block_types": [
+    "CrossAttnUpBlock2D",
+    "CrossAttnUpBlock2D",
+    "CrossAttnUpBlock2D",
+    "UpBlock2D"
+  ],
+  "cross_attention_dim": 128,
+  "attention_head_dim": 4
+}

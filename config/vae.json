@@ -1,0 +1,19 @@
+{
+  "target": "ldm.ldm.models.autoencoder.AutoencoderKL",
+  "params": {
+    "embed_dim": 16,
+    "ddconfig": {
+      "double_z": true,
+      "z_channels": 16,
+      "resolution": 288,
+      "in_channels": 1,
+      "out_ch": 1,
+      "ch": 128,
+      "ch_mult": [1, 1, 2, 2, 4],
+      "num_res_blocks": 2,
+      "attn_resolutions": [16],
+      "dropout": 0.0
+    }
+  },
+  "ckpt_path": "/home/dohyunk/project2/ldm_vae_ckpt/2025-11-03T17-32-02_autoencoder_kl_16x16x16_resize_mask/checkpoints/epoch=000012.ckpt"
+}

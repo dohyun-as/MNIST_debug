@@ -64,12 +64,22 @@ class MNISTConditionalDataset(Dataset):
 
         transform = transforms.Compose(transform_list)
 
-        self.dataset = datasets.MNIST(
+        mnist = datasets.MNIST(
             root=root,
             train=train,
             transform=transform,
             download=download,
         )
+
+        # 🔹 label 0 제거
+        # mnist.targets: (N,) tensor, mnist.data: (N, 28, 28) tensor
+        targets = mnist.targets
+        mask = targets != 0  # 0 아닌 것만 True
+
+        mnist.data = mnist.data[mask]
+        mnist.targets = mnist.targets[mask]
+
+        self.dataset = mnist
 
     def __len__(self):
         return len(self.dataset)

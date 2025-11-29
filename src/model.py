@@ -11,15 +11,25 @@ class SimpleImageEncoder(nn.Module):
     def __init__(self, in_channels: int = 1, cond_dim: int = 128):
         super().__init__()
         self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1),  # 288 -> 144
+            nn.GroupNorm(8, 64),
+            nn.SiLU(inplace=True),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),          # 144 -> 72
+            nn.GroupNorm(8, 128),
+            nn.SiLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),         # 72 -> 36
+            nn.GroupNorm(16, 256),
+            nn.SiLU(inplace=True),
+
+            nn.Conv2d(256, cond_dim, kernel_size=3, stride=2, padding=1),    # 36 -> 18
+            nn.GroupNorm(16, cond_dim),
+            nn.SiLU(inplace=True),
+            
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.proj = nn.Linear(128, cond_dim)
+        self.proj = nn.Linear(cond_dim, cond_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.cnn(x)               # (B, 128, 1, 1)
@@ -58,6 +68,9 @@ class ConditionalUNet(nn.Module):
         cond_dim: int | None = None,
         cond_in_channels: int = 1,     # image conditioning 시 cond_image 채널 수
         unet_config: dict | None = None,
+        grid_conditioning: bool = False, 
+        grid_vocab_size: int = 10, 
+        grid_hw: int = 9,
     ):
         super().__init__()
 
@@ -70,6 +83,8 @@ class ConditionalUNet(nn.Module):
         else:
             self.cond_dim = class_embed_dim
 
+
+        self.grid_conditioning = grid_conditioning
         self.image_conditioning = image_conditioning
 
         # 2) image conditioning일 때 encoder 설정
@@ -81,11 +96,25 @@ class ConditionalUNet(nn.Module):
                 )
             else:
                 self.encoder = encoder
+                
+        elif self.grid_conditioning:
+            self.grid_hw = grid_hw
+            self.grid_vocab_size = grid_vocab_size
+            # 숫자 embedding
+            self.grid_embed = nn.Embedding(grid_vocab_size, self.cond_dim)
+            # 2D positional embedding
+            self.grid_pos_embed = nn.Parameter(
+                torch.zeros(1, grid_hw * grid_hw, self.cond_dim)
+            )
+            nn.init.trunc_normal_(self.grid_pos_embed, std=0.02)
+
+            self.encoder = None
+            self.class_embedding = None
+
         else:
             self.encoder = None
-
-        # 3) label embedding (B,) -> (B, cond_dim)
-        self.class_embedding = nn.Embedding(num_classes, self.cond_dim)
+            # 3) label embedding (B,) -> (B, cond_dim)
+            self.class_embedding = nn.Embedding(num_classes, self.cond_dim)
 
         # 4) UNet2DConditionModel 설정
         if unet_config is None:
@@ -131,6 +160,7 @@ class ConditionalUNet(nn.Module):
         y: torch.Tensor | None = None,
         cond_image: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
+        grid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         조건을 UNet이 바로 쓸 수 있는 encoder_hidden_states (B, L, D)로 변환.
@@ -147,6 +177,19 @@ class ConditionalUNet(nn.Module):
         # 1) 이미 인코딩된 상태가 들어온 경우
         if encoder_hidden_states is not None:
             h = encoder_hidden_states
+
+        elif self.grid_conditioning:
+            if grid is None:
+                raise ValueError("grid_conditioning=True 인데 grid가 없음")
+            g = grid.to(torch.long)
+
+            emb = self.grid_embed(g)      # (B, H, W, D)
+            B, H, W, D = emb.shape
+            tokens = emb.view(B, H * W, D)  # (B, L, D), L=H*W
+
+            # pos emb: H*W에 맞게 앞부분만 사용
+            pos = self.grid_pos_embed[:, : H * W, :]  # (1, L, D)
+            h = tokens + pos
 
         # 2) image conditioning 모드
         elif self.image_conditioning:
@@ -185,6 +228,7 @@ class ConditionalUNet(nn.Module):
         y: torch.Tensor | None = None,
         cond_image: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
+        grid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         x_t: (B, 1, H, W)
@@ -199,6 +243,7 @@ class ConditionalUNet(nn.Module):
             y=y,
             cond_image=cond_image,
             encoder_hidden_states=encoder_hidden_states,
+            grid=grid,
         )
 
         out = self.unet(

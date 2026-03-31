@@ -210,7 +210,6 @@ class ConditionalUNet(nn.Module):
         # --- concat conditioning 옵션 ---
         concat_conditioning: bool = False,
         concat_downsample_factor: int = 16,
-        concat_channels: int = 4,
         # ---------------------------------------
         use_fsq: bool = True,
         fsq_levels: list[int] = [8, 8, 8, 5],
@@ -237,7 +236,7 @@ class ConditionalUNet(nn.Module):
             self.cond_dim = class_embed_dim
 
         self.concat_conditioning = concat_conditioning
-        self.concat_channels = int(concat_channels)
+        self.concat_channels = self.cond_dim
         self.concat_downsample_factor = concat_downsample_factor
 
 
@@ -294,7 +293,7 @@ class ConditionalUNet(nn.Module):
                 codebook_size=vq_codebook_size,        # <- 원하는 vocab 크기 (예: 9, 33, 256, 512, 1024 ...)
                 vq_dim=None,              # None이면 slot_dim 그대로 quantize
                 beta=vq_beta,              # VQ loss 내에서 사용되는 commitment loss 계수
-                use_ema=False,             # 추천
+                use_ema=True,             # 추천
                 ema_decay=0.99,
                 drop_quant_p=fsq_drop_quant_p,
                 corrupt_tokens_p=fsq_corrupt_tokens_p,
@@ -347,8 +346,8 @@ class ConditionalUNet(nn.Module):
             nn.Conv2d(self.cond_dim, self.cond_dim, kernel_size=3, padding=1),
             nn.GroupNorm(min(8, self.cond_dim), self.cond_dim),
             nn.SiLU(inplace=True),
-            nn.Conv2d(self.cond_dim, self.concat_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(min(8, self.concat_channels), self.concat_channels),
+            nn.Conv2d(self.cond_dim, self.cond_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, self.cond_dim), self.cond_dim),
             nn.SiLU(inplace=True),
             )       
         else:
@@ -574,16 +573,7 @@ class ConditionalUNet(nn.Module):
             if self.cond_up is not None:
                 cond_2d = self.cond_up(cond_2d)  # (B,D,H,W)
 
-            if self.training and torch.rand(1).item() < 0.01:  # 너무 자주 찍히는 거 방지
-                with torch.no_grad():
-                    c = cond_2d.detach().float()
-                    print(
-                        "[cond_2d]",
-                        f"min={c.min().item():.4f}",
-                        f"max={c.max().item():.4f}",
-                        f"mean={c.mean().item():.4f}",
-                        f"std={c.std().item():.4f}",
-                    )
+
             x_in = torch.cat([x_t, cond_2d], dim=1)  # (B, 1+D, H, W)
 
         # print("x_in", x_in.shape)

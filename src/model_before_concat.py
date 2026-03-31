@@ -3,101 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fsq import FSQ
-from Discretizer import FSQDiscretizer, VQDiscretizer
-from diffusers import UNet2DConditionModel, UNet2DModel
+from Discretizer import FSQDiscretizer
+from diffusers import UNet2DConditionModel
 
-
-class PatchImageCondition2DEncoder(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 1,
-        feat_channels: int = 128,
-        grid_size: int = 9,
-        base_channels: int = 64,
-        blocks_per_stage: int = 2,
-        use_pos_emb: bool = True,
-    ):
-        super().__init__()
-        self.feat_channels = feat_channels
-        self.grid_size = grid_size
-
-        # [1] Stem: 초기 채널 확장
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 3, padding=1),
-            nn.GroupNorm(min(8, base_channels), base_channels),
-            nn.SiLU(inplace=True)
-        )
-
-        # [2] Hierarchical Stages: MNIST 한 장을 제대로 훑는 구조
-        # Stage 1: 32x32 -> 16x16
-        self.layer1 = self._make_layer(base_channels, base_channels * 2, blocks_per_stage, down=True)
-        
-        # Stage 2: 16x16 -> 8x8
-        self.layer2 = self._make_layer(base_channels * 2, base_channels * 4, blocks_per_stage, down=True)
-        
-        # Stage 3: 8x8 -> 4x4 (숫자의 고수준 특징 추출)
-        self.layer3 = self._make_layer(base_channels * 4, base_channels * 4, blocks_per_stage, down=True)
-
-        final_ch = base_channels * 4
-
-        # [3] Final Projection
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.proj = nn.Sequential(
-            nn.Linear(final_ch, feat_channels),
-            nn.LayerNorm(feat_channels),
-            nn.SiLU(inplace=True)
-        )
-
-        # (선택) 2D positional embedding
-        self.use_pos_emb = use_pos_emb
-        if use_pos_emb:
-            self.pos_emb = nn.Parameter(torch.zeros(1, feat_channels, grid_size, grid_size))
-            nn.init.trunc_normal_(self.pos_emb, std=0.02)
-
-    def _make_layer(self, c_in, c_out, blocks, down):
-        layers = [ResBlock2D(c_in, c_out, down=down)]
-        for _ in range(blocks - 1):
-            layers.append(ResBlock2D(c_out, c_out, down=False))
-        return nn.Sequential(*layers)
-
-    def _pad_to_grid(self, x: torch.Tensor):
-        B, C, H, W = x.shape
-        Gh = Gw = self.grid_size
-        newH = int(math.ceil(H / Gh) * Gh)
-        newW = int(math.ceil(W / Gw) * Gw)
-        padH, padW = newH - H, newW - W
-        if padH > 0 or padW > 0:
-            x = F.pad(x, (0, padW, 0, padH), mode="replicate")
-        return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._pad_to_grid(x)
-        B, C, H, W = x.shape
-        Gh = Gw = self.grid_size
-        ph, pw = H // Gh, W // Gw
-
-        # 1. Patch 분리: (B*81, C, ph, pw)
-        patches = F.unfold(x, kernel_size=(ph, pw), stride=(ph, pw))
-        patches = patches.transpose(1, 2).contiguous().view(B * Gh * Gw, C, ph, pw)
-
-        # 2. Deep Encoding
-        h = self.stem(patches)
-        h = self.layer1(h)
-        h = self.layer2(h)
-        h = self.layer3(h) # (B*81, final_ch, 4, 4) 수준까지 압축
-        
-        h = self.pool(h).flatten(1) # (B*81, final_ch)
-        h = self.proj(h)            # (B*81, feat_channels)
-
-        # 3. 격자 형태로 재구성: (B, Cfeat, 9, 9)
-        feat = h.view(B, Gh * Gw, self.feat_channels).transpose(1, 2).contiguous()
-        feat = feat.view(B, self.feat_channels, Gh, Gw)
-
-        if self.use_pos_emb:
-            feat = feat + self.pos_emb
-
-        return feat
-    
 class ResBlock2D(nn.Module):
     def __init__(self, c_in, c_out, down=False, groups=8):
         super().__init__()
@@ -210,20 +118,11 @@ class ConditionalUNet(nn.Module):
         # --- concat conditioning 옵션 ---
         concat_conditioning: bool = False,
         concat_downsample_factor: int = 16,
-        concat_channels: int = 4,
         # ---------------------------------------
         use_fsq: bool = True,
         fsq_levels: list[int] = [8, 8, 8, 5],
         fsq_drop_quant_p: float = 0.0,
         fsq_corrupt_tokens_p: float = 0.0,
-        # ---------------------------------------
-        vq_codebook_size: int = 9,
-        vq_beta: float = 0.25,
-        use_vq_discretizer : bool = False,
-        # ---------------------------------------
-        patch_conditioning: bool = False,
-        patch_grid_size: int = 9,
-        patch_use_pos_emb: bool = False,
     ):
         super().__init__()
 
@@ -237,7 +136,7 @@ class ConditionalUNet(nn.Module):
             self.cond_dim = class_embed_dim
 
         self.concat_conditioning = concat_conditioning
-        self.concat_channels = int(concat_channels)
+        self.concat_channels = self.cond_dim
         self.concat_downsample_factor = concat_downsample_factor
 
 
@@ -245,13 +144,7 @@ class ConditionalUNet(nn.Module):
         self.image_conditioning = image_conditioning
 
         self.use_fsq = use_fsq and image_conditioning  # image_cond에서만 쓰는 걸 추천
-        self.use_vq_discretizer = use_vq_discretizer and image_conditioning
-        # --- safety check ---
-        if self.use_fsq and self.use_vq_discretizer:
-            raise ValueError(
-                "Both use_fsq and use_vq_discretizer are True. "
-                "Choose exactly one discretization method."
-            )
+
         
         self.cond_drop_prob = uncond_drop_prob
 
@@ -260,19 +153,11 @@ class ConditionalUNet(nn.Module):
         if self.image_conditioning:
             # (B,C,H,W)->(B,D)
             if encoder is None:
-                if patch_conditioning:
-                    self.encoder = PatchImageCondition2DEncoder(
-                        in_channels=cond_in_channels,
-                        feat_channels=feat_channels,
-                        grid_size=patch_grid_size,
-                        use_pos_emb=patch_use_pos_emb,
-                    )
-                else:
-                    self.encoder = ImageCondition2DEncoder(
-                        in_channels=cond_in_channels,
-                        feat_channels=feat_channels,            # 예: 256
-                        downsample_factor=concat_downsample_factor,
-                    )
+                self.encoder = ImageCondition2DEncoder(
+                    in_channels=cond_in_channels,
+                    feat_channels=feat_channels,            # 예: 256
+                    downsample_factor=concat_downsample_factor,
+                )
             else:
                 self.encoder = encoder
 
@@ -284,22 +169,10 @@ class ConditionalUNet(nn.Module):
             if self.use_fsq:
                 self.discretizer = FSQDiscretizer(
                     slot_dim=self.cond_dim,
-                    levels=fsq_levels, 
-                    drop_quant_p=fsq_drop_quant_p,
-                    corrupt_tokens_p=fsq_corrupt_tokens_p,
+                    levels=[5,5,5,5], 
+                    drop_quant_p=0.0,
+                    corrupt_tokens_p=0.0,
                 )
-            elif self.use_vq_discretizer:
-                self.discretizer = VQDiscretizer(
-                slot_dim=self.cond_dim,
-                codebook_size=vq_codebook_size,        # <- 원하는 vocab 크기 (예: 9, 33, 256, 512, 1024 ...)
-                vq_dim=None,              # None이면 slot_dim 그대로 quantize
-                beta=vq_beta,              # VQ loss 내에서 사용되는 commitment loss 계수
-                use_ema=False,             # 추천
-                ema_decay=0.99,
-                drop_quant_p=fsq_drop_quant_p,
-                corrupt_tokens_p=fsq_corrupt_tokens_p,
-                )
-
                 # self.cond_token_proj = None
                 
                 # fsq_dim = len(fsq_levels)  # d = len(levels)
@@ -338,21 +211,44 @@ class ConditionalUNet(nn.Module):
             self.class_embedding = nn.Embedding(num_classes, self.cond_dim)
 
         # 4) UNet2DConditionModel 설정
-        unet_config = dict(unet_config)
-
-        if self.concat_conditioning:
-            unet_config["in_channels"] = unet_config["in_channels"] + self.concat_channels
-            self.cond_up = nn.Sequential(
-            # NOTE: we will call with either scale_factor or target size in forward logic
-            nn.Conv2d(self.cond_dim, self.cond_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(min(8, self.cond_dim), self.cond_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(self.cond_dim, self.concat_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(min(8, self.concat_channels), self.concat_channels),
-            nn.SiLU(inplace=True),
-            )       
+        if unet_config is None:
+            # 기본 config
+            unet_config = {
+                "sample_size": image_size,
+                "in_channels": 1,
+                "out_channels": 1,
+                "layers_per_block": 2,
+                "block_out_channels": (64, 128, 256, 256),
+                "down_block_types": (
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "DownBlock2D",
+                    "DownBlock2D",
+                ),
+                "up_block_types": (
+                    "UpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                    "UpBlock2D",
+                ),
+                "cross_attention_dim": self.cond_dim,
+                "attention_head_dim": 4,
+            }
         else:
-            self.cond_up = None
+            # 외부 config에서 일부 필드 없으면 채워주기
+            unet_config = dict(unet_config)  # 얕은 복사해서 수정
+            # sample_size가 없으면 image_size로
+            unet_config.setdefault("sample_size", image_size)
+            unet_config.setdefault("in_channels", 1)
+            unet_config.setdefault("out_channels", 1)
+            # cross_attention_dim은 cond_dim과 일치시키기
+            unet_config.setdefault("cross_attention_dim", self.cond_dim)
+            if unet_config["cross_attention_dim"] != self.cond_dim:
+                # cond_dim을 맞춰줌
+                unet_config["cross_attention_dim"] = self.cond_dim
+
+        if self.image_conditioning and self.concat_conditioning:
+            unet_config["in_channels"] = unet_config["in_channels"] + self.concat_channels
 
         if self.cond_drop_prob > 0:
             if self.image_conditioning:
@@ -366,16 +262,12 @@ class ConditionalUNet(nn.Module):
                 null_k = 1
 
             self.null_cond = nn.Parameter(torch.zeros(1, null_k, self.cond_dim))
-            print("cond_token_num", null_k)
             print("self.cond_dim_null",self.cond_dim)
             nn.init.normal_(self.null_cond, std=0.02)
         else:
             self.null_cond = None
 
-        if concat_conditioning:
-            self.unet = UNet2DModel(**unet_config)
-        else:
-            self.unet = UNet2DConditionModel(**unet_config)
+        self.unet = UNet2DConditionModel(**unet_config)
 
     def _get_null_tokens(self, B: int, L: int, device, dtype):
         """
@@ -438,7 +330,6 @@ class ConditionalUNet(nn.Module):
         # 0) tokens 만들기
         if encoder_hidden_states is not None:
             tokens = encoder_hidden_states  # (B,L,D)
-            return tokens
 
         elif self.image_conditioning:
             if cond_image is None:
@@ -460,7 +351,7 @@ class ConditionalUNet(nn.Module):
                 raise ValueError("class conditioning 모드에서는 y가 필요합니다.")
             tokens = self.class_embedding(y)[:, None, :]  # (B,1,D)
 
-        if self.use_fsq or self.use_vq_discretizer:
+        if self.use_fsq:
             tokens, tok_ids = self.discretizer(tokens)
 
         # ✅ eval CFG용: unconditional 강제
@@ -530,7 +421,6 @@ class ConditionalUNet(nn.Module):
         cond_image: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
         grid: torch.Tensor | None = None,
-        return_aux_loss: bool = False,
     ) -> torch.Tensor:
         # cond_encoding은 "최종 tokens"를 리턴: (B, L, D)
         cond_tokens = self.cond_encoding(
@@ -541,62 +431,35 @@ class ConditionalUNet(nn.Module):
             return_token_ids=False,
         )  # (B, L, D)
 
-        if self.use_vq_discretizer:
-            aux_loss = getattr(self.discretizer, "last_vq_loss", None)
-            
         x_in = x_t
+        unet_cond_states = cond_tokens  # 기본: cross-attn
 
         # ✅ concat conditioning이면: tokens -> (B, D, h, w) -> upsample -> concat
-        if self.concat_conditioning:
+        if self.image_conditioning and self.concat_conditioning:
+            if cond_image is None:
+                raise ValueError("concat_conditioning=True 인데 cond_image가 없음")
+
             B, L, D = cond_tokens.shape
+            Hc, Wc = cond_image.shape[-2], cond_image.shape[-1]
 
-            if self.image_conditioning:
-                if cond_image is None:
-                    raise ValueError("concat_conditioning=True 인데 cond_image가 없음")
-
-                Hc, Wc = cond_image.shape[-2], cond_image.shape[-1]
-
-                # encoder가 만든 feature map의 spatial size는 입력/다운샘플 팩터로 결정됨
-                if hasattr(self.encoder, "grid_size"):  # patch encoder
-                    h = w = self.encoder.grid_size
-                else:
-                    h = Hc // self.concat_downsample_factor
-                    w = Wc // self.concat_downsample_factor
-            else:
-                # grid_conditioning
-                h = w = self.grid_hw
+            # encoder가 만든 feature map의 spatial size는 입력/다운샘플 팩터로 결정됨
+            h = Hc // self.concat_downsample_factor
+            w = Wc // self.concat_downsample_factor
 
             assert L == h * w, f"L={L} != h*w={h*w} (h={h}, w={w})"
 
             cond_2d = cond_tokens.view(B, h, w, D).permute(0, 3, 1, 2).contiguous()  # (B,D,h,w)
             cond_2d = F.interpolate(cond_2d, size=x_t.shape[-2:], mode="nearest")    # (B,D,H,W)
 
-            if self.cond_up is not None:
-                cond_2d = self.cond_up(cond_2d)  # (B,D,H,W)
-
-            if self.training and torch.rand(1).item() < 0.01:  # 너무 자주 찍히는 거 방지
-                with torch.no_grad():
-                    c = cond_2d.detach().float()
-                    print(
-                        "[cond_2d]",
-                        f"min={c.min().item():.4f}",
-                        f"max={c.max().item():.4f}",
-                        f"mean={c.mean().item():.4f}",
-                        f"std={c.std().item():.4f}",
-                    )
             x_in = torch.cat([x_t, cond_2d], dim=1)  # (B, 1+D, H, W)
 
+            # concat만 사용할 거면 cross-attn은 더미로
+            unet_cond_states = x_t.new_zeros(B, 1, self.cond_dim)
         # print("x_in", x_in.shape)
         # print("cond_statesc",unet_cond_states.shape)
-
-        if self.concat_conditioning:
-            out = self.unet(sample=x_in, timestep=t)
-        else:
-            out = self.unet(sample=x_in, timestep=t, encoder_hidden_states=cond_tokens)
-
-        pred = out.sample
-
-        if return_aux_loss:
-            return pred, aux_loss
-        else:
-            return pred
+        out = self.unet(
+            sample=x_in,
+            timestep=t,
+            encoder_hidden_states=unet_cond_states,
+        )
+        return out.sample

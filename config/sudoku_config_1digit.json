@@ -5,13 +5,14 @@
     "image_shape": [252, 252],
     "pad_to_size": [288, 288],
     "adjust_with_resize": true,
-    "resize_mode": "nearest",
+    "resize_mode": "bicubic",
     "resize_antialias": true,
     "subset_size": null,
     "top_n": 1000,
     "test_samples_num": 10000,
     "augment": false,
-    "grayscale": true
+    "grayscale": true,
+    "reveal_cells": [[5, 5]]
   },
   "SRM_conditioning_cfg": {
     "label": false,

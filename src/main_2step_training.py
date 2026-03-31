@@ -640,7 +640,7 @@ def run_evaluation(
             return_uncond=True,     # ✅ null로 강제
         )
 
-    for t in tqdm(ddim_scheduler.timesteps, disable=True):
+    for step_idx, t in enumerate(tqdm(ddim_scheduler.timesteps, disable=True)):
         t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
         if guidance_scale == 1.0:
@@ -650,7 +650,12 @@ def run_evaluation(
             eps_u = unwrapped_model(x, t_batch, encoder_hidden_states=uncond_tokens, cond_image=ref_images,)
             eps = eps_u + guidance_scale * (eps_c - eps_u)
 
-        x = ddim_scheduler.step(eps, t, x).prev_sample
+        # 두 번째 step에서 바로 x0 예측으로 나가기
+        if step_idx == 1:
+            x = ddim_scheduler.step(eps, t, x).pred_original_sample
+            break
+        else:
+            x = ddim_scheduler.step(eps, t, x).prev_sample
 
     # VAE decode (있으면 latent → pixel)
     if vae is not None:
@@ -774,13 +779,6 @@ def run_evaluation(
                         f"  - (row={r}, col={c}) GTimg={int(gt_cpu[bi,r,c])} PRED={int(pr_cpu[bi,r,c])}"
                     )
 
-        # gt/pred_grid는 여기서 확정됨:
-        gt_9 = gt.long()
-        pred_9 = pred_grid.long()
-
-        # tok_ids가 있으면 (discretizer 사용 시) tok2digit 분석 진행
-        tok_ids_2d = None
-        pred_from_tok = None
         if args.use_fsq or args.use_vq_discretizer:
             # ============================================================
             # ====== 추가 분석: 토큰ID -> 숫자 매핑 및 시각화 ======
@@ -796,6 +794,12 @@ def run_evaluation(
 
             # 0) tok_ids 준비 (이미 위에서 뽑았다고 했으니 여기선 shape만 보정/확인)
             tok_ids_2d = tok_ids.view(B, 9, 9).long()  # (B,9,9)
+
+            # gt/pred_grid는 네 코드에서 이미 여기서 확정됨:
+            # gt = ... (B,9,9)
+            # pred_grid = s_eval["discrete"].long()  # (B,9,9)
+            gt_9 = gt.long()
+            pred_9 = pred_grid.long()
 
             assert tok_ids_2d.shape == gt_9.shape, f"tok_ids={tok_ids_2d.shape}, gt={gt_9.shape}"
             assert pred_9.shape == gt_9.shape, f"pred={pred_9.shape}, gt={gt_9.shape}"
@@ -1012,146 +1016,12 @@ def run_evaluation(
             accelerator.print(f"[Eval] Saved digit grids:\n  {gt_path}\n  {tok_path}\n  {pr_path}")
             # ============================================================
 
-        # ============================================================
-        # ====== PCA / t-SNE 시각화 (cond_tokens) ======
-        # ====== discretizer 없이도 embedding 분석 가능 ======
-        # ============================================================
-        try:
-            from sklearn.decomposition import PCA
-            from sklearn.manifold import TSNE
-            import matplotlib.pyplot as plt
-            import numpy as np
-
-            # cond_tokens: (B, K, D) where K=81 (9x9), D=slot_dim
-            # tok_ids_2d: (B, 9, 9) -> token ids (only if discretizer used)
-            # gt_9: (B, 9, 9) -> GT digits
-            # pred_from_tok: (B, 9, 9) -> tok2digit mapping result (only if discretizer used)
-
-            cond_flat = cond_tokens.detach().cpu().float().numpy()  # (B, K, D)
-            B_vis, K_vis, D_vis = cond_flat.shape
-            cond_flat = cond_flat.reshape(B_vis * K_vis, D_vis)  # (B*K, D)
-
-            gt_flat_np = gt_9.detach().cpu().numpy().reshape(-1)  # (B*K,)
-            pred_flat_np = pred_9.detach().cpu().numpy().reshape(-1)  # (B*K,) - 실제 diffusion pred
-            
-            # tok2digit 결과 (discretizer 사용 시에만)
-            has_tok2digit = (pred_from_tok is not None)
-            if has_tok2digit:
-                pred_tok_flat_np = pred_from_tok.detach().cpu().numpy().reshape(-1)  # (B*K,)
-
-            # --- PCA ---
-            pca = PCA(n_components=2)
-            pca_emb = pca.fit_transform(cond_flat)  # (B*K, 2)
-
-            # --- t-SNE ---
-            tsne = TSNE(n_components=2, perplexity=min(30, B_vis * K_vis - 1), random_state=42, max_iter=500)
-            tsne_emb = tsne.fit_transform(cond_flat)  # (B*K, 2)
-
-            # 색깔 지정 (0~9 digit)
-            cmap = plt.cm.get_cmap('tab10', 10)
-
-            # tok2digit이 있으면 3열, 없으면 2열로 시각화
-            n_cols = 3 if has_tok2digit else 2
-            fig, axes = plt.subplots(2, n_cols, figsize=(6 * n_cols, 12))
-
-            # (0,0) PCA - GT color
-            ax = axes[0, 0]
-            for d in range(10):
-                mask = (gt_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(pca_emb[mask, 0], pca_emb[mask, 1], 
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('PCA - colored by GT digit')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-
-            if has_tok2digit:
-                # (0,1) PCA - Pred (tok2digit) color
-                ax = axes[0, 1]
-                for d in range(10):
-                    mask = (pred_tok_flat_np == d)
-                    if mask.sum() > 0:
-                        ax.scatter(pca_emb[mask, 0], pca_emb[mask, 1],
-                                   c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-                ax.set_title('PCA - colored by tok2digit pred')
-                ax.legend(loc='upper right', fontsize=8)
-                ax.set_xlabel('PC1')
-                ax.set_ylabel('PC2')
-
-                # (0,2) PCA - Actual diffusion pred color
-                ax = axes[0, 2]
-            else:
-                # (0,1) PCA - Actual diffusion pred color
-                ax = axes[0, 1]
-            for d in range(10):
-                mask = (pred_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(pca_emb[mask, 0], pca_emb[mask, 1],
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('PCA - colored by diffusion pred')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-
-            # (1,0) t-SNE - GT color
-            ax = axes[1, 0]
-            for d in range(10):
-                mask = (gt_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(tsne_emb[mask, 0], tsne_emb[mask, 1],
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('t-SNE - colored by GT digit')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('dim1')
-            ax.set_ylabel('dim2')
-
-            if has_tok2digit:
-                # (1,1) t-SNE - Pred (tok2digit) color
-                ax = axes[1, 1]
-                for d in range(10):
-                    mask = (pred_tok_flat_np == d)
-                    if mask.sum() > 0:
-                        ax.scatter(tsne_emb[mask, 0], tsne_emb[mask, 1],
-                                   c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-                ax.set_title('t-SNE - colored by tok2digit pred')
-                ax.legend(loc='upper right', fontsize=8)
-                ax.set_xlabel('dim1')
-                ax.set_ylabel('dim2')
-
-                # (1,2) t-SNE - Actual diffusion pred color
-                ax = axes[1, 2]
-            else:
-                # (1,1) t-SNE - Actual diffusion pred color
-                ax = axes[1, 1]
-            for d in range(10):
-                mask = (pred_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(tsne_emb[mask, 0], tsne_emb[mask, 1],
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('t-SNE - colored by diffusion pred')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('dim1')
-            ax.set_ylabel('dim2')
-
-            plt.tight_layout()
-            
-            viz_dir = os.path.join(eval_dir, "grid_digits")
-            os.makedirs(viz_dir, exist_ok=True)
-            embed_viz_path = os.path.join(viz_dir, f"step_{global_step}{suf}_cond_embed.png")
-            plt.savefig(embed_viz_path, dpi=150)
-            plt.close(fig)
-            accelerator.print(f"[Eval] Saved cond_token embedding viz: {embed_viz_path}")
-
-        except Exception as e:
-            accelerator.print(f"[Eval][Warning] PCA/t-SNE viz failed: {e}")
-        # ============================================================
-
-        # 필요하면 result를 밖에서 쓰기 좋게 묶어서 리턴/저장
-        # 예) 디버깅용으로 첫 샘플 비교 출력
-        # accelerator.print("GT[0]:\n", gt[0])
-        # accelerator.print("PR[0]:\n", s_eval["discrete"][0])
-        # accelerator.print("WRONG[0]:\n", wrong_mask[0].int())
+            # 필요하면 result를 밖에서 쓰기 좋게 묶어서 리턴/저장
+            # 예) 디버깅용으로 첫 샘플 비교 출력
+            # accelerator.print("GT[0]:\n", gt[0])
+            # accelerator.print("PR[0]:\n", s_eval["discrete"][0])
+            # accelerator.print("WRONG[0]:\n", wrong_mask[0].int())
+        
 
         # ---- 로그/출력용 dict로 합치기 ----
         # (wandb나 tensorboard에 올리고 싶으면 여기서 accelerator.log로 넘기면 됨)
@@ -1528,7 +1398,7 @@ def main():
             batch_size = images.shape[0]
 
             timesteps = torch.randint(
-                low=0,
+                low=960,
                 high=noise_scheduler.config.num_train_timesteps,
                 size=(batch_size,),
                 device=device,

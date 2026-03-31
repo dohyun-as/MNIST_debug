@@ -275,7 +275,6 @@ def parse_args():
 
     parser.add_argument("--concat_conditioning", action="store_true")
     parser.add_argument("--concat_downsample_factor", type=int, default=16)
-    parser.add_argument("--concat_channels", type=int, default=4)
     parser.add_argument("--cond_dim", type=int, default=None)
     parser.add_argument("--use_fsq", action="store_true")
     parser.add_argument("--fsq_levels", type=int, nargs="+",
@@ -284,15 +283,6 @@ def parse_args():
     )
     parser.add_argument("--fsq_drop_quant_p", type=float, default=0.0)
     parser.add_argument("--fsq_corrupt_tokens_p", type=float, default=0.0)
-    # ---------------------------------------
-    parser.add_argument("--use_vq_discretizer", action="store_true",)
-    parser.add_argument("--vq_loss_weight", type=float, default=0.1,)
-    parser.add_argument("--vq_codebook_size", type=int, default=9,
-        help="VQ codebook size (for VQ discretizer).",
-    )
-    parser.add_argument("--vq_beta", type=float, default=0.25,
-        help="VQ commitment loss coefficient.",
-    )
         # --- patchwise image conditioning encoder ---
     parser.add_argument(
         "--patch_conditioning",
@@ -706,8 +696,6 @@ def run_evaluation(
         wrong_mask = None
         n_wrong = None
         cell_acc = None
-        acc_tok_vs_gt = None
-        acc_tok_vs_pred = None
 
         if ref_grids is not None:
             gt = ref_grids
@@ -774,384 +762,6 @@ def run_evaluation(
                         f"  - (row={r}, col={c}) GTimg={int(gt_cpu[bi,r,c])} PRED={int(pr_cpu[bi,r,c])}"
                     )
 
-        # gt/pred_grid는 여기서 확정됨:
-        gt_9 = gt.long()
-        pred_9 = pred_grid.long()
-
-        # tok_ids가 있으면 (discretizer 사용 시) tok2digit 분석 진행
-        tok_ids_2d = None
-        pred_from_tok = None
-        if args.use_fsq or args.use_vq_discretizer:
-            # ============================================================
-            # ====== 추가 분석: 토큰ID -> 숫자 매핑 및 시각화 ======
-            # ============================================================
-            ##############################################################
-            # ====== 추가 import 필요 ======
-            from PIL import Image, ImageDraw, ImageFont
-            import math
-
-            # ============================================================
-            # [TokID -> Digit] mapping + visualize (GT / tok2digit / pred_grid)
-            # ============================================================
-
-            # 0) tok_ids 준비 (이미 위에서 뽑았다고 했으니 여기선 shape만 보정/확인)
-            tok_ids_2d = tok_ids.view(B, 9, 9).long()  # (B,9,9)
-
-            assert tok_ids_2d.shape == gt_9.shape, f"tok_ids={tok_ids_2d.shape}, gt={gt_9.shape}"
-            assert pred_9.shape == gt_9.shape, f"pred={pred_9.shape}, gt={gt_9.shape}"
-
-            # 1) GT vs pred_grid mismatch mask (빨간 테두리용)
-            wrong_mask_pred = (pred_9 != gt_9)  # (B,9,9) bool
-
-            # 2) tok_id -> digit 통계 매핑 만들기 (batch 전체에서)
-            #    vocab은 tok_ids에서 자동 추정
-            vocab = int(tok_ids_2d.max().item()) + 1  # token book 개수
-            tid_flat = tok_ids_2d.reshape(-1)         # (B*81,)
-            gt_flat  = gt_9.reshape(-1).clamp(0, 9)   # digit 0~9 가정
-
-            # counts[tok, digit] 만들기 (vectorized)
-            # idx = tok*10 + digit
-            idx = (tid_flat * 10 + gt_flat).to(torch.long)
-            counts = torch.bincount(idx, minlength=vocab * 10).view(vocab, 10)  # (vocab,10)
-
-            tok2digit = counts.argmax(dim=1)  # (vocab,)
-            tok_conf  = counts.max(dim=1).values.float() / (counts.sum(dim=1).float() + 1e-9)
-
-            # 3) tok_id grid를 digit grid로 변환
-            pred_from_tok = tok2digit[tok_ids_2d]  # (B,9,9)
-
-            # 4) 비교 지표(원하면 로그)
-            wrong_tok_vs_gt = (pred_from_tok != gt_9)
-            acc_tok_vs_gt = (~wrong_tok_vs_gt).float().mean().item()
-
-            wrong_tok_vs_pred = (pred_from_tok != pred_9)
-            acc_tok_vs_pred = (~wrong_tok_vs_pred).float().mean().item()
-
-            accelerator.print(
-                f"[Eval][Tok2Digit] vocab={vocab} "
-                f"acc(tok->digit vs GT)={acc_tok_vs_gt:.4f} "
-                f"acc(tok->digit vs PRED)={acc_tok_vs_pred:.4f}"
-            )
-
-            # 5) digit confusion(뭐랑 헷갈렸는지) - GT vs pred_grid, GT vs tok2digit
-            def confusion_10x10(gt_grid, pr_grid):
-                g = gt_grid.reshape(-1).clamp(0, 9).to(torch.long)
-                p = pr_grid.reshape(-1).clamp(0, 9).to(torch.long)
-                cm = torch.bincount(g * 10 + p, minlength=100).view(10, 10)  # rows=GT, cols=PRED
-                return cm
-
-            cm_pred = confusion_10x10(gt_9, pred_9)
-            cm_tok  = confusion_10x10(gt_9, pred_from_tok)
-
-            def print_full_confusion(cm, name, accelerator, digits=10):
-                # cm: (10,10) rows=GT, cols=PRED
-                if not accelerator.is_main_process:
-                    return
-                accelerator.print(f"[Eval][ConfusionFull] {name} (rows=GT, cols=Pred)")
-                for gt_d in range(digits):
-                    row = cm[gt_d]
-                    total = int(row.sum().item())
-                    if total == 0:
-                        continue
-                    parts = []
-                    for pr_d in range(digits):
-                        cnt = int(row[pr_d].item())
-                        if cnt == 0:
-                            continue
-                        parts.append(f"{pr_d}:{cnt}")
-                    accelerator.print(f"  GT {gt_d} (n={total}) -> " + ", ".join(parts))
-
-            # 전체 출력
-            print_full_confusion(cm_pred, "GT->PRED", accelerator)
-            print_full_confusion(cm_tok,  "GT->TOK2DIG", accelerator)
-
-            # 6) ====== 숫자 그리드 렌더링 (PIL) ======
-            def render_digit_grid(
-                grid_9x9,
-                wrong_mask_9x9=None,     # 빨간 테두리 (GT vs PRED mismatch)
-                bg_mask_9x9=None,        # 연분홍 배경 (GT vs TOK2DIG mismatch)
-                cell=34, pad=3, border=3, title=None,
-                font_size=18,
-            ):
-                """
-                grid_9x9: (9,9) tensor/ndarray of ints
-                wrong_mask_9x9: (9,9) bool -> True면 빨간 테두리
-                bg_mask_9x9: (9,9) bool -> True면 연분홍 배경
-                """
-                grid_9x9 = grid_9x9.detach().cpu().numpy()
-                if wrong_mask_9x9 is not None:
-                    wrong_mask_9x9 = wrong_mask_9x9.detach().cpu().numpy()
-                if bg_mask_9x9 is not None:
-                    bg_mask_9x9 = bg_mask_9x9.detach().cpu().numpy()
-
-                # title을 더 타이트하게
-                title_h = 18 if title else 0
-                W = 9 * cell + 2 * pad
-                H = 9 * cell + 2 * pad + title_h
-
-                img = Image.new("RGB", (W, H), (255, 255, 255))
-                draw = ImageDraw.Draw(img)
-
-                # 폰트: 있으면 truetype로 크게, 없으면 default
-                font = None
-                try:
-                    # 컨테이너에 보통 있는 폰트 경로(없으면 except)
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
-                except Exception:
-                    font = ImageFont.load_default()
-
-                if title:
-                    draw.text((pad, 0), title, fill=(0, 0, 0), font=font)
-
-                y0 = title_h
-
-                pink = (255, 230, 235)  # 연분홍 배경
-
-                for r in range(9):
-                    for c in range(9):
-                        x1 = pad + c * cell
-                        y1 = y0 + pad + r * cell
-                        x2 = x1 + cell
-                        y2 = y1 + cell
-
-                        # 배경 채우기 (GT vs TOK2DIG mismatch)
-                        if bg_mask_9x9 is not None and bool(bg_mask_9x9[r, c]):
-                            draw.rectangle([x1, y1, x2, y2], fill=pink)
-
-                        # 기본 셀 테두리 (연한 회색)
-                        draw.rectangle([x1, y1, x2, y2], outline=(200, 200, 200), width=1)
-
-                        val = int(grid_9x9[r, c])
-                        s = str(val)
-
-                        # text centering (Pillow>=10)
-                        bbox = draw.textbbox((0, 0), s, font=font)
-                        tw = bbox[2] - bbox[0]
-                        th = bbox[3] - bbox[1]
-                        tx = x1 + (cell - tw) / 2
-                        ty = y1 + (cell - th) / 2
-                        draw.text((tx, ty), s, fill=(0, 0, 0), font=font)
-
-                        # 빨간 테두리 (GT vs PRED mismatch)
-                        if wrong_mask_9x9 is not None and bool(wrong_mask_9x9[r, c]):
-                            draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=border)
-
-                return img
-            def tile_images(img_list, nrow, pad=10, bg=(255,255,255)):
-                """
-                img_list: list of PIL Images (same size)
-                nrow: columns
-                """
-                if len(img_list) == 0:
-                    return None
-                w, h = img_list[0].size
-                ncol = nrow
-                nrows = math.ceil(len(img_list) / ncol)
-                out_w = ncol * w + (ncol + 1) * pad
-                out_h = nrows * h + (nrows + 1) * pad
-                canvas = Image.new("RGB", (out_w, out_h), bg)
-
-                for i, im in enumerate(img_list):
-                    rr = i // ncol
-                    cc = i % ncol
-                    x = pad + cc * (w + pad)
-                    y = pad + rr * (h + pad)
-                    canvas.paste(im, (x, y))
-                return canvas
-
-            # 7) batch 전체를 타일로 모아서 GT / TOK2DIG / PRED 3장 저장
-            #    빨간 테두리는 "GT vs PRED 불일치" 기준을 모든 그림에 동일하게 적용
-            gt_imgs = []
-            tok_imgs = []
-            pred_imgs = []
-
-            # GT vs TOK2DIG mismatch (분홍 배경)
-            wrong_mask_tok = (pred_from_tok != gt_9)  # (B,9,9)
-
-            for i in range(B):
-                wm_red = wrong_mask_pred[i]   # GT vs PRED mismatch -> 빨간 테두리
-                wm_pink = wrong_mask_tok[i]   # GT vs TOK2DIG mismatch -> 분홍 배경
-
-                gt_imgs.append(render_digit_grid(
-                    gt_9[i],
-                    wrong_mask_9x9=wm_red,
-                    bg_mask_9x9=wm_pink,
-                    title=None #f"GT #{i}"
-                ))
-                tok_imgs.append(render_digit_grid(
-                    pred_from_tok[i],
-                    wrong_mask_9x9=wm_red,
-                    bg_mask_9x9=wm_pink,
-                    title=None #f"TOK2DIG #{i}"
-                ))
-                pred_imgs.append(render_digit_grid(
-                    pred_9[i],
-                    wrong_mask_9x9=wm_red,
-                    bg_mask_9x9=wm_pink,
-                    title=None #f"PRED #{i}"
-                ))
-
-            # 타일 nrow는 기존 n_per_class 쓰면 보기 좋음
-            nrow = n_per_class if 'n_per_class' in locals() else min(B, 8)
-
-            gt_canvas  = tile_images(gt_imgs,  nrow=nrow)
-            tok_canvas = tile_images(tok_imgs, nrow=nrow)
-            pr_canvas  = tile_images(pred_imgs, nrow=nrow)
-
-            viz_dir = os.path.join(eval_dir, "grid_digits")
-            os.makedirs(viz_dir, exist_ok=True)
-
-            gt_path  = os.path.join(viz_dir, f"step_{global_step}{suf}_GT.png")
-            tok_path = os.path.join(viz_dir, f"step_{global_step}{suf}_TOK2DIG.png")
-            pr_path  = os.path.join(viz_dir, f"step_{global_step}{suf}_PRED.png")
-
-            gt_canvas.save(gt_path)
-            tok_canvas.save(tok_path)
-            pr_canvas.save(pr_path)
-
-            accelerator.print(f"[Eval] Saved digit grids:\n  {gt_path}\n  {tok_path}\n  {pr_path}")
-            # ============================================================
-
-        # ============================================================
-        # ====== PCA / t-SNE 시각화 (cond_tokens) ======
-        # ====== discretizer 없이도 embedding 분석 가능 ======
-        # ============================================================
-        try:
-            from sklearn.decomposition import PCA
-            from sklearn.manifold import TSNE
-            import matplotlib.pyplot as plt
-            import numpy as np
-
-            # cond_tokens: (B, K, D) where K=81 (9x9), D=slot_dim
-            # tok_ids_2d: (B, 9, 9) -> token ids (only if discretizer used)
-            # gt_9: (B, 9, 9) -> GT digits
-            # pred_from_tok: (B, 9, 9) -> tok2digit mapping result (only if discretizer used)
-
-            cond_flat = cond_tokens.detach().cpu().float().numpy()  # (B, K, D)
-            B_vis, K_vis, D_vis = cond_flat.shape
-            cond_flat = cond_flat.reshape(B_vis * K_vis, D_vis)  # (B*K, D)
-
-            gt_flat_np = gt_9.detach().cpu().numpy().reshape(-1)  # (B*K,)
-            pred_flat_np = pred_9.detach().cpu().numpy().reshape(-1)  # (B*K,) - 실제 diffusion pred
-            
-            # tok2digit 결과 (discretizer 사용 시에만)
-            has_tok2digit = (pred_from_tok is not None)
-            if has_tok2digit:
-                pred_tok_flat_np = pred_from_tok.detach().cpu().numpy().reshape(-1)  # (B*K,)
-
-            # --- PCA ---
-            pca = PCA(n_components=2)
-            pca_emb = pca.fit_transform(cond_flat)  # (B*K, 2)
-
-            # --- t-SNE ---
-            tsne = TSNE(n_components=2, perplexity=min(30, B_vis * K_vis - 1), random_state=42, max_iter=500)
-            tsne_emb = tsne.fit_transform(cond_flat)  # (B*K, 2)
-
-            # 색깔 지정 (0~9 digit)
-            cmap = plt.cm.get_cmap('tab10', 10)
-
-            # tok2digit이 있으면 3열, 없으면 2열로 시각화
-            n_cols = 3 if has_tok2digit else 2
-            fig, axes = plt.subplots(2, n_cols, figsize=(6 * n_cols, 12))
-
-            # (0,0) PCA - GT color
-            ax = axes[0, 0]
-            for d in range(10):
-                mask = (gt_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(pca_emb[mask, 0], pca_emb[mask, 1], 
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('PCA - colored by GT digit')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-
-            if has_tok2digit:
-                # (0,1) PCA - Pred (tok2digit) color
-                ax = axes[0, 1]
-                for d in range(10):
-                    mask = (pred_tok_flat_np == d)
-                    if mask.sum() > 0:
-                        ax.scatter(pca_emb[mask, 0], pca_emb[mask, 1],
-                                   c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-                ax.set_title('PCA - colored by tok2digit pred')
-                ax.legend(loc='upper right', fontsize=8)
-                ax.set_xlabel('PC1')
-                ax.set_ylabel('PC2')
-
-                # (0,2) PCA - Actual diffusion pred color
-                ax = axes[0, 2]
-            else:
-                # (0,1) PCA - Actual diffusion pred color
-                ax = axes[0, 1]
-            for d in range(10):
-                mask = (pred_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(pca_emb[mask, 0], pca_emb[mask, 1],
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('PCA - colored by diffusion pred')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-
-            # (1,0) t-SNE - GT color
-            ax = axes[1, 0]
-            for d in range(10):
-                mask = (gt_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(tsne_emb[mask, 0], tsne_emb[mask, 1],
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('t-SNE - colored by GT digit')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('dim1')
-            ax.set_ylabel('dim2')
-
-            if has_tok2digit:
-                # (1,1) t-SNE - Pred (tok2digit) color
-                ax = axes[1, 1]
-                for d in range(10):
-                    mask = (pred_tok_flat_np == d)
-                    if mask.sum() > 0:
-                        ax.scatter(tsne_emb[mask, 0], tsne_emb[mask, 1],
-                                   c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-                ax.set_title('t-SNE - colored by tok2digit pred')
-                ax.legend(loc='upper right', fontsize=8)
-                ax.set_xlabel('dim1')
-                ax.set_ylabel('dim2')
-
-                # (1,2) t-SNE - Actual diffusion pred color
-                ax = axes[1, 2]
-            else:
-                # (1,1) t-SNE - Actual diffusion pred color
-                ax = axes[1, 1]
-            for d in range(10):
-                mask = (pred_flat_np == d)
-                if mask.sum() > 0:
-                    ax.scatter(tsne_emb[mask, 0], tsne_emb[mask, 1],
-                               c=[cmap(d)], label=f'{d}', alpha=0.7, s=15)
-            ax.set_title('t-SNE - colored by diffusion pred')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_xlabel('dim1')
-            ax.set_ylabel('dim2')
-
-            plt.tight_layout()
-            
-            viz_dir = os.path.join(eval_dir, "grid_digits")
-            os.makedirs(viz_dir, exist_ok=True)
-            embed_viz_path = os.path.join(viz_dir, f"step_{global_step}{suf}_cond_embed.png")
-            plt.savefig(embed_viz_path, dpi=150)
-            plt.close(fig)
-            accelerator.print(f"[Eval] Saved cond_token embedding viz: {embed_viz_path}")
-
-        except Exception as e:
-            accelerator.print(f"[Eval][Warning] PCA/t-SNE viz failed: {e}")
-        # ============================================================
-
-        # 필요하면 result를 밖에서 쓰기 좋게 묶어서 리턴/저장
-        # 예) 디버깅용으로 첫 샘플 비교 출력
-        # accelerator.print("GT[0]:\n", gt[0])
-        # accelerator.print("PR[0]:\n", s_eval["discrete"][0])
-        # accelerator.print("WRONG[0]:\n", wrong_mask[0].int())
 
         # ---- 로그/출력용 dict로 합치기 ----
         # (wandb나 tensorboard에 올리고 싶으면 여기서 accelerator.log로 넘기면 됨)
@@ -1181,16 +791,247 @@ def run_evaluation(
                 "eval/sudoku_cell_acc_img": cell_acc_img.item(),
                 "eval/sudoku_wrong_mean_img": n_wrong_img.float().mean().item(),
             })
-
-            if acc_tok_vs_gt is not None:
-                log_dict.update({
-                    "eval/tok2digit_acc_vs_gt": acc_tok_vs_gt,
-                    "eval/tok2digit_acc_vs_pred": acc_tok_vs_pred,
-                })
                                 
             accelerator.log(log_dict, step=global_step)  # ✅ 이거 추가
 
-            
+        ##############################################################
+        # ====== 추가 import 필요 ======
+        from PIL import Image, ImageDraw, ImageFont
+        import math
+
+        # ============================================================
+        # [TokID -> Digit] mapping + visualize (GT / tok2digit / pred_grid)
+        # ============================================================
+
+        # 0) tok_ids 준비 (이미 위에서 뽑았다고 했으니 여기선 shape만 보정/확인)
+        tok_ids_2d = tok_ids.view(B, 9, 9).long()  # (B,9,9)
+
+        # gt/pred_grid는 네 코드에서 이미 여기서 확정됨:
+        # gt = ... (B,9,9)
+        # pred_grid = s_eval["discrete"].long()  # (B,9,9)
+        gt_9 = gt.long()
+        pred_9 = pred_grid.long()
+
+        assert tok_ids_2d.shape == gt_9.shape, f"tok_ids={tok_ids_2d.shape}, gt={gt_9.shape}"
+        assert pred_9.shape == gt_9.shape, f"pred={pred_9.shape}, gt={gt_9.shape}"
+
+        # 1) GT vs pred_grid mismatch mask (빨간 테두리용)
+        wrong_mask_pred = (pred_9 != gt_9)  # (B,9,9) bool
+
+        # 2) tok_id -> digit 통계 매핑 만들기 (batch 전체에서)
+        #    vocab은 tok_ids에서 자동 추정
+        vocab = int(tok_ids_2d.max().item()) + 1  # token book 개수
+        tid_flat = tok_ids_2d.reshape(-1)         # (B*81,)
+        gt_flat  = gt_9.reshape(-1).clamp(0, 9)   # digit 0~9 가정
+
+        # counts[tok, digit] 만들기 (vectorized)
+        # idx = tok*10 + digit
+        idx = (tid_flat * 10 + gt_flat).to(torch.long)
+        counts = torch.bincount(idx, minlength=vocab * 10).view(vocab, 10)  # (vocab,10)
+
+        tok2digit = counts.argmax(dim=1)  # (vocab,)
+        tok_conf  = counts.max(dim=1).values.float() / (counts.sum(dim=1).float() + 1e-9)
+
+        # 3) tok_id grid를 digit grid로 변환
+        pred_from_tok = tok2digit[tok_ids_2d]  # (B,9,9)
+
+        # 4) 비교 지표(원하면 로그)
+        wrong_tok_vs_gt = (pred_from_tok != gt_9)
+        acc_tok_vs_gt = (~wrong_tok_vs_gt).float().mean().item()
+
+        wrong_tok_vs_pred = (pred_from_tok != pred_9)
+        acc_tok_vs_pred = (~wrong_tok_vs_pred).float().mean().item()
+
+        accelerator.print(
+            f"[Eval][Tok2Digit] vocab={vocab} "
+            f"acc(tok->digit vs GT)={acc_tok_vs_gt:.4f} "
+            f"acc(tok->digit vs PRED)={acc_tok_vs_pred:.4f}"
+        )
+
+        # 5) digit confusion(뭐랑 헷갈렸는지) - GT vs pred_grid, GT vs tok2digit
+        def confusion_10x10(gt_grid, pr_grid):
+            g = gt_grid.reshape(-1).clamp(0, 9).to(torch.long)
+            p = pr_grid.reshape(-1).clamp(0, 9).to(torch.long)
+            cm = torch.bincount(g * 10 + p, minlength=100).view(10, 10)  # rows=GT, cols=PRED
+            return cm
+
+        cm_pred = confusion_10x10(gt_9, pred_9)
+        cm_tok  = confusion_10x10(gt_9, pred_from_tok)
+
+        def print_full_confusion(cm, name, accelerator, digits=10):
+            # cm: (10,10) rows=GT, cols=PRED
+            if not accelerator.is_main_process:
+                return
+            accelerator.print(f"[Eval][ConfusionFull] {name} (rows=GT, cols=Pred)")
+            for gt_d in range(digits):
+                row = cm[gt_d]
+                total = int(row.sum().item())
+                if total == 0:
+                    continue
+                parts = []
+                for pr_d in range(digits):
+                    cnt = int(row[pr_d].item())
+                    if cnt == 0:
+                        continue
+                    parts.append(f"{pr_d}:{cnt}")
+                accelerator.print(f"  GT {gt_d} (n={total}) -> " + ", ".join(parts))
+
+        # 전체 출력
+        print_full_confusion(cm_pred, "GT->PRED", accelerator)
+        print_full_confusion(cm_tok,  "GT->TOK2DIG", accelerator)
+
+        # 6) ====== 숫자 그리드 렌더링 (PIL) ======
+        def render_digit_grid(
+            grid_9x9,
+            wrong_mask_9x9=None,     # 빨간 테두리 (GT vs PRED mismatch)
+            bg_mask_9x9=None,        # 연분홍 배경 (GT vs TOK2DIG mismatch)
+            cell=34, pad=3, border=3, title=None,
+            font_size=18,
+        ):
+            """
+            grid_9x9: (9,9) tensor/ndarray of ints
+            wrong_mask_9x9: (9,9) bool -> True면 빨간 테두리
+            bg_mask_9x9: (9,9) bool -> True면 연분홍 배경
+            """
+            grid_9x9 = grid_9x9.detach().cpu().numpy()
+            if wrong_mask_9x9 is not None:
+                wrong_mask_9x9 = wrong_mask_9x9.detach().cpu().numpy()
+            if bg_mask_9x9 is not None:
+                bg_mask_9x9 = bg_mask_9x9.detach().cpu().numpy()
+
+            # title을 더 타이트하게
+            title_h = 18 if title else 0
+            W = 9 * cell + 2 * pad
+            H = 9 * cell + 2 * pad + title_h
+
+            img = Image.new("RGB", (W, H), (255, 255, 255))
+            draw = ImageDraw.Draw(img)
+
+            # 폰트: 있으면 truetype로 크게, 없으면 default
+            font = None
+            try:
+                # 컨테이너에 보통 있는 폰트 경로(없으면 except)
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            except Exception:
+                font = ImageFont.load_default()
+
+            if title:
+                draw.text((pad, 0), title, fill=(0, 0, 0), font=font)
+
+            y0 = title_h
+
+            pink = (255, 230, 235)  # 연분홍 배경
+
+            for r in range(9):
+                for c in range(9):
+                    x1 = pad + c * cell
+                    y1 = y0 + pad + r * cell
+                    x2 = x1 + cell
+                    y2 = y1 + cell
+
+                    # 배경 채우기 (GT vs TOK2DIG mismatch)
+                    if bg_mask_9x9 is not None and bool(bg_mask_9x9[r, c]):
+                        draw.rectangle([x1, y1, x2, y2], fill=pink)
+
+                    # 기본 셀 테두리 (연한 회색)
+                    draw.rectangle([x1, y1, x2, y2], outline=(200, 200, 200), width=1)
+
+                    val = int(grid_9x9[r, c])
+                    s = str(val)
+
+                    # text centering (Pillow>=10)
+                    bbox = draw.textbbox((0, 0), s, font=font)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    tx = x1 + (cell - tw) / 2
+                    ty = y1 + (cell - th) / 2
+                    draw.text((tx, ty), s, fill=(0, 0, 0), font=font)
+
+                    # 빨간 테두리 (GT vs PRED mismatch)
+                    if wrong_mask_9x9 is not None and bool(wrong_mask_9x9[r, c]):
+                        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=border)
+
+            return img
+        def tile_images(img_list, nrow, pad=10, bg=(255,255,255)):
+            """
+            img_list: list of PIL Images (same size)
+            nrow: columns
+            """
+            if len(img_list) == 0:
+                return None
+            w, h = img_list[0].size
+            ncol = nrow
+            nrows = math.ceil(len(img_list) / ncol)
+            out_w = ncol * w + (ncol + 1) * pad
+            out_h = nrows * h + (nrows + 1) * pad
+            canvas = Image.new("RGB", (out_w, out_h), bg)
+
+            for i, im in enumerate(img_list):
+                rr = i // ncol
+                cc = i % ncol
+                x = pad + cc * (w + pad)
+                y = pad + rr * (h + pad)
+                canvas.paste(im, (x, y))
+            return canvas
+
+        # 7) batch 전체를 타일로 모아서 GT / TOK2DIG / PRED 3장 저장
+        #    빨간 테두리는 "GT vs PRED 불일치" 기준을 모든 그림에 동일하게 적용
+        gt_imgs = []
+        tok_imgs = []
+        pred_imgs = []
+
+        # GT vs TOK2DIG mismatch (분홍 배경)
+        wrong_mask_tok = (pred_from_tok != gt_9)  # (B,9,9)
+
+        for i in range(B):
+            wm_red = wrong_mask_pred[i]   # GT vs PRED mismatch -> 빨간 테두리
+            wm_pink = wrong_mask_tok[i]   # GT vs TOK2DIG mismatch -> 분홍 배경
+
+            gt_imgs.append(render_digit_grid(
+                gt_9[i],
+                wrong_mask_9x9=wm_red,
+                bg_mask_9x9=wm_pink,
+                title=None #f"GT #{i}"
+            ))
+            tok_imgs.append(render_digit_grid(
+                pred_from_tok[i],
+                wrong_mask_9x9=wm_red,
+                bg_mask_9x9=wm_pink,
+                title=None #f"TOK2DIG #{i}"
+            ))
+            pred_imgs.append(render_digit_grid(
+                pred_9[i],
+                wrong_mask_9x9=wm_red,
+                bg_mask_9x9=wm_pink,
+                title=None #f"PRED #{i}"
+            ))
+
+        # 타일 nrow는 기존 n_per_class 쓰면 보기 좋음
+        nrow = n_per_class if 'n_per_class' in locals() else min(B, 8)
+
+        gt_canvas  = tile_images(gt_imgs,  nrow=nrow)
+        tok_canvas = tile_images(tok_imgs, nrow=nrow)
+        pr_canvas  = tile_images(pred_imgs, nrow=nrow)
+
+        viz_dir = os.path.join(eval_dir, "grid_digits")
+        os.makedirs(viz_dir, exist_ok=True)
+
+        gt_path  = os.path.join(viz_dir, f"step_{global_step}{suf}_GT.png")
+        tok_path = os.path.join(viz_dir, f"step_{global_step}{suf}_TOK2DIG.png")
+        pr_path  = os.path.join(viz_dir, f"step_{global_step}{suf}_PRED.png")
+
+        gt_canvas.save(gt_path)
+        tok_canvas.save(tok_path)
+        pr_canvas.save(pr_path)
+
+        accelerator.print(f"[Eval] Saved digit grids:\n  {gt_path}\n  {tok_path}\n  {pr_path}")
+        # ============================================================
+
+        # 필요하면 result를 밖에서 쓰기 좋게 묶어서 리턴/저장
+        # 예) 디버깅용으로 첫 샘플 비교 출력
+        # accelerator.print("GT[0]:\n", gt[0])
+        # accelerator.print("PR[0]:\n", s_eval["discrete"][0])
+        # accelerator.print("WRONG[0]:\n", wrong_mask[0].int())
     unwrapped_model.train()
 
     accelerator.print(f"[Eval] Saved eval samples to {out_path}")
@@ -1391,14 +1232,10 @@ def main():
         uncond_drop_prob=args.uncond_drop_prob,
         concat_conditioning=args.concat_conditioning,
         concat_downsample_factor=args.concat_downsample_factor,
-        concat_channels=args.concat_channels,
         use_fsq=args.use_fsq,
         fsq_levels=args.fsq_levels,
         fsq_drop_quant_p=args.fsq_drop_quant_p,
         fsq_corrupt_tokens_p=args.fsq_corrupt_tokens_p,
-        use_vq_discretizer=args.use_vq_discretizer,
-        vq_codebook_size=args.vq_codebook_size,
-        vq_beta=args.vq_beta,
         patch_conditioning=args.patch_conditioning,
         patch_grid_size=args.patch_grid_size,
     )
@@ -1563,24 +1400,14 @@ def main():
                     timesteps=timesteps,
                 )
 
-            vq_loss = None
             # class conditioning or image conditioning
             if args.image_conditioning:
-                if not args.use_vq_discretizer:
-                    # 🔹 이미지 기반 conditioning: encoder(cond_image) 사용
-                    pred_noise = model(
-                        noisy_inputs,
-                        timesteps,
-                        cond_image=images,   # 원본(또는 padded) 이미지를 condition으로 사용
-                    )
-                else:
-                    # 🔹 VQ discretizer 기반 이미지 conditioning
-                    pred_noise, vq_loss = model(
-                        noisy_inputs,
-                        timesteps,
-                        cond_image=images,   # 원본(또는 padded) 이미지를 condition으로 사용
-                        return_aux_loss=True,
-                    )
+                # 🔹 이미지 기반 conditioning: encoder(cond_image) 사용
+                pred_noise = model(
+                    noisy_inputs,
+                    timesteps,
+                    cond_image=images,   # 원본(또는 padded) 이미지를 condition으로 사용
+                )
             else:
                 # 🔹 기존 label conditioning
                 pred_noise = model(
@@ -1605,9 +1432,6 @@ def main():
                 raise ValueError(f"Unknown prediction_type: {args.prediction_type}")
             
             loss = F.mse_loss(pred_noise, target)
-
-            if vq_loss is not None:
-                loss = loss + args.vq_loss_weight * vq_loss
 
             loss = loss / args.grad_accum_steps
             accelerator.backward(loss)
@@ -1640,7 +1464,6 @@ def main():
                 logs = {
                     "step_loss": f"{avg_loss:.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                    "vq_loss": f"{(args.vq_loss_weight * vq_loss).item() if vq_loss is not None else 0:.4f}",
                 }
                 progress_bar.set_postfix(**logs)
 

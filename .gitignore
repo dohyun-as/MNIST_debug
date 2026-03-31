@@ -1,4 +1,7 @@
 outputs
-datasets
+/datasets
 data
 __pycache__
+/ldm_vae_ckpt
+/ILSVRC
+src/ldm

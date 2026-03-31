@@ -201,17 +201,27 @@ class DDiTFinalLayer(nn.Module):
 
 class DIT(nn.Module):
     """
-    DiT backbone for discrete diffusion on flattened image tokens.
+    DiT backbone for discrete diffusion on flattened token sequences.
+
+    Supports:
+    - Sudoku grids (pos_emb_type="2d" / "sudoku")
+    - Multi-resolution image tokens (pos_emb_type="multires")
+    - Generic 1D sequences (pos_emb_type="1d")
+    - Optional class-label conditioning via adaLN (num_classes > 0)
+    - Optional cross-attention conditioning (use_cross_attn=True)
 
     Args:
         vocab_size:   number of discrete token values (including mask token)
-        seq_len:      sequence length (e.g. 28*28 = 784 for MNIST)
+        seq_len:      sequence length
         hidden_size:  transformer hidden dim
         n_heads:      number of attention heads
         n_blocks:     number of transformer blocks
         cond_dim:     conditioning vector size (timestep embedding dim)
         mlp_ratio:    MLP expansion ratio
         dropout:      dropout probability
+        num_classes:  number of class labels for adaLN conditioning (0=disabled)
+        level_sizes:  list of spatial sizes per level for multires pos emb,
+                      e.g. [8, 4, 2, 1].  Required when pos_emb_type="multires".
     """
 
     def __init__(
@@ -230,18 +240,22 @@ class DIT(nn.Module):
         sudoku_hw: int = 9,
         use_sudoku_pos_emb: bool = False,
         pos_emb_type: str = "2d",
+        num_classes: int = 0,
+        level_sizes: list | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.use_cross_attn = use_cross_attn
+        self.num_classes = num_classes
 
         # backward compat: old use_sudoku_pos_emb=True → pos_emb_type="sudoku"
         if use_sudoku_pos_emb:
             pos_emb_type = "sudoku"
 
-        assert pos_emb_type in ("1d", "2d", "sudoku"), (
-            f"pos_emb_type must be '1d', '2d', or 'sudoku', got '{pos_emb_type}'")
+        assert pos_emb_type in ("1d", "2d", "sudoku", "multires"), (
+            f"pos_emb_type must be '1d', '2d', 'sudoku', or 'multires', "
+            f"got '{pos_emb_type}'")
         self.pos_emb_type = pos_emb_type
 
         self.token_emb = nn.Embedding(vocab_size, hidden_size)
@@ -266,7 +280,44 @@ class DIT(nn.Module):
             cols = torch.arange(seq_len) % sudoku_hw
             boxes = (rows // 3) * 3 + (cols // 3)
             self.register_buffer("box_idx", boxes, persistent=False)
+
+        # ── multi-resolution positional embedding ──
+        if pos_emb_type == "multires":
+            assert level_sizes is not None, (
+                "level_sizes required for pos_emb_type='multires'")
+            self.level_sizes = list(level_sizes)
+            expected_len = sum(s * s for s in level_sizes)
+            if seq_len != expected_len:
+                raise ValueError(
+                    f"pos_emb_type='multires' with level_sizes={level_sizes} "
+                    f"expects seq_len={expected_len}, got {seq_len}")
+            n_levels = len(level_sizes)
+            max_s = max(level_sizes)
+            self.mr_level_emb = nn.Embedding(n_levels, hidden_size)
+            self.mr_row_emb = nn.Embedding(max_s, hidden_size)
+            self.mr_col_emb = nn.Embedding(max_s, hidden_size)
+            level_ids, row_ids, col_ids = [], [], []
+            for li, s in enumerate(level_sizes):
+                for r in range(s):
+                    for c in range(s):
+                        level_ids.append(li)
+                        row_ids.append(r)
+                        col_ids.append(c)
+            self.register_buffer("mr_level_idx",
+                                 torch.tensor(level_ids), persistent=False)
+            self.register_buffer("mr_row_idx",
+                                 torch.tensor(row_ids), persistent=False)
+            self.register_buffer("mr_col_idx",
+                                 torch.tensor(col_ids), persistent=False)
+
         self.sigma_map = TimestepEmbedder(cond_dim)
+
+        # ── class-label conditioning (adaLN) ──
+        if num_classes > 0:
+            # +1 index reserved for "null class" (CFG unconditional)
+            self.label_emb = nn.Embedding(num_classes + 1, cond_dim)
+        else:
+            self.label_emb = None
 
         # ── optional conditioning embeddings for cross-attention ──
         if use_cross_attn and cond_seq_codebook_size > 0:
@@ -300,12 +351,14 @@ class DIT(nn.Module):
         return h
 
     def forward(self, indices: torch.Tensor, sigma: torch.Tensor,
-                cond_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
+                cond_tokens: Optional[torch.Tensor] = None,
+                class_labels: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Args:
-            indices:     (B, L) int64 token indices
-            sigma:       (B,) float  noise level
-            cond_tokens: (B, L_cond, D) optional cross-attn conditioning.
-                         Can also be (B, L_cond) int64 if cond_emb exists.
+            indices:      (B, L) int64 token indices
+            sigma:        (B,) float  noise level
+            cond_tokens:  (B, L_cond, D) optional cross-attn conditioning.
+                          Can also be (B, L_cond) int64 if cond_emb exists.
+            class_labels: (B,) int64 optional class labels for adaLN cond.
         Returns:
             logits: (B, L, vocab_size)
         """
@@ -323,7 +376,17 @@ class DIT(nn.Module):
             if self.pos_emb_type == "sudoku":
                 pos = pos + self.box_emb(self.box_idx)
             x = x + pos[None, :, :]
+        elif self.pos_emb_type == "multires":
+            pos = (self.mr_level_emb(self.mr_level_idx) +
+                   self.mr_row_emb(self.mr_row_idx) +
+                   self.mr_col_emb(self.mr_col_idx))
+            x = x + pos[None, :, :]
+
         c = F.silu(self.sigma_map(sigma))  # (B, cond_dim)
+
+        # add class-label conditioning
+        if class_labels is not None and self.label_emb is not None:
+            c = c + F.silu(self.label_emb(class_labels))
 
         for blk in self.blocks:
             x = blk(x, c, cond_tokens=cond_tokens)

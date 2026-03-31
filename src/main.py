@@ -31,6 +31,7 @@ from sampling import sample_ddim_with_cfg
 
 from concurrent.futures import ThreadPoolExecutor
 import importlib
+import gc
 
 def parse_step_from_dir(path: str) -> int:
     # accepts ".../step12345" or ".../step12345/"
@@ -97,6 +98,8 @@ def print_model_sizes(
     concat_downsample_factor: int,
     patch_conditioning: bool = False,
     patch_grid_size: int = 9,
+    encoder_type: str = 'cnn',
+    vit_patch_size: int = 4,
 ):
     if not accelerator.is_main_process:
         return
@@ -128,7 +131,15 @@ def print_model_sizes(
         if patch_conditioning:
             h, w, L = patch_grid_size, patch_grid_size, patch_grid_size * patch_grid_size
             accelerator.print(
-                f"[COND] image_conditioning (patchwise) tokens: h={h}, w={w}, L={L} (grid={patch_grid_size}x{patch_grid_size})"
+                f"[COND] image_conditioning (patchwise, {encoder_type}) tokens: h={h}, w={w}, L={L} (grid={patch_grid_size}x{patch_grid_size})"
+            )
+        elif encoder_type == 'vit':
+            h = model_image_size // vit_patch_size
+            w = model_image_size // vit_patch_size
+            L = h * w
+            accelerator.print(
+                f"[COND] image_conditioning (vit) tokens: h={h}, w={w}, L={L} "
+                f"(image={model_image_size}x{model_image_size}, patch={vit_patch_size})"
             )
         else:
             h, w, L = compute_image_token_hw(
@@ -137,7 +148,7 @@ def print_model_sizes(
                 downsample_factor=concat_downsample_factor,
             )
             accelerator.print(
-                f"[COND] image_conditioning tokens: h={h}, w={w}, L={L} "
+                f"[COND] image_conditioning (cnn) tokens: h={h}, w={w}, L={L} "
                 f"(image={model_image_size}x{model_image_size}, down={concat_downsample_factor})"
             )
 
@@ -276,6 +287,8 @@ def parse_args():
     parser.add_argument("--concat_conditioning", action="store_true")
     parser.add_argument("--concat_downsample_factor", type=int, default=16)
     parser.add_argument("--concat_channels", type=int, default=4)
+    parser.add_argument("--normalize_concat", action="store_true",
+                        help="If set, normalize the conditioning map before concatenation (per-sample, per-channel).")
     parser.add_argument("--cond_dim", type=int, default=None)
     parser.add_argument("--use_fsq", action="store_true")
     parser.add_argument("--fsq_levels", type=int, nargs="+",
@@ -311,6 +324,41 @@ def parse_args():
         default=9,
         help="Grid size for Sudoku evaluator (N means NxN). Use 1 to disable Sudoku rule check and only discretize.",
     )
+
+    # --- encoder type selection ---
+    parser.add_argument(
+        "--encoder_type",
+        type=str,
+        default="cnn",
+        choices=["cnn", "vit"],
+        help="Encoder backbone type: 'cnn' (ResNet-style) or 'vit' (Vision Transformer).",
+    )
+    parser.add_argument("--vit_patch_size", type=int, default=4,
+                        help="Patch size for ViT encoder (pixels per patch side). "
+                             "For patchwise mode, this is the sub-patch size within each grid cell.")
+    parser.add_argument("--vit_depth", type=int, default=4,
+                        help="Number of transformer layers in the ViT encoder.")
+    parser.add_argument("--vit_num_heads", type=int, default=4,
+                        help="Number of attention heads in the ViT encoder.")
+    parser.add_argument("--vit_mlp_ratio", type=float, default=4.0,
+                        help="MLP expansion ratio in the ViT encoder.")
+
+    # --- MAE-style masking during training ---
+    parser.add_argument("--mae_mask_ratio", type=float, default=0.0,
+                        help="Fraction of image patches to mask (MAE-style) during training. "
+                             "Used when --encoder_type vit and NOT --patch_conditioning.")
+    parser.add_argument("--mae_patch_mask_ratio", type=float, default=0.0,
+                        help="Fraction of sub-patches to mask within each grid cell during training. "
+                             "Used when --encoder_type vit and --patch_conditioning.")
+    parser.add_argument("--mae_cell_mask_ratio", type=float, default=0.0,
+                        help="Fraction of entire grid cells to mask during training. "
+                             "Used when --encoder_type vit and --patch_conditioning.")
+    parser.add_argument("--use_averaged_features", action="store_true", default=False,
+                        help="Use averaged patch features instead of CLS token for aggregation. "
+                             "Default: False (uses CLS token)")
+    parser.add_argument("--num_timestep_buckets", type=int, default=1,
+                        help="Number of timestep buckets for timestep-specific conditioning. "
+                             "Only used with image_conditioning. Default: 1 (no bucketing).")
 
     # diffusion (for DDPMScheduler)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
@@ -1401,6 +1449,21 @@ def main():
         vq_beta=args.vq_beta,
         patch_conditioning=args.patch_conditioning,
         patch_grid_size=args.patch_grid_size,
+        # --- encoder type & ViT params ---
+        encoder_type=args.encoder_type,
+        vit_patch_size=args.vit_patch_size,
+        vit_depth=args.vit_depth,
+        vit_num_heads=args.vit_num_heads,
+        vit_mlp_ratio=args.vit_mlp_ratio,
+        # --- MAE masking ---
+        mae_mask_ratio=args.mae_mask_ratio,
+        mae_patch_mask_ratio=args.mae_patch_mask_ratio,
+        mae_cell_mask_ratio=args.mae_cell_mask_ratio,
+        normalize_concat=args.normalize_concat,
+        # --- patch encoder aggregation ---
+        use_cls_token=not args.use_averaged_features,
+        # --- timestep bucket conditioning ---
+        num_timestep_buckets=args.num_timestep_buckets,
     )
 
     optimizer = torch.optim.AdamW(
@@ -1457,6 +1520,8 @@ def main():
     concat_downsample_factor=args.concat_downsample_factor,
     patch_conditioning=args.patch_conditioning,
     patch_grid_size=args.patch_grid_size,
+    encoder_type=args.encoder_type,
+    vit_patch_size=args.vit_patch_size,
     )
 
     # 에폭/스텝 계산
@@ -1661,6 +1726,11 @@ def main():
                 # evaluation
                 if (global_step % args.eval_every == 0):
 
+                    # ── 메모리 정리: training 중간 텐서(grad 등) 해제 후 eval 진입 ──
+                    optimizer.zero_grad(set_to_none=True)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                     # CFG (g=args.guidance_scale) - 스케일이 1이면 굳이 또 안 돌려도 됨
                     if args.guidance_scale != 1.0:
                         run_evaluation(
@@ -1692,7 +1762,10 @@ def main():
                         sudoku_evaluator=sudoku_evaluator,
                     )
 
-                        
+                    # ── eval 끝난 뒤 메모리 정리 ──
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                 # save checkpoint (accelerate state)
                 if (global_step % args.save_every == 0):
                     ckpt_root = os.path.join(args.output_dir, "ckpt")

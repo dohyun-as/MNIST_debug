@@ -1607,12 +1607,14 @@ def evaluate_image_cond(
     val_grids: torch.Tensor,
     val_dataset_raw=None,
 ):
-    """Evaluate image_cond_mode: sample tok_ids → render images → sudoku eval.
+    """Evaluate image_cond_mode (mirrors grid-mode evaluate_and_save).
 
-    1) Sample tok_ids from discrete diffusion (unconditional)
-    2) Render images using ConditionalUNet (DDIM)
-    3) Run sudoku evaluator on rendered images
-    4) Compare sampled tok_ids with GT cached tok_ids
+    Unconditional:
+      1) Sample tok_ids → render images → eval_images → digit grids
+      2) Rule checks, digit distribution, violation visualisation
+      3) GT rendering sanity check + tok2digit analysis
+
+    Then delegates to evaluate_image_cond_difficulty for per-task eval.
     """
     if not accelerator.is_main_process:
         return
@@ -1629,12 +1631,17 @@ def evaluate_image_cond(
         ema.store(params)
         ema.copy_to(params)
 
-    save_dir = os.path.join(args.output_dir, "eval_samples")
-    os.makedirs(save_dir, exist_ok=True)
+    # ════════════════════════════════════════════════════════
+    #  Unconditional evaluation
+    # ════════════════════════════════════════════════════════
+    uncond_dir = os.path.join(args.output_dir, "eval_samples", "unconditional")
+    os.makedirs(uncond_dir, exist_ok=True)
 
     seq_len = model.backbone.seq_len
     vocab_size = model.data_vocab_size
+    grid_hw = 9  # sudoku
     n_samples = min(args.eval_num_samples, len(val_cached_tok_ids))
+    B = n_samples
 
     # ── 1) Sample tok_ids from discrete diffusion ──
     sampled_tok = model.sample(
@@ -1644,69 +1651,74 @@ def evaluate_image_cond(
         device=device,
         sampler=args.sampler,
         noise_removal=True,
+        tokens_per_step=args.tokens_per_step,
     )  # (B, L)
 
-    # ── 2) Compare with GT tok_ids ──
+    # ── 2) tok_acc vs GT (image_cond specific) ──
     gt_tok = val_cached_tok_ids[:n_samples].to(device)
     tok_acc = (sampled_tok == gt_tok).float().mean().item()
     wrong_per_seq = (sampled_tok != gt_tok).float().sum(dim=1).mean().item()
 
-    accelerator.print(
-        f"[eval] step={step}  tok_acc={tok_acc:.4f}  "
-        f"wrong_per_seq={wrong_per_seq:.2f}/{seq_len}")
-
-    # token distribution
-    vals = sampled_tok.flatten()
-    total = vals.numel()
-    counts = torch.bincount(vals, minlength=vocab_size)
+    # token distribution (top-k)
+    tok_vals = sampled_tok.flatten()
+    tok_counts = torch.bincount(tok_vals, minlength=vocab_size)
     top_k = min(10, vocab_size)
-    top_vals, top_ids = counts.topk(top_k)
-    dist_strs = [f"tok={tid}:{cnt}" for tid, cnt in
-                 zip(top_ids.tolist(), top_vals.tolist())]
-    accelerator.print(f"[eval] token dist (top-{top_k}): {', '.join(dist_strs)}")
+    top_vals, top_ids = tok_counts.topk(top_k)
+    tok_dist_strs = [f"tok={tid}:{cnt}" for tid, cnt in
+                     zip(top_ids.tolist(), top_vals.tolist())]
 
-    # ── 3) Render images from sampled tok_ids ──
+    accelerator.print(
+        f"[eval/uncond] step={step}  tok_acc={tok_acc:.4f}  "
+        f"wrong_per_seq={wrong_per_seq:.2f}/{seq_len}")
+    accelerator.print(
+        f"[eval/uncond] token dist (top-{top_k}): {', '.join(tok_dist_strs)}")
+
+    # ── 3) Render images from sampled tok_ids (ALL samples) ──
     pred_type = getattr(args, "_cond_prediction_type", "sample")
-    n_render = min(n_samples, 72)  # render at most 72 images
     ddim_steps = getattr(args, "cond_eval_ddim_steps", 50)
-
     rbs = getattr(args, "eval_render_batch_size", 16)
+
     rendered_imgs = render_images_from_tok_ids(
-        sampled_tok[:n_render],
-        cond_unet,
+        sampled_tok, cond_unet,
         num_inference_steps=ddim_steps,
         prediction_type=pred_type,
         render_batch_size=rbs,
     )  # (B, 1, H, W) in [-1,1]
-
     rendered_01 = (rendered_imgs.clamp(-1, 1) + 1) * 0.5
 
-    # Also render GT tok_ids for comparison
+    # Also render GT tok_ids for sanity check
     gt_rendered = render_images_from_tok_ids(
-        gt_tok[:n_render],
-        cond_unet,
+        gt_tok, cond_unet,
         num_inference_steps=ddim_steps,
         prediction_type=pred_type,
         render_batch_size=rbs,
     )
     gt_rendered_01 = (gt_rendered.clamp(-1, 1) + 1) * 0.5
 
-    # ── 4) Save rendered grids ──
-    nrow = min(9, int(math.sqrt(n_render)) + 1)
+    # ── 4) Save rendered image grids (for visual inspection) ──
+    n_vis = min(64, B)
+    nrow = min(8, int(math.sqrt(n_vis)))
+    nrow_img = min(9, int(math.sqrt(n_vis)) + 1)
 
-    # sampled tok → images
-    grid_sampled = make_grid(rendered_01, nrow=nrow, padding=2)
-    save_image(
-        grid_sampled,
-        os.path.join(save_dir, f"step_{step:07d}_sampled_imgs.png"))
+    grid_sampled = make_grid(rendered_01[:n_vis], nrow=nrow_img, padding=2)
+    save_image(grid_sampled,
+               os.path.join(uncond_dir, f"step_{step:07d}_sampled_imgs.png"))
+    grid_gt = make_grid(gt_rendered_01[:n_vis], nrow=nrow_img, padding=2)
+    save_image(grid_gt,
+               os.path.join(uncond_dir, f"step_{step:07d}_gt_imgs.png"))
 
-    # GT tok → images
-    grid_gt = make_grid(gt_rendered_01, nrow=nrow, padding=2)
-    save_image(
-        grid_gt,
-        os.path.join(save_dir, f"step_{step:07d}_gt_imgs.png"))
+    # ── 5) Sudoku eval via eval_images ──
+    # Initialize metrics that may be set inside try block
+    rule_acc = None
+    row_acc = None
+    col_acc = None
+    box_acc = None
+    cell_acc = None
+    cell_acc_gt = None
+    rule_acc_gt = None
+    tok2digit_acc = None
+    digit_dist_strs = []
 
-    # ── 5) Sudoku evaluator  (same pipeline as main.py run_evaluation) ──
     try:
         classifier_pth = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1720,14 +1732,13 @@ def evaluate_image_cond(
             grid_size=(9, 9),
         )
 
-        gt_9x9 = val_grids[:n_render].to(device).long()
+        gt_9x9 = val_grids[:n_samples].to(device).long()  # (B, 9, 9) in [1,9]
 
         # ── eval on sampled-tok rendered images ──
-        fake_m11 = rendered_imgs[:n_render].clamp(-1, 1)
-        s_eval = evaluator.eval_images(fake_m11)
-        pred_grid = s_eval["discrete"].long()  # (B, 9, 9)
+        s_eval = evaluator.eval_images(rendered_imgs.clamp(-1, 1))
+        pred_grid = s_eval["discrete"].long()  # (B, 9, 9) in [1,9]
 
-        # cell accuracy  (pred vs GT grid)
+        # cell accuracy (pred vs GT)
         wrong_mask = (pred_grid != gt_9x9)
         n_wrong = wrong_mask.flatten(1).sum(dim=1)
         cell_acc = (~wrong_mask).float().mean().item()
@@ -1735,19 +1746,42 @@ def evaluate_image_cond(
         # sudoku rule check
         n_valid, n_row, n_col, n_box, n_total = check_sudoku_rules(pred_grid)
         rule_acc = n_valid / max(n_total, 1)
+        row_acc  = n_row  / max(n_total, 1)
+        col_acc  = n_col  / max(n_total, 1)
+        box_acc  = n_box  / max(n_total, 1)
+
+        # digit distribution (from predicted grids, [1,9])
+        pred_vals = pred_grid.flatten()
+        for v in range(1, 10):
+            cnt = (pred_vals == v).sum().item()
+            digit_dist_strs.append(
+                f"digit {v}: {cnt} ({cnt / pred_vals.numel() * 100:.1f}%)")
 
         accelerator.print(
-            f"[eval][sampled] step={step}  "
+            f"[eval/uncond] step={step}  n={n_total}  "
+            f"rule_acc={rule_acc:.4f}  "
+            f"(row={row_acc:.4f} col={col_acc:.4f} box={box_acc:.4f})  "
             f"cell_acc={cell_acc:.4f}  "
-            f"rule_acc={rule_acc:.4f} ({n_valid}/{n_total})  "
-            f"row={n_row} col={n_col} box={n_box}  "
             f"wrong_mean={n_wrong.float().mean():.2f}")
+
+        # ── save digit grid images (with rule violations marked) ──
+        sample_digit_imgs = []
+        for i in range(n_vis):
+            g_np = (pred_grid[i] - 1).cpu().numpy()  # [0,8] for violation check
+            viol = _find_rule_violations(g_np, grid_hw)
+            viol_mask = torch.from_numpy(viol)
+            sample_digit_imgs.append(
+                render_digit_grid(pred_grid[i], wrong_mask=viol_mask))
+        canvas = tile_images(sample_digit_imgs, nrow=nrow)
+        if canvas is not None:
+            canvas.save(os.path.join(
+                uncond_dir, f"step_{step:07d}_sampled.png"))
 
         # detailed wrong cell analysis (only when few errors)
         total_wrong = int(wrong_mask.sum().item())
         if total_wrong < 10:
             accelerator.print(
-                f"[eval][sampled] TOTAL wrong cells={total_wrong} (<10)")
+                f"[eval/uncond] TOTAL wrong cells={total_wrong} (<10)")
             wm = wrong_mask.detach().cpu()
             gt_cpu = gt_9x9.detach().cpu()
             pr_cpu = pred_grid.detach().cpu()
@@ -1756,7 +1790,7 @@ def evaluate_image_cond(
                 if coords.numel() == 0:
                     continue
                 accelerator.print(
-                    f"[eval][sampled] sample#{bi} wrong={coords.shape[0]}")
+                    f"[eval/uncond] sample#{bi} wrong={coords.shape[0]}")
                 for r, c in coords.tolist():
                     accelerator.print(
                         f"  - (row={r}, col={c}) "
@@ -1764,23 +1798,21 @@ def evaluate_image_cond(
                         f"PRED={int(pr_cpu[bi,r,c])}")
 
         # ── eval on GT-tok rendered images (sanity check) ──
-        gt_m11 = gt_rendered[:n_render].clamp(-1, 1)
-        s_gt_eval = evaluator.eval_images(gt_m11)
+        s_gt_eval = evaluator.eval_images(gt_rendered.clamp(-1, 1))
         gt_pred_grid = s_gt_eval["discrete"].long()
-
         wrong_mask_gt = (gt_pred_grid != gt_9x9)
         cell_acc_gt = (~wrong_mask_gt).float().mean().item()
         n_valid_gt, _, _, _, _ = check_sudoku_rules(gt_pred_grid)
         rule_acc_gt = n_valid_gt / max(n_total, 1)
 
         accelerator.print(
-            f"[eval][gt_tok] step={step}  "
+            f"[eval/uncond][gt_tok] step={step}  "
             f"cell_acc={cell_acc_gt:.4f}  "
             f"rule_acc={rule_acc_gt:.4f} ({n_valid_gt}/{n_total})  "
             f"wrong_mean={wrong_mask_gt.flatten(1).sum(1).float().mean():.2f}")
 
         # ── tok2digit analysis ──
-        tok_ids_2d = sampled_tok[:n_render].view(-1, 9, 9).long()
+        tok_ids_2d = sampled_tok.view(-1, 9, 9).long()
         gt_flat = gt_9x9.reshape(-1).clamp(0, 9).long()
         tid_flat = tok_ids_2d.reshape(-1).long()
         vocab_n = int(tid_flat.max().item()) + 1
@@ -1790,43 +1822,50 @@ def evaluate_image_cond(
         pred_from_tok = tok2digit[tok_ids_2d]
         tok2digit_acc = (pred_from_tok == gt_9x9).float().mean().item()
 
-        # tok2digit confusion
-        wrong_tok_vs_pred = (pred_from_tok != pred_grid)
-        acc_tok_vs_pred = (~wrong_tok_vs_pred).float().mean().item()
-
         accelerator.print(
-            f"[eval] tok2digit_acc(vs GT)={tok2digit_acc:.4f}  "
-            f"tok2digit_acc(vs PRED)={acc_tok_vs_pred:.4f}")
+            f"[eval/uncond] tok2digit_acc={tok2digit_acc:.4f}")
 
         # ── logging ──
-        log_dict = {
-            "eval/tok_acc": tok_acc,
-            "eval/wrong_per_seq": wrong_per_seq,
-            "eval/cell_acc": cell_acc,
-            "eval/rule_acc": rule_acc,
-            "eval/cell_acc_gt_tok": cell_acc_gt,
-            "eval/rule_acc_gt_tok": rule_acc_gt,
-            "eval/tok2digit_acc": tok2digit_acc,
+        uncond_log = {
+            "eval/uncond/rule_acc": rule_acc,
+            "eval/uncond/row_acc": row_acc,
+            "eval/uncond/col_acc": col_acc,
+            "eval/uncond/box_acc": box_acc,
+            "eval/uncond/cell_acc": cell_acc,
+            "eval/uncond/tok_acc": tok_acc,
+            "eval/uncond/wrong_per_seq": wrong_per_seq,
+            "eval/uncond/cell_acc_gt_tok": cell_acc_gt,
+            "eval/uncond/rule_acc_gt_tok": rule_acc_gt,
+            "eval/uncond/tok2digit_acc": tok2digit_acc,
         }
         if args.log_with:
-            accelerator.log(log_dict, step=step)
+            accelerator.log(uncond_log, step=step)
 
     except Exception as e:
         import traceback
-        accelerator.print(f"[eval] Sudoku evaluator failed: {e}")
+        accelerator.print(f"[eval/uncond] Sudoku evaluator failed: {e}")
         accelerator.print(traceback.format_exc())
         if args.log_with:
             accelerator.log({
-                "eval/tok_acc": tok_acc,
-                "eval/wrong_per_seq": wrong_per_seq,
+                "eval/uncond/tok_acc": tok_acc,
+                "eval/uncond/wrong_per_seq": wrong_per_seq,
             }, step=step)
 
     # ── 6) Save text details ──
-    txt_path = os.path.join(save_dir, f"step_{step:07d}_details.txt")
+    txt_path = os.path.join(uncond_dir, f"step_{step:07d}_details.txt")
     with open(txt_path, "w") as f:
-        f.write(f"step={step}\n")
-        f.write(f"tok_acc={tok_acc:.6f}\n")
-        f.write(f"wrong_per_seq={wrong_per_seq:.2f}\n")
+        f.write(f"step={step}  samples={n_samples}\n")
+        f.write(f"tok_acc={tok_acc:.6f}  wrong_per_seq={wrong_per_seq:.2f}\n")
+        if rule_acc is not None:
+            f.write(f"rule_acc={rule_acc:.6f}  "
+                    f"row={row_acc:.6f}  col={col_acc:.6f}  "
+                    f"box={box_acc:.6f}\n")
+        if cell_acc is not None:
+            f.write(f"cell_acc={cell_acc:.6f}\n")
+        if digit_dist_strs:
+            f.write("digit distribution:\n")
+            for dd in digit_dist_strs:
+                f.write(f"  {dd}\n")
         f.write(f"\nFirst 8 sampled tok_ids:\n")
         for i in range(min(8, n_samples)):
             f.write(f"  sample {i}: {sampled_tok[i].tolist()}\n")
@@ -1834,23 +1873,25 @@ def evaluate_image_cond(
         for i in range(min(8, n_samples)):
             f.write(f"  gt     {i}: {gt_tok[i].tolist()}\n")
 
-    accelerator.print(f"[eval] Saved → {save_dir}/")
+    accelerator.print(f"[eval/uncond] saved → {uncond_dir}/")
 
-    # ── 7) Difficulty-based inpainting eval (easy / medium / hard) ──
+    # ════════════════════════════════════════════════════════
+    #  Per-task inpainting (hard / medium / easy)
+    # ════════════════════════════════════════════════════════
+    if ema is not None:
+        ema.restore(params)
+    model.train()
     evaluate_image_cond_difficulty(
-        diffusion, step, args, accelerator,
+        diffusion, step, args, accelerator, ema,
         cond_unet=cond_unet,
         val_cached_tok_ids=val_cached_tok_ids,
         val_grids=val_grids,
     )
 
-    if ema is not None:
-        ema.restore(params)
-    model.train()
-
 
 # ────────────────────────────────────────────────────────────
 #  image_cond_mode: difficulty-based inpainting evaluation
+#  (mirrors evaluate_difficulty but with token→render→eval_images pipeline)
 # ────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -1859,6 +1900,7 @@ def evaluate_image_cond_difficulty(
     step: int,
     args,
     accelerator: Accelerator,
+    ema: EMA | None,
     cond_unet,
     val_cached_tok_ids: torch.Tensor,
     val_grids: torch.Tensor,
@@ -1869,8 +1911,9 @@ def evaluate_image_cond_difficulty(
       1) Reveal some GT tok_ids as hints
       2) Inpaint the rest via sample_inpaint()
       3) Render completed tok_ids → images via DDIM
-      4) Run sudoku evaluator on rendered images
-      5) Compare with GT grids
+      4) Run evaluator.eval_images() → digit grids
+      5) Evaluate: cell_acc (unknown / all), rule_acc (row/col/box),
+         digit distribution, comparison images with wrong-cell marking
     """
     if not accelerator.is_main_process:
         return
@@ -1882,18 +1925,27 @@ def evaluate_image_cond_difficulty(
     model = accelerator.unwrap_model(diffusion)
     model.eval()
 
+    params = list(model.parameters())
+    if ema is not None:
+        ema.store(params)
+        ema.copy_to(params)
+
     seq_len = model.backbone.seq_len
+    grid_hw = 9
     n_samples = min(args.eval_num_samples, len(val_cached_tok_ids))
     gt_tok = val_cached_tok_ids[:n_samples].to(device)   # (B, L)
-    gt_9x9 = val_grids[:n_samples].to(device).long()     # (B, 9, 9)
+    gt_9x9 = val_grids[:n_samples].to(device).long()     # (B, 9, 9) in [1,9]
     B = gt_tok.shape[0]
 
     pred_type = getattr(args, "_cond_prediction_type", "sample")
     ddim_steps = getattr(args, "cond_eval_ddim_steps", 50)
-    n_render = min(B, 72)
+    rbs = getattr(args, "eval_render_batch_size", 16)
+
+    nrow = min(8, int(math.sqrt(B)))
+    n_vis = min(64, B)
 
     log_dict = {}
-    summary_lines = [f"[eval/image_cond_diff] step={step}  samples={B}"]
+    summary_lines = [f"[eval] step={step}  samples_per_level={B}"]
 
     # ── set up evaluator once ──
     evaluator = None
@@ -1912,6 +1964,7 @@ def evaluate_image_cond_difficulty(
         accelerator.print(f"[eval/diff] Failed to load evaluator: {e}")
 
     for level_name, (hint_lo, hint_hi) in DIFFICULTY_LEVELS.items():
+        # ── per-task save directory ──
         task_dir = os.path.join(
             args.output_dir, "eval_samples", level_name)
         os.makedirs(task_dir, exist_ok=True)
@@ -1942,9 +1995,13 @@ def evaluate_image_cond_difficulty(
             num_steps=args.eval_num_steps,
             sampler=args.sampler,
             noise_removal=True,
+            tokens_per_step=args.tokens_per_step,
+            return_step_logs=True,
         )
         if isinstance(completed_tok, tuple):
-            completed_tok = completed_tok[0]
+            completed_tok, step_logs = completed_tok
+        else:
+            step_logs = None
 
         # ── tok_ids accuracy ──
         unknown_mask = ~known_mask
@@ -1958,65 +2015,134 @@ def evaluate_image_cond_difficulty(
             tok_acc_unk = 1.0
         tok_acc_all = (completed_tok == gt_tok).float().mean().item()
 
-        # ── render images ──
-        rbs = getattr(args, "eval_render_batch_size", 16)
+        # ── render ALL images ──
         rendered = render_images_from_tok_ids(
-            completed_tok[:n_render],
-            cond_unet,
+            completed_tok, cond_unet,
             num_inference_steps=ddim_steps,
             prediction_type=pred_type,
             render_batch_size=rbs,
-        )  # (B', 1, H, W)
-
+        )  # (B, 1, H, W)
         rendered_01 = (rendered.clamp(-1, 1) + 1) * 0.5
 
-        # ── save rendered grid ──
-        nrow = min(9, int(math.sqrt(n_render)) + 1)
-        grid_img = make_grid(rendered_01, nrow=nrow, padding=2)
+        # ── save rendered image grid ──
+        nrow_img = min(9, int(math.sqrt(n_vis)) + 1)
+        grid_img = make_grid(rendered_01[:n_vis], nrow=nrow_img, padding=2)
         save_image(
             grid_img,
             os.path.join(task_dir, f"step_{step:07d}_rendered.png"))
 
-        # ── sudoku eval ──
+        # ── sudoku eval via eval_images ──
         cell_acc = None
+        full_cell_acc = None
         rule_acc = None
+        row_acc = None
+        col_acc = None
+        box_acc = None
+        wrong_per_grid = None
+        digit_dist = []
+
         if evaluator is not None:
             try:
-                fake_m11 = rendered.clamp(-1, 1)
-                s_eval = evaluator.eval_images(fake_m11)
-                pred_grid = s_eval["discrete"].long()
-                gt_sub = gt_9x9[:n_render]
+                s_eval = evaluator.eval_images(rendered.clamp(-1, 1))
+                pred_grid = s_eval["discrete"].long()  # (B, 9, 9) in [1,9]
 
-                wrong_mask = (pred_grid != gt_sub)
-                cell_acc = (~wrong_mask).float().mean().item()
-                wrong_per_grid = wrong_mask.flatten(1).sum(1).float().mean().item()
+                # ── cell accuracy (unknown positions only) ──
+                known_mask_2d = known_mask.view(B, grid_hw, grid_hw)
+                unknown_mask_2d = ~known_mask_2d
+                n_unknown_cells = unknown_mask_2d.float().sum()
+                if n_unknown_cells > 0:
+                    cell_acc = (
+                        (pred_grid == gt_9x9) & unknown_mask_2d
+                    ).float().sum() / n_unknown_cells
+                    cell_acc = cell_acc.item()
+                else:
+                    cell_acc = 1.0
 
+                # ── full-grid cell accuracy ──
+                full_cell_acc = (pred_grid == gt_9x9).float().mean().item()
+                wrong_per_grid = (
+                    pred_grid != gt_9x9
+                ).float().sum(dim=(1, 2)).mean().item()
+
+                # ── sudoku rule check ──
                 n_valid, n_row, n_col, n_box, n_total = check_sudoku_rules(
                     pred_grid)
                 rule_acc = n_valid / max(n_total, 1)
+                row_acc  = n_row  / max(n_total, 1)
+                col_acc  = n_col  / max(n_total, 1)
+                box_acc  = n_box  / max(n_total, 1)
 
+                # ── digit distribution ──
+                vals = pred_grid.flatten()
+                for v in range(1, 10):
+                    cnt = (vals == v).sum().item()
+                    digit_dist.append(
+                        f"  digit {v}: {cnt} "
+                        f"({cnt / vals.numel() * 100:.1f}%)")
+
+                # ── logging ──
                 prefix = f"eval/{level_name}"
+                log_dict[f"{prefix}/cell_acc_unknown"] = cell_acc
+                log_dict[f"{prefix}/cell_acc"] = full_cell_acc
+                log_dict[f"{prefix}/wrong_per_grid"] = wrong_per_grid
+                log_dict[f"{prefix}/rule_acc"] = rule_acc
+                log_dict[f"{prefix}/row_acc"] = row_acc
+                log_dict[f"{prefix}/col_acc"] = col_acc
+                log_dict[f"{prefix}/box_acc"] = box_acc
+                log_dict[f"{prefix}/avg_hints"] = avg_hints
                 log_dict[f"{prefix}/tok_acc_unk"] = tok_acc_unk
                 log_dict[f"{prefix}/tok_acc_all"] = tok_acc_all
-                log_dict[f"{prefix}/cell_acc"] = cell_acc
-                log_dict[f"{prefix}/rule_acc"] = rule_acc
 
                 summary_lines.append(
                     f"  {level_name:6s}  hints={avg_hints:5.1f}  "
-                    f"tok_acc(unk)={tok_acc_unk:.4f}  "
-                    f"tok_acc(all)={tok_acc_all:.4f}  "
-                    f"cell_acc={cell_acc:.4f}  "
-                    f"rule_acc={rule_acc:.4f} ({n_valid}/{n_total})  "
-                    f"wrong/grid={wrong_per_grid:.2f}")
+                    f"cell_acc(unk)={cell_acc:.4f}  "
+                    f"cell_acc(all)={full_cell_acc:.4f}  "
+                    f"rule_acc={rule_acc:.4f}  "
+                    f"(row={row_acc:.4f} col={col_acc:.4f} box={box_acc:.4f})  "
+                    f"tok_acc(unk)={tok_acc_unk:.4f}")
+
+                # ── save: digit-grid images (sampled) ──
+                sample_imgs = [
+                    render_digit_grid(pred_grid[i])
+                    for i in range(n_vis)]
+                canvas = tile_images(sample_imgs, nrow=nrow)
+                if canvas is not None:
+                    canvas.save(os.path.join(
+                        task_dir, f"step_{step:07d}_sampled.png"))
+
+                # ── save: GT digit-grid images ──
+                gt_imgs = [
+                    render_digit_grid(gt_9x9[i])
+                    for i in range(min(gt_9x9.shape[0], n_vis))]
+                gt_canvas = tile_images(gt_imgs, nrow=nrow)
+                if gt_canvas is not None:
+                    gt_canvas.save(os.path.join(
+                        task_dir, f"step_{step:07d}_gt.png"))
+
+                # ── save: comparison (wrong filled cells in red) ──
+                cmp_imgs = []
+                for i in range(n_vis):
+                    hint_2d = known_mask_2d[i]
+                    wrong = (pred_grid[i] != gt_9x9[i])
+                    cmp_imgs.append(
+                        render_digit_grid(
+                            pred_grid[i],
+                            wrong_mask=wrong & ~hint_2d,
+                        ))
+                cmp_canvas = tile_images(cmp_imgs, nrow=nrow)
+                if cmp_canvas is not None:
+                    cmp_canvas.save(os.path.join(
+                        task_dir, f"step_{step:07d}_cmp.png"))
 
                 # detailed wrong-cell for easy level
                 if level_name == "easy":
-                    total_wrong = int(wrong_mask.sum().item())
+                    wrong_mask_all = (pred_grid != gt_9x9)
+                    total_wrong = int(wrong_mask_all.sum().item())
                     if total_wrong < 20:
                         accelerator.print(
                             f"[eval/{level_name}] wrong cells={total_wrong}")
-                        wm = wrong_mask.detach().cpu()
-                        gt_cpu = gt_sub.detach().cpu()
+                        wm = wrong_mask_all.detach().cpu()
+                        gt_cpu = gt_9x9.detach().cpu()
                         pr_cpu = pred_grid.detach().cpu()
                         for bi in range(min(8, wm.shape[0])):
                             coords = torch.nonzero(wm[bi], as_tuple=False)
@@ -2026,7 +2152,8 @@ def evaluate_image_cond_difficulty(
                                 f"  sample#{bi} wrong={coords.shape[0]}")
                             for r, c in coords.tolist():
                                 accelerator.print(
-                                    f"    (r={r},c={c}) GT={int(gt_cpu[bi,r,c])} "
+                                    f"    (r={r},c={c}) "
+                                    f"GT={int(gt_cpu[bi,r,c])} "
                                     f"PRED={int(pr_cpu[bi,r,c])}")
 
             except Exception as e:
@@ -2044,7 +2171,24 @@ def evaluate_image_cond_difficulty(
                 f"tok_acc(all)={tok_acc_all:.4f}  "
                 f"(no evaluator)")
 
-        # ── save text details ──
+        # ── save: step logs (sampling trajectory) ──
+        if step_logs is not None:
+            step_logs_path = os.path.join(
+                task_dir, f"step_{step:07d}_sampling_logs.txt")
+            with open(step_logs_path, "w") as f:
+                f.write(f"Sampling logs for {level_name} level\n")
+                f.write("=" * 80 + "\n\n")
+                for log_entry in step_logs:
+                    step_idx = log_entry['step']
+                    t_val = log_entry['t']
+                    if isinstance(t_val, torch.Tensor):
+                        t_val = t_val.item()
+                    n_masked_list = log_entry['n_masked']
+                    n_masked_avg = sum(n_masked_list) / len(n_masked_list)
+                    f.write(f"Step {step_idx:3d}: t={t_val:.6f}  "
+                            f"n_masked={n_masked_avg:.1f}/{seq_len}\n")
+
+        # ── save: text details ──
         txt_path = os.path.join(
             task_dir, f"step_{step:07d}_details.txt")
         with open(txt_path, "w") as f:
@@ -2053,20 +2197,46 @@ def evaluate_image_cond_difficulty(
             f.write(f"tok_acc(unknown)={tok_acc_unk:.6f}\n")
             f.write(f"tok_acc(all)={tok_acc_all:.6f}\n")
             if cell_acc is not None:
-                f.write(f"cell_acc={cell_acc:.6f}\n")
+                f.write(f"cell_acc(unknown)={cell_acc:.6f}\n")
+            if full_cell_acc is not None:
+                f.write(f"cell_acc(all)={full_cell_acc:.6f}\n")
+            if wrong_per_grid is not None:
+                f.write(f"wrong_per_grid={wrong_per_grid:.2f}\n")
             if rule_acc is not None:
-                f.write(f"rule_acc={rule_acc:.6f}\n")
+                f.write(f"rule_acc={rule_acc:.6f}  "
+                        f"row={row_acc:.6f}  col={col_acc:.6f}  "
+                        f"box={box_acc:.6f}\n")
+            if digit_dist:
+                f.write("digit distribution:\n")
+                for dd in digit_dist:
+                    f.write(dd + "\n")
+            f.write(f"\nfirst 8 completed tok_ids (flat):\n")
+            for i in range(min(8, B)):
+                f.write(f"  sample {i}: {completed_tok[i].tolist()}\n")
 
         accelerator.print(
             f"[eval/{level_name}] step={step}  "
+            f"cell_acc(unk)={cell_acc if cell_acc is not None else 'N/A'}  "
+            f"rule_acc={rule_acc if rule_acc is not None else 'N/A'}  "
             f"tok_acc(unk)={tok_acc_unk:.4f}  "
             f"saved → {task_dir}/")
 
-    # ── summary ──
+    # ── overall summary ──
     for line in summary_lines:
         accelerator.print(line)
     if args.log_with and log_dict:
         accelerator.log(log_dict, step=step)
+
+    # save combined summary
+    summary_dir = os.path.join(args.output_dir, "eval_samples")
+    os.makedirs(summary_dir, exist_ok=True)
+    txt_path = os.path.join(summary_dir, f"step_{step:07d}_summary.txt")
+    with open(txt_path, "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+
+    if ema is not None:
+        ema.restore(params)
+    model.train()
 
 
 # ────────────────────────────────────────────────────────────

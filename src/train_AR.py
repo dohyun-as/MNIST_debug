@@ -248,7 +248,7 @@ class ARTransformer(nn.Module):
         device: str | torch.device = "cuda",
         return_history: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        """Autoregressive sampling.
+        """Autoregressive sampling (for generation/evaluation).
 
         Unconditional model
             Generates 81 tokens from scratch.  The first token is sampled
@@ -258,6 +258,12 @@ class ARTransformer(nn.Module):
             *condition* is (B, 81) with MASK / digit values.  The model
             generates 81 target tokens conditioned on this prefix.  When
             *condition* is ``None`` an all-MASK prefix is used (≈ uncond).
+
+        Sampling modes:
+            - temperature=0.0: Greedy (argmax) → always picks highest prob
+            - temperature=0.5-1.0: Stochastic with varying randomness
+            - temperature=1.0: Balanced stochastic sampling
+            - temperature>1.0: More random exploration
 
         Returns
         -------
@@ -346,7 +352,11 @@ def _sample_token(
 
     Args:
         logits: (B, V) raw logits
-        temperature: softmax temperature (0 → greedy)
+        temperature: softmax temperature
+            - 0: greedy decoding (argmax, highest probability)
+            - 0 < t < 1: sharp distribution (less random)
+            - 1: standard softmax (balanced randomness)
+            - t > 1: smooth distribution (more random)
         top_k: keep only top-k logits (0 = no filtering)
         top_p: nucleus sampling threshold (0 = disabled)
 
@@ -855,12 +865,13 @@ def parse_args():
     p.add_argument("--label_smoothing", type=float, default=0.0,
                    help="Label smoothing for CE loss.")
 
-    # sampling
-    p.add_argument("--temperature", type=float, default=1.0)
+    # sampling (used during evaluation generation only)
+    p.add_argument("--temperature", type=float, default=1.0,
+                   help="Sampling temperature (eval only): 0=greedy/argmax, 1.0=stochastic, >1=more random.")
     p.add_argument("--top_k", type=int, default=0,
-                   help="Top-k sampling (0 = disabled).")
+                   help="Top-k sampling (0 = disabled). Keep only top-k highest logits.")
     p.add_argument("--top_p", type=float, default=0.0,
-                   help="Nucleus sampling threshold (0 = disabled).")
+                   help="Nucleus (top-p) sampling (0 = disabled). Keep tokens with cumulative prob <= threshold.")
 
     # logging / eval / save
     p.add_argument("--log_every", type=int, default=100)
@@ -1534,7 +1545,13 @@ def main():
 
     accelerator.print(
         f"\n[train] Starting for {args.max_train_steps} steps "
-        f"(~{num_epochs} epochs) ...\n")
+        f"(~{num_epochs} epochs)\n")
+
+    # print sampling config (used during evaluation)
+    temp_info = "greedy/argmax" if args.temperature == 0 else f"{args.temperature:.2f}"
+    accelerator.print(
+        f"[sampling] temperature={temp_info}  "
+        f"top_k={args.top_k}  top_p={args.top_p}\n")
 
     model.train()
     epoch = 0

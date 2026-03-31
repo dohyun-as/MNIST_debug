@@ -150,13 +150,15 @@ class DiscreteDiffusion(nn.Module):
         return logits
 
     def forward(self, x: Tensor, sigma: Tensor,
-                cond_tokens: Optional[Tensor] = None) -> Tensor:
+                cond_tokens: Optional[Tensor] = None,
+                class_labels: Optional[Tensor] = None) -> Tensor:
         """Run backbone + apply subs parameterization. Returns log p_θ.
 
         Args:
-            x:           (B, L)  int64  noised tokens
-            sigma:       (B,)    float  noise level σ(t)
-            cond_tokens: optional conditioning for cross-attn
+            x:            (B, L)  int64  noised tokens
+            sigma:        (B,)    float  noise level σ(t)
+            cond_tokens:  optional conditioning for cross-attn
+            class_labels: optional (B,) int64 class labels for adaLN cond
         Returns:
             log_probs: (B, L, vocab_size)
         """
@@ -164,7 +166,8 @@ class DiscreteDiffusion(nn.Module):
         x = x.long()
         if sigma.ndim > 1:
             sigma = sigma.squeeze(-1)
-        logits = self.backbone(x, sigma, cond_tokens=cond_tokens)
+        logits = self.backbone(x, sigma, cond_tokens=cond_tokens,
+                               class_labels=class_labels)
         return self._subs_parameterization(logits, x)
 
     # ─────────────── training loss ─────────────────────────
@@ -181,15 +184,17 @@ class DiscreteDiffusion(nn.Module):
         return t
 
     def _forward_pass_diffusion(self, x0: Tensor,
-                                 cond_tokens: Optional[Tensor] = None) -> Tensor:
+                                 cond_tokens: Optional[Tensor] = None,
+                                 class_labels: Optional[Tensor] = None) -> Tensor:
         """Compute per-token diffusion loss for a batch of clean tokens.
 
         Exactly matches MDLM's continuous-time subs loss:
             L(x0) = - (dsigma / (exp(sigma) - 1)) * log p_θ(x0 | xt, t)
 
         Args:
-            x0:          (B, L) int64 clean tokens
-            cond_tokens: optional conditioning for cross-attn
+            x0:           (B, L) int64 clean tokens
+            cond_tokens:  optional conditioning for cross-attn
+            class_labels: optional (B,) int64 class labels for adaLN cond
         Returns:
             loss: (B, L) per-token loss (non-negative)
         """
@@ -208,7 +213,8 @@ class DiscreteDiffusion(nn.Module):
 
         xt = self.q_xt(x0, move_chance)
         model_output = self.forward(xt, unet_conditioning,
-                                    cond_tokens=cond_tokens)  # log p_θ
+                                    cond_tokens=cond_tokens,
+                                    class_labels=class_labels)  # log p_θ
 
         # Gather log p_θ(x0_i | xt, t) for each position
         log_p_theta = torch.gather(
@@ -226,7 +232,8 @@ class DiscreteDiffusion(nn.Module):
         return -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
 
     def compute_loss(self, x0: Tensor, attention_mask: Optional[Tensor] = None,
-                     cond_tokens: Optional[Tensor] = None) -> LossOutput:
+                     cond_tokens: Optional[Tensor] = None,
+                     class_labels: Optional[Tensor] = None) -> LossOutput:
         """Full loss computation (used in training step).
 
         Args:
@@ -240,7 +247,8 @@ class DiscreteDiffusion(nn.Module):
             attention_mask = torch.ones_like(x0, dtype=torch.float32)
 
         loss_per_token = self._forward_pass_diffusion(
-            x0, cond_tokens=cond_tokens)  # (B, L)
+            x0, cond_tokens=cond_tokens,
+            class_labels=class_labels)  # (B, L)
         nlls = loss_per_token * attention_mask
         count = attention_mask.sum()
         token_nll = nlls.sum() / count
@@ -254,6 +262,7 @@ class DiscreteDiffusion(nn.Module):
         self, x: Tensor, t: Tensor, dt: float,
         p_x0: Optional[Tensor] = None,
         cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
     ):
         """One DDPM step with caching (MDLM's ddpm_cache sampler)."""
         sigma_t, _ = self.noise(t)
@@ -262,13 +271,14 @@ class DiscreteDiffusion(nn.Module):
             sigma_t = sigma_t.squeeze(-1)
         if sigma_s.ndim > 1:
             sigma_s = sigma_s.squeeze(-1)
-        
+
         # FIX: use proper move_chance = 1 - exp(-sigma)
         move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
         move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
 
         if p_x0 is None:
-            p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens).exp()
+            p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens,
+                                class_labels=class_labels).exp()
 
         q_xs = p_x0 * (move_chance_t - move_chance_s)
         q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
@@ -280,7 +290,8 @@ class DiscreteDiffusion(nn.Module):
 
     @torch.no_grad()
     def _ddpm_update(self, x: Tensor, t: Tensor, dt: float,
-                     cond_tokens: Optional[Tensor] = None) -> Tensor:
+                     cond_tokens: Optional[Tensor] = None,
+                     class_labels: Optional[Tensor] = None) -> Tensor:
         """One DDPM step (no caching)."""
         sigma_t, _ = self.noise(t)
         sigma_s, _ = self.noise(t - dt)
@@ -292,7 +303,8 @@ class DiscreteDiffusion(nn.Module):
         move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
         move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
 
-        log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens)
+        log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens,
+                                class_labels=class_labels)
         q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)
         q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
         _x = _sample_categorical(q_xs)
@@ -311,6 +323,7 @@ class DiscreteDiffusion(nn.Module):
         sampler: str = "ddpm_cache",
         noise_removal: bool = True,
         cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         tokens_per_step: int = 0,
     ) -> Tensor:
@@ -324,6 +337,7 @@ class DiscreteDiffusion(nn.Module):
             sampler:     ``"ddpm"``, ``"ddpm_cache"``, or ``"confidence"``
             noise_removal: if True, apply a final argmax denoising step
             cond_tokens: optional conditioning for cross-attn
+            class_labels: optional (B,) int64 class labels for adaLN cond
             return_history: if True, return (final_x, history) where
                 history is a list of (B, L) tensors at each step
             tokens_per_step: for confidence sampler – unmask exactly this
@@ -335,6 +349,7 @@ class DiscreteDiffusion(nn.Module):
         if sampler == "confidence":
             return self._sample_confidence(
                 batch_size, seq_len, num_steps, device, cond_tokens,
+                class_labels=class_labels,
                 return_history=return_history,
                 tokens_per_step=tokens_per_step)
 
@@ -351,12 +366,14 @@ class DiscreteDiffusion(nn.Module):
             t = timesteps[i] * torch.ones(batch_size, 1, device=device)
             if sampler == "ddpm_cache":
                 p_x0_cache, x_next = self._ddpm_caching_update(
-                    x, t, dt, p_x0=p_x0_cache, cond_tokens=cond_tokens)
+                    x, t, dt, p_x0=p_x0_cache, cond_tokens=cond_tokens,
+                    class_labels=class_labels)
                 if not torch.equal(x_next, x):
                     p_x0_cache = None
                 x = x_next
             else:
-                x = self._ddpm_update(x, t, dt, cond_tokens=cond_tokens)
+                x = self._ddpm_update(x, t, dt, cond_tokens=cond_tokens,
+                                      class_labels=class_labels)
 
             if return_history:
                 history.append(x.clone().cpu())
@@ -364,7 +381,8 @@ class DiscreteDiffusion(nn.Module):
         if noise_removal:
             t = timesteps[-1] * torch.ones(batch_size, 1, device=device)
             sigma_t = self.noise(t)[0]
-            x = self.forward(x, sigma_t, cond_tokens=cond_tokens).argmax(dim=-1)
+            x = self.forward(x, sigma_t, cond_tokens=cond_tokens,
+                             class_labels=class_labels).argmax(dim=-1)
             if return_history:
                 history.append(x.clone().cpu())
 
@@ -380,6 +398,7 @@ class DiscreteDiffusion(nn.Module):
         num_steps: int,
         device: torch.device,
         cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         tokens_per_step: int = 0,
     ) -> Tensor:
@@ -423,7 +442,7 @@ class DiscreteDiffusion(nn.Module):
             sigma_t = self.noise(t)[0]
 
             # get model prediction
-            log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens)  # (B, L, V)
+            log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)  # (B, L, V)
             # exclude mask token from prediction
             log_p_x0[:, :, self.mask_index] = NEG_INF
 
@@ -459,7 +478,7 @@ class DiscreteDiffusion(nn.Module):
         if still_masked.any():
             t = torch.full((batch_size, 1), 1e-5, device=device)
             sigma_t = self.noise(t)[0]
-            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens)
+            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)
             log_p[:, :, self.mask_index] = NEG_INF
             final_probs = torch.softmax(log_p, dim=-1)
             final_pred = final_probs.argmax(dim=-1)
@@ -482,6 +501,7 @@ class DiscreteDiffusion(nn.Module):
         sampler: str = "ddpm_cache",
         noise_removal: bool = True,
         cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         return_confidence_history: bool = False,
         tokens_per_step: int = 0,
@@ -513,6 +533,7 @@ class DiscreteDiffusion(nn.Module):
         if sampler == "confidence":
             return self._inpaint_confidence(
                 x_gt, known_mask, num_steps, cond_tokens,
+                class_labels=class_labels,
                 return_history=return_history,
                 return_confidence_history=return_confidence_history,
                 tokens_per_step=tokens_per_step,
@@ -536,7 +557,8 @@ class DiscreteDiffusion(nn.Module):
 
         def compute_confidence_and_pred(x_t: Tensor, t_scalar: Tensor):
             sigma_t = self.noise(t_scalar)[0]
-            log_p = self.forward(x_t, sigma_t, cond_tokens=cond_tokens)
+            log_p = self.forward(x_t, sigma_t, cond_tokens=cond_tokens,
+                                 class_labels=class_labels)
             log_p[:, :, self.mask_index] = NEG_INF
             probs = torch.softmax(log_p, dim=-1)  # SOFTMAX to get true probabilities
             return probs.max(dim=-1).values, probs.argmax(dim=-1)
@@ -564,12 +586,14 @@ class DiscreteDiffusion(nn.Module):
             
             if sampler == "ddpm_cache":
                 p_x0_cache, x_next = self._ddpm_caching_update(
-                    x, t, dt, p_x0=p_x0_cache, cond_tokens=cond_tokens)
+                    x, t, dt, p_x0=p_x0_cache, cond_tokens=cond_tokens,
+                    class_labels=class_labels)
                 if not torch.equal(x_next, x):
                     p_x0_cache = None
                 x = x_next.long()  # ENSURE int64
             else:
-                x = self._ddpm_update(x, t, dt, cond_tokens=cond_tokens).long()  # ENSURE int64
+                x = self._ddpm_update(x, t, dt, cond_tokens=cond_tokens,
+                                      class_labels=class_labels).long()  # ENSURE int64
             
             # force known positions back to GT (must be after casting to int!)
             x = torch.where(known_mask, x_gt, x)
@@ -579,7 +603,7 @@ class DiscreteDiffusion(nn.Module):
                 is_masked = (x == self.mask_index)
                 n_masked = is_masked.sum(dim=1)
                 sigma_t, _ = self.noise(t)
-                log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens)
+                log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)
                 log_p[:, :, self.mask_index] = NEG_INF
                 probs = torch.softmax(log_p, dim=-1)
                 pred_tokens = probs.argmax(dim=-1)
@@ -610,7 +634,7 @@ class DiscreteDiffusion(nn.Module):
             masked_ratio_final = (n_masked_final / n_unknown).clamp(eps, 1)
             t = masked_ratio_final.view(-1, 1)
             sigma_t = self.noise(t)[0]
-            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens)
+            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)
             log_p[:, :, self.mask_index] = NEG_INF
             final_probs = torch.softmax(log_p, dim=-1)
             pred = final_probs.argmax(dim=-1).long()  # ENSURE int64
@@ -653,6 +677,7 @@ class DiscreteDiffusion(nn.Module):
         known_mask: Tensor,
         num_steps: int,
         cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         return_confidence_history: bool = False,
         tokens_per_step: int = 0,
@@ -678,7 +703,7 @@ class DiscreteDiffusion(nn.Module):
         if return_confidence_history:
             t0 = torch.full((batch_size, 1), 1.0 - 1e-5, device=device)
             sigma_t0 = self.noise(t0)[0]
-            log_p0 = self.forward(x, sigma_t0, cond_tokens=cond_tokens)
+            log_p0 = self.forward(x, sigma_t0, cond_tokens=cond_tokens, class_labels=class_labels)
             log_p0[:, :, self.mask_index] = NEG_INF
             probs0 = torch.softmax(log_p0, dim=-1)  # SOFTMAX to get true probabilities
             confidence_history.append(probs0.max(dim=-1).values.cpu())
@@ -721,7 +746,7 @@ class DiscreteDiffusion(nn.Module):
             # )
 
 
-            log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens)
+            log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)
 
             # # ===== INPAINT DEBUG (ALWAYS ON) =====
             # b0 = 0
@@ -822,7 +847,7 @@ class DiscreteDiffusion(nn.Module):
                 # Re-forward on updated x to get current predictions for remaining masked cells
                 t_next = torch.full((batch_size, 1), max(1e-5, 1.0 - (step + 2) / num_steps), device=device)
                 sigma_next = self.noise(t_next)[0]
-                log_p_new = self.forward(x, sigma_next, cond_tokens=cond_tokens)
+                log_p_new = self.forward(x, sigma_next, cond_tokens=cond_tokens, class_labels=class_labels)
                 log_p_new[:, :, self.mask_index] = NEG_INF
                 probs_new = torch.softmax(log_p_new, dim=-1)  # SOFTMAX to get true probabilities
                 confidence_history.append(probs_new.max(dim=-1).values.cpu())
@@ -833,7 +858,7 @@ class DiscreteDiffusion(nn.Module):
         if still_masked.any():
             t = torch.full((batch_size, 1), 1e-5, device=device)
             sigma_t = self.noise(t)[0]
-            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens)
+            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)
             log_p[:, :, self.mask_index] = NEG_INF
             final_probs = torch.softmax(log_p, dim=-1)  # SOFTMAX to get true probabilities
             pred = final_probs.argmax(dim=-1)

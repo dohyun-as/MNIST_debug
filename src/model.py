@@ -117,6 +117,293 @@ class ResBlock2D(nn.Module):
         s = self.skip(x) if self.skip is not None else x
         return self.act(h + s)
 
+# ────────────────────────────────────────────────────────────────────
+#  ViT-based Encoders  (Transformer alternative to CNN encoders)
+# ────────────────────────────────────────────────────────────────────
+
+class ImageConditionViTEncoder(nn.Module):
+    """ViT encoder for whole-image conditioning.
+
+    Splits the image into (patch_size × patch_size) patches, projects them to
+    an embedding dimension, runs through transformer layers, then reshapes
+    back to a 2-D feature map  (B, feat_channels, h_tok, w_tok).
+
+    MAE-style masking:  during training, ``mae_mask_ratio`` fraction of patches
+    are **dropped** from the sequence (not replaced with mask tokens), following
+    the original MAE design.  The encoder only sees visible patches.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        feat_channels: int = 128,
+        image_size: int = 288,
+        patch_size: int = 16,
+        depth: int = 6,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        mae_mask_ratio: float = 0.0,
+    ):
+        super().__init__()
+        assert image_size % patch_size == 0, (
+            f"image_size ({image_size}) must be divisible by patch_size ({patch_size})")
+        self.feat_channels = feat_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.mae_mask_ratio = mae_mask_ratio
+
+        self.h_tok = image_size // patch_size
+        self.w_tok = image_size // patch_size
+        n_patches = self.h_tok * self.w_tok
+
+        patch_dim = in_channels * patch_size * patch_size
+        self.patch_proj = nn.Linear(patch_dim, feat_channels)
+        self.pos_emb = nn.Parameter(torch.zeros(1, n_patches, feat_channels))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feat_channels,
+            nhead=num_heads,
+            dim_feedforward=int(feat_channels * mlp_ratio),
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(feat_channels)
+
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, C, H, W) -> (B, N, patch_dim)"""
+        B, C, H, W = x.shape
+        p = self.patch_size
+        x = x.unfold(2, p, p).unfold(3, p, p)        # (B, C, h, w, p, p)
+        x = x.contiguous().view(B, C, -1, p, p)       # (B, C, N, p, p)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()     # (B, N, C, p, p)
+        x = x.view(B, -1, C * p * p)                  # (B, N, patch_dim)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        tokens = self.patch_proj(self._patchify(x))  # (B, N, D)
+        tokens = tokens + self.pos_emb  # (B, N, D)
+
+        # MAE masking (training only): drop masked patches from the sequence
+        if self.training and self.mae_mask_ratio > 0:
+            N = tokens.shape[1]
+            n_keep = N - int(N * self.mae_mask_ratio)
+            n_keep = max(n_keep, 1)  # keep at least 1 patch
+            noise = torch.rand(B, N, device=tokens.device)
+            ids_sort = noise.argsort(dim=1)
+            ids_keep = ids_sort[:, :n_keep]  # (B, n_keep)
+            ids_keep, _ = ids_keep.sort(dim=1)  # maintain spatial order
+            tokens = torch.gather(
+                tokens, 1, ids_keep.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
+
+        tokens = self.transformer(tokens)
+        tokens = self.norm(tokens)
+
+        if self.training and self.mae_mask_ratio > 0:
+            # Restore full spatial grid: place visible tokens back, fill masked
+            # positions with zeros (downstream UNet handles incomplete info).
+            full = torch.zeros(B, self.h_tok * self.w_tok, self.feat_channels,
+                               device=tokens.device, dtype=tokens.dtype)
+            full.scatter_(1, ids_keep.unsqueeze(-1).expand(-1, -1, self.feat_channels),
+                          tokens)
+            feat = full.transpose(1, 2).view(
+                B, self.feat_channels, self.h_tok, self.w_tok)
+        else:
+            feat = tokens.transpose(1, 2).view(
+                B, self.feat_channels, self.h_tok, self.w_tok)
+        return feat
+
+
+class PatchImageConditionViTEncoder(nn.Module):
+    """Patchwise ViT encoder: splits image into (grid_size×grid_size) cells,
+    then each cell is separately encoded by a shared ViT.
+
+    Output: (B, feat_channels, grid_size, grid_size)
+
+    MAE masking (training only):
+      - ``mae_patch_mask_ratio``:  fraction of sub-patches to mask *within*
+        each grid cell.
+      - ``mae_cell_mask_ratio``:   fraction of entire grid cells to mask
+        (replace with learnable cell mask token).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        feat_channels: int = 128,
+        grid_size: int = 9,
+        patch_size: int = 4,
+        depth: int = 4,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        use_pos_emb: bool = True,
+        mae_patch_mask_ratio: float = 0.0,
+        mae_cell_mask_ratio: float = 0.0,
+        max_patches_per_cell: int = 128,
+        use_cls_token: bool = True,
+    ):
+        super().__init__()
+        self.feat_channels = feat_channels
+        self.grid_size = grid_size
+        self.patch_size = patch_size
+        self.mae_patch_mask_ratio = mae_patch_mask_ratio
+        self.mae_cell_mask_ratio = mae_cell_mask_ratio
+        self.use_cls_token = use_cls_token
+
+        patch_dim_placeholder = in_channels * patch_size * patch_size
+        self.patch_proj = nn.Linear(patch_dim_placeholder, feat_channels)
+
+        # cls-token per cell  (aggregation token)
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, feat_channels))
+            nn.init.trunc_normal_(self.cls_token, std=0.02)
+        else:
+            self.cls_token = None
+
+        # cell mask token: only when cell-level masking is enabled
+        if mae_cell_mask_ratio > 0:
+            self.cell_mask_token = nn.Parameter(torch.zeros(1, feat_channels))
+            nn.init.normal_(self.cell_mask_token, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feat_channels,
+            nhead=num_heads,
+            dim_feedforward=int(feat_channels * mlp_ratio),
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(feat_channels)
+
+        # 2-D grid positional embedding
+        self.use_pos_emb = use_pos_emb
+        if use_pos_emb:
+            self.grid_pos_emb = nn.Parameter(
+                torch.zeros(1, feat_channels, grid_size, grid_size))
+            nn.init.trunc_normal_(self.grid_pos_emb, std=0.02)
+
+        # Cell-internal positional embedding (max_patches_per_cell + 1 for CLS)
+        self.cell_pos_emb = nn.Parameter(
+            torch.zeros(1, max_patches_per_cell + 1, feat_channels))
+        nn.init.trunc_normal_(self.cell_pos_emb, std=0.02)
+
+    def _pad_to_grid(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        Gh = Gw = self.grid_size
+        newH = int(math.ceil(H / Gh) * Gh)
+        newW = int(math.ceil(W / Gw) * Gw)
+        padH, padW = newH - H, newW - W
+        if padH > 0 or padW > 0:
+            x = F.pad(x, (0, padW, 0, padH), mode='replicate')
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._pad_to_grid(x)
+        B, C, H, W = x.shape
+        Gh = Gw = self.grid_size
+        ph, pw = H // Gh, W // Gw  # cell pixel dims
+        p = self.patch_size
+
+        # Ensure cell size is divisible by patch_size
+        assert ph % p == 0 and pw % p == 0, (
+            f"Cell size ({ph}x{pw}) must be divisible by patch_size ({p})")
+        n_ph, n_pw = ph // p, pw // p
+        n_patches = n_ph * n_pw
+
+        # ── 1) Split into grid cells: (B*G*G, C, ph, pw) ──
+        patches = F.unfold(x, kernel_size=(ph, pw), stride=(ph, pw))
+        patches = patches.transpose(1, 2).contiguous()
+        cells = patches.view(B * Gh * Gw, C, ph, pw)  # (BG², C, ph, pw)
+
+        # ── 2) Patchify each cell: (BG², n_patches, patch_dim) ──
+        cells_unf = cells.unfold(2, p, p).unfold(3, p, p)  # (BG², C, n_ph, n_pw, p, p)
+        cells_unf = cells_unf.contiguous().view(B * Gh * Gw, C, n_patches, p, p)
+        cells_unf = cells_unf.permute(0, 2, 1, 3, 4).contiguous()
+        cells_unf = cells_unf.view(B * Gh * Gw, n_patches, C * p * p)  # (BG², N, patch_dim)
+
+        tokens = self.patch_proj(cells_unf)  # (BG², N, D)
+
+        # ── 3) Prepend CLS token (if use_cls_token=True) ──
+        if self.use_cls_token:
+            cls_tok = self.cls_token.expand(B * Gh * Gw, -1, -1)  # (BG², 1, D)
+            tokens = torch.cat([cls_tok, tokens], dim=1)  # (BG², N+1, D)
+
+        # cell-internal positional embedding (slice from pre-allocated max)
+        tokens = tokens + self.cell_pos_emb[:, :tokens.shape[1], :]
+
+        # ── 4) MAE patch masking (within each cell): DROP masked patches ──
+        if self.training and self.mae_patch_mask_ratio > 0:
+            N = n_patches  # only mask non-CLS patches
+            n_keep = N - int(N * self.mae_patch_mask_ratio)
+            n_keep = max(n_keep, 1)  # keep at least 1 patch
+            BG = tokens.shape[0]
+            noise = torch.rand(BG, N, device=tokens.device)
+            ids_sort = noise.argsort(dim=1)
+            ids_keep = ids_sort[:, :n_keep]  # (BG, n_keep)
+            ids_keep, _ = ids_keep.sort(dim=1)
+            
+            if self.use_cls_token:
+                # +1 offset for CLS at index 0, then prepend CLS index
+                ids_keep_with_cls = torch.cat([
+                    torch.zeros(BG, 1, dtype=torch.long, device=tokens.device),
+                    ids_keep + 1
+                ], dim=1)  # (BG, 1+n_keep)
+                indices = ids_keep_with_cls.unsqueeze(-1).expand(-1, -1, tokens.shape[-1])
+            else:
+                # No CLS token, just use the kept patch indices
+                indices = ids_keep.unsqueeze(-1).expand(-1, -1, tokens.shape[-1])
+            
+            tokens = torch.gather(tokens, 1, indices)
+
+        # ── 5) Transformer ──
+        tokens = self.transformer(tokens)
+        tokens = self.norm(tokens)
+
+        # ── 6) Extract cell representation ──
+        if self.use_cls_token:
+            # Use CLS token (first token)
+            cell_feat = tokens[:, 0, :]  # (BG², D)
+        else:
+            # Average all patch tokens
+            cell_feat = tokens.mean(dim=1)  # (BG², D)
+
+        # ── 7) MAE cell-level masking ──
+        cell_feat = cell_feat.view(B, Gh * Gw, self.feat_channels)  # (B, G², D)
+        if self.training and self.mae_cell_mask_ratio > 0:
+            n_cells = Gh * Gw
+            n_cell_mask = int(n_cells * self.mae_cell_mask_ratio)
+            if n_cell_mask > 0:
+                noise = torch.rand(B, n_cells, device=cell_feat.device)
+                ids_sort = noise.argsort(dim=1)
+                mask_ids = ids_sort[:, :n_cell_mask]
+                mask = torch.zeros(B, n_cells, dtype=torch.bool,
+                                   device=cell_feat.device)
+                mask.scatter_(1, mask_ids, True)
+                cell_mask_tok = self.cell_mask_token.unsqueeze(0).expand(
+                    B, n_cells, -1)  # (B, G², D)
+                cell_feat = torch.where(
+                    mask.unsqueeze(-1), cell_mask_tok, cell_feat)
+
+        # ── 8) Reshape to (B, D, Gh, Gw) ──
+        feat = cell_feat.transpose(1, 2).contiguous().view(
+            B, self.feat_channels, Gh, Gw)
+
+        if self.use_pos_emb:
+            feat = feat + self.grid_pos_emb
+
+        return feat
+
+
+# ────────────────────────────────────────────────────────────────────
+#  CNN Encoders  (original)
+# ────────────────────────────────────────────────────────────────────
+
 class ImageCondition2DEncoder(nn.Module):
     """
     cond_image: (B, Cin, H, W) -> feat2d: (B, Cfeat, h, w)
@@ -224,6 +511,21 @@ class ConditionalUNet(nn.Module):
         patch_conditioning: bool = False,
         patch_grid_size: int = 9,
         patch_use_pos_emb: bool = False,
+        # --- encoder type: 'cnn' or 'vit' ---
+        encoder_type: str = 'cnn',
+        vit_patch_size: int = 4,
+        vit_depth: int = 4,
+        vit_num_heads: int = 4,
+        vit_mlp_ratio: float = 4.0,
+        # --- MAE masking ---
+        mae_mask_ratio: float = 0.0,
+        mae_patch_mask_ratio: float = 0.0,
+        mae_cell_mask_ratio: float = 0.0,
+        normalize_concat: bool = False,
+        # --- patch encoder aggregation ---
+        use_cls_token: bool = True,
+        # --- timestep bucket conditioning ---
+        num_timestep_buckets: int = 1,
     ):
         super().__init__()
 
@@ -236,9 +538,14 @@ class ConditionalUNet(nn.Module):
         else:
             self.cond_dim = class_embed_dim
 
+        self.num_timestep_buckets = num_timestep_buckets
+
         self.concat_conditioning = concat_conditioning
         self.concat_channels = int(concat_channels)
         self.concat_downsample_factor = concat_downsample_factor
+
+        # Option: normalize the conditioning map before concatenation
+        self.normalize_concat = bool(normalize_concat)
 
 
         self.grid_conditioning = grid_conditioning
@@ -256,29 +563,70 @@ class ConditionalUNet(nn.Module):
         self.cond_drop_prob = uncond_drop_prob
 
 
+        self.encoder_type = encoder_type
+
         # 2) image conditioning일 때 encoder 설정
         if self.image_conditioning:
             # (B,C,H,W)->(B,D)
             if encoder is None:
-                if patch_conditioning:
-                    self.encoder = PatchImageCondition2DEncoder(
-                        in_channels=cond_in_channels,
-                        feat_channels=feat_channels,
-                        grid_size=patch_grid_size,
-                        use_pos_emb=patch_use_pos_emb,
-                    )
+                if encoder_type == 'vit':
+                    import math
+                    # ── ViT encoders ──
+                    if patch_conditioning:
+                        # Pre-compute max patches per cell for pos-emb allocation
+                        _cell_size = math.ceil(image_size / patch_grid_size)
+                        _n_patches_per_cell = (_cell_size // vit_patch_size) ** 2
+                        self.encoder = PatchImageConditionViTEncoder(
+                            in_channels=cond_in_channels,
+                            feat_channels=feat_channels,
+                            grid_size=patch_grid_size,
+                            patch_size=vit_patch_size,
+                            depth=vit_depth,
+                            num_heads=vit_num_heads,
+                            mlp_ratio=vit_mlp_ratio,
+                            use_pos_emb=patch_use_pos_emb,
+                            mae_patch_mask_ratio=mae_patch_mask_ratio,
+                            mae_cell_mask_ratio=mae_cell_mask_ratio,
+                            max_patches_per_cell=_n_patches_per_cell,
+                            use_cls_token=use_cls_token,
+                        )
+                    else:
+                        self.encoder = ImageConditionViTEncoder(
+                            in_channels=cond_in_channels,
+                            feat_channels=feat_channels,
+                            image_size=image_size,
+                            patch_size=vit_patch_size,
+                            depth=vit_depth,
+                            num_heads=vit_num_heads,
+                            mlp_ratio=vit_mlp_ratio,
+                            mae_mask_ratio=mae_mask_ratio,
+                        )
                 else:
-                    self.encoder = ImageCondition2DEncoder(
-                        in_channels=cond_in_channels,
-                        feat_channels=feat_channels,            # 예: 256
-                        downsample_factor=concat_downsample_factor,
-                    )
+                    # ── CNN encoders (original) ──
+                    if patch_conditioning:
+                        self.encoder = PatchImageCondition2DEncoder(
+                            in_channels=cond_in_channels,
+                            feat_channels=feat_channels,
+                            grid_size=patch_grid_size,
+                            use_pos_emb=patch_use_pos_emb,
+                        )
+                    else:
+                        self.encoder = ImageCondition2DEncoder(
+                            in_channels=cond_in_channels,
+                            feat_channels=feat_channels,
+                            downsample_factor=concat_downsample_factor,
+                        )
             else:
                 self.encoder = encoder
 
                 
 
-            self.cond_token_proj = nn.Linear(self.encoder.feat_channels, self.cond_dim)
+            # image conditioning에서만 timestep bucket conditioning 적용
+            # encoder output을 cond_dim * num_timestep_buckets으로 projection
+            self.cond_token_proj = nn.Linear(
+                self.encoder.feat_channels, 
+                self.cond_dim * num_timestep_buckets
+            )
 
             # --- FSQ modules (only if use_fsq) ---
             if self.use_fsq:
@@ -354,12 +702,25 @@ class ConditionalUNet(nn.Module):
         else:
             self.cond_up = None
 
+        # normalization option for concat
+        self.normalize_concat = bool(normalize_concat)
+
         if self.cond_drop_prob > 0:
             if self.image_conditioning:
-                # image_size 기반으로 "기대 토큰 수" K 계산
-                h = image_size // self.concat_downsample_factor
-                w = image_size // self.concat_downsample_factor
-                null_k = max(1, h * w)
+                # Compute expected number of tokens K based on encoder type
+                if patch_conditioning:
+                    # Patchwise encoders (CNN or ViT) → grid_size × grid_size
+                    null_k = patch_grid_size * patch_grid_size
+                elif encoder_type == 'vit':
+                    # ViT whole-image → (image_size // vit_patch_size)²
+                    h = image_size // vit_patch_size
+                    w = image_size // vit_patch_size
+                    null_k = max(1, h * w)
+                else:
+                    # CNN whole-image → (image_size // downsample_factor)²
+                    h = image_size // self.concat_downsample_factor
+                    w = image_size // self.concat_downsample_factor
+                    null_k = max(1, h * w)
             elif self.grid_conditioning:
                 null_k = self.grid_hw * self.grid_hw
             else:
@@ -430,6 +791,7 @@ class ConditionalUNet(nn.Module):
         cond_image=None,
         encoder_hidden_states=None,
         grid=None,
+        t=None,
         return_token_ids: bool = False,
         return_uncond: bool= False,
     ):
@@ -443,7 +805,7 @@ class ConditionalUNet(nn.Module):
         elif self.image_conditioning:
             if cond_image is None:
                 raise ValueError("image_conditioning=True 인데 cond_image가 없음")
-            tokens, _ = self.encode_image_to_tokens(cond_image)  # (B,L,D), (B,h,w) or None
+            tokens, _ = self.encode_image_to_tokens(cond_image, t)  # (B,L,D), (B,h,w) or None
 
         elif self.grid_conditioning:
             if grid is None:
@@ -507,14 +869,37 @@ class ConditionalUNet(nn.Module):
     #     tokens = tok2d.view(B, h * w, D)  # (B,L,D)
     #     # print("tokens", tokens.shape)
     #     return tokens, tok_ids, (h, w)
-    def encode_image_to_tokens(self, cond_image: torch.Tensor):
+    def encode_image_to_tokens(self, cond_image: torch.Tensor, t: torch.Tensor = None):
         # print("cond_image", cond_image.shape)
         feat2d = self.encoder(cond_image)  # (B,Cfeat,h,w)
         # print("feat2d", feat2d.shape)
         feat_tok = feat2d.permute(0, 2, 3, 1).contiguous()  # (B,h,w,Cfeat)
         # print("feat_tok", feat_tok.shape)
 
-        tok2d = self.cond_token_proj(feat_tok)  # (B,h,w,cond_dim)
+        tok2d = self.cond_token_proj(feat_tok)  # (B,h,w,cond_dim*num_timestep_buckets)
+
+        # timestep bucket에 따라 해당 부분만 추출
+        if self.num_timestep_buckets > 1:
+            # timestep을 bucket index로 매핑 (t=None이면 bucket 0)
+            bucket_idx = 0
+            if t is not None:
+                if isinstance(t, torch.Tensor):
+                    if t.dim() > 0:
+                        t_val = t[0].item() if t.numel() > 0 else 0
+                    else:
+                        t_val = t.item()
+                else:
+                    t_val = float(t)
+                
+                # timestep 범위: 보통 0 ~ 999 (1000 steps)
+                t_normalized = t_val / 999.0
+                t_normalized = max(0.0, min(1.0, t_normalized))  # clamp to [0, 1]
+                bucket_idx = int(t_normalized * (self.num_timestep_buckets - 1))
+            
+            # embedding에서 해당 bucket 부분만 추출
+            start_idx = bucket_idx * self.cond_dim
+            end_idx = start_idx + self.cond_dim
+            tok2d = tok2d[..., start_idx:end_idx]  # (B,h,w,cond_dim)
 
         # print("tok2d", tok2d.shape)
         B, h, w, D = tok2d.shape
@@ -538,6 +923,7 @@ class ConditionalUNet(nn.Module):
             cond_image=cond_image,
             encoder_hidden_states=encoder_hidden_states,
             grid=grid,
+            t=t,
             return_token_ids=False,
         )  # (B, L, D)
 
@@ -557,9 +943,12 @@ class ConditionalUNet(nn.Module):
                 Hc, Wc = cond_image.shape[-2], cond_image.shape[-1]
 
                 # encoder가 만든 feature map의 spatial size는 입력/다운샘플 팩터로 결정됨
-                if hasattr(self.encoder, "grid_size"):  # patch encoder
+                if hasattr(self.encoder, "grid_size"):  # patch encoder (CNN or ViT)
                     h = w = self.encoder.grid_size
-                else:
+                elif hasattr(self.encoder, "h_tok"):    # ViT whole-image encoder
+                    h = self.encoder.h_tok
+                    w = self.encoder.w_tok
+                else:                                   # CNN whole-image encoder
                     h = Hc // self.concat_downsample_factor
                     w = Wc // self.concat_downsample_factor
             else:
@@ -574,16 +963,24 @@ class ConditionalUNet(nn.Module):
             if self.cond_up is not None:
                 cond_2d = self.cond_up(cond_2d)  # (B,D,H,W)
 
-            if self.training and torch.rand(1).item() < 0.01:  # 너무 자주 찍히는 거 방지
-                with torch.no_grad():
-                    c = cond_2d.detach().float()
-                    print(
-                        "[cond_2d]",
-                        f"min={c.min().item():.4f}",
-                        f"max={c.max().item():.4f}",
-                        f"mean={c.mean().item():.4f}",
-                        f"std={c.std().item():.4f}",
-                    )
+            # Optionally normalize conditioning map per-sample per-channel
+            if getattr(self, "normalize_concat", False):
+                eps = 1e-6
+                mean = cond_2d.mean(dim=(2, 3), keepdim=True)
+                std = cond_2d.std(dim=(2, 3), unbiased=False, keepdim=True)
+                cond_2d = (cond_2d - mean) / (std + eps)
+                # no learnable affine here; normalize_concat only standardizes per-sample per-channel
+
+            # if self.training and torch.rand(1).item() < 0.01:  # 너무 자주 찍히는 거 방지
+            #     with torch.no_grad():
+            #         c = cond_2d.detach().float()
+            #         print(
+            #             "[cond_2d]",
+            #             f"min={c.min().item():.4f}",
+            #             f"max={c.max().item():.4f}",
+            #             f"mean={c.mean().item():.4f}",
+            #             f"std={c.std().item():.4f}",
+            #         )
             x_in = torch.cat([x_t, cond_2d], dim=1)  # (B, 1+D, H, W)
 
         # print("x_in", x_in.shape)

@@ -68,6 +68,9 @@ class DiscreteDiffusion(nn.Module):
         of shape ``(B, L, vocab_size)``.  ``DIT`` is the default.
     vocab_size : int
         Number of *data* categories (mask token is appended as ``vocab_size``).
+    factorized_head : bool
+        If True, uses TokenBridge-style factorized per-dim loss during
+        training. The backbone must have a FactorizedARHead output layer.
     noise_type : str
         ``"loglinear"`` (default) or ``"cosine"``.
     noise_eps : float
@@ -102,6 +105,12 @@ class DiscreteDiffusion(nn.Module):
         # mask token = last index (appended category)
         self.mask_index = vocab_size
         self.vocab_size = vocab_size + 1   # includes mask
+
+        # Detect factorized head from backbone
+        from dit_model import FactorizedARHead
+        self.factorized_head = getattr(backbone, 'factorized_head', False)
+        if self.factorized_head:
+            self._ar_head: FactorizedARHead = backbone.output_layer
 
         self.noise = get_noise(noise_type, eps=noise_eps)
 
@@ -149,6 +158,55 @@ class DiscreteDiffusion(nn.Module):
 
         return logits
 
+    def _run_backbone_hidden(self, x: Tensor, sigma: Tensor,
+                             cond_tokens: Optional[Tensor] = None,
+                             class_labels: Optional[Tensor] = None):
+        """Run backbone up to (but not including) output_layer.
+        Returns hidden states (B, L, hidden_size) and cond vector c.
+        Only used when factorized_head=True.
+        """
+        backbone = self.backbone
+        x_long = x.long()
+        if sigma.ndim > 1:
+            sigma = sigma.squeeze(-1)
+
+        if cond_tokens is not None and cond_tokens.dtype in (torch.long, torch.int):
+            cond_tokens = backbone.embed_cond(cond_tokens)
+
+        h = backbone.token_emb(x_long)
+        h = backbone.pos_emb(h)
+        if backbone.pos_emb_type in ("2d", "sudoku"):
+            pos = (backbone.row_emb(backbone.row_idx) +
+                   backbone.col_emb(backbone.col_idx))
+            if backbone.pos_emb_type == "sudoku":
+                pos = pos + backbone.box_emb(backbone.box_idx)
+            h = h + pos[None, :, :]
+        elif backbone.pos_emb_type == "multires":
+            pos = (backbone.mr_level_emb(backbone.mr_level_idx) +
+                   backbone.mr_row_emb(backbone.mr_row_idx) +
+                   backbone.mr_col_emb(backbone.mr_col_idx))
+            h = h + pos[None, :, :]
+
+        c = F.silu(backbone.sigma_map(sigma))
+        if hasattr(backbone, 'label_emb') and backbone.label_emb is not None:
+            if class_labels is not None:
+                c = c + F.silu(backbone.label_emb(class_labels))
+
+        n_prefix = 0
+        use_prefix = (cond_tokens is not None)
+        if use_prefix:
+            n_prefix = cond_tokens.shape[1]
+            h = torch.cat([cond_tokens, h], dim=1)
+            cond_tokens = None
+
+        for blk in backbone.blocks:
+            h = blk(h, c, cond_tokens=cond_tokens)
+
+        if n_prefix > 0:
+            h = h[:, n_prefix:, :]
+
+        return h, c
+
     def forward(self, x: Tensor, sigma: Tensor,
                 cond_tokens: Optional[Tensor] = None,
                 class_labels: Optional[Tensor] = None) -> Tensor:
@@ -157,7 +215,9 @@ class DiscreteDiffusion(nn.Module):
         Args:
             x:            (B, L)  int64  noised tokens
             sigma:        (B,)    float  noise level σ(t)
-            cond_tokens:  optional conditioning for cross-attn
+            cond_tokens:  (B, C, D) optional prefix conditioning.
+                          Prepended to x inside backbone, output is
+                          sliced back to (B, L, vocab_size).
             class_labels: optional (B,) int64 class labels for adaLN cond
         Returns:
             log_probs: (B, L, vocab_size)
@@ -166,8 +226,11 @@ class DiscreteDiffusion(nn.Module):
         x = x.long()
         if sigma.ndim > 1:
             sigma = sigma.squeeze(-1)
+        # Use prefix_mode when cond_tokens are provided
+        use_prefix = (cond_tokens is not None)
         logits = self.backbone(x, sigma, cond_tokens=cond_tokens,
-                               class_labels=class_labels)
+                               class_labels=class_labels,
+                               prefix_mode=use_prefix)
         return self._subs_parameterization(logits, x)
 
     # ─────────────── training loss ─────────────────────────
@@ -182,6 +245,104 @@ class DiscreteDiffusion(nn.Module):
         if self.importance_sampling:
             t = self.noise.importance_sampling_transformation(t)
         return t
+
+    def _forward_pass_diffusion_factorized(
+        self, x0: Tensor,
+        cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Factorized per-dim diffusion loss (TokenBridge-style).
+
+        Instead of log p_θ(x0 | xt, t) as a single 64K classification,
+        computes Σ_d log p_θ(dim_d | dim_{<d}, xt, t) with teacher forcing.
+
+        Returns: (B, L) per-token loss (non-negative), same as standard.
+        """
+        t = self._sample_t(x0.shape[0], x0.device)
+
+        if self.change_of_variables:
+            unet_conditioning = t[:, None]
+            f_T = torch.log1p(-torch.exp(-self.noise.sigma_max))
+            f_0 = torch.log1p(-torch.exp(-self.noise.sigma_min))
+            move_chance = torch.exp(f_0 + t * (f_T - f_0))
+            move_chance = move_chance[:, None]
+        else:
+            sigma, dsigma = self.noise(t)
+            unet_conditioning = sigma[:, None]
+            move_chance = 1 - torch.exp(-sigma[:, None])
+
+        xt = self.q_xt(x0, move_chance)
+
+        # Run backbone UP TO the output layer (get hidden states)
+        xt_long = xt.long()
+        if unet_conditioning.ndim > 1:
+            sigma_in = unet_conditioning.squeeze(-1)
+        else:
+            sigma_in = unet_conditioning
+
+        use_prefix = (cond_tokens is not None)
+        # We need the hidden states before the output layer
+        # Run backbone manually: embed → blocks → (skip output_layer)
+        backbone = self.backbone
+        if cond_tokens is not None and cond_tokens.dtype in (torch.long, torch.int):
+            cond_tokens = backbone.embed_cond(cond_tokens)
+        x = backbone.token_emb(xt_long)
+        x = backbone.pos_emb(x)
+        if backbone.pos_emb_type in ("2d", "sudoku"):
+            pos = (backbone.row_emb(backbone.row_idx) +
+                   backbone.col_emb(backbone.col_idx))
+            if backbone.pos_emb_type == "sudoku":
+                pos = pos + backbone.box_emb(backbone.box_idx)
+            x = x + pos[None, :, :]
+        elif backbone.pos_emb_type == "multires":
+            pos = (backbone.mr_level_emb(backbone.mr_level_idx) +
+                   backbone.mr_row_emb(backbone.mr_row_idx) +
+                   backbone.mr_col_emb(backbone.mr_col_idx))
+            x = x + pos[None, :, :]
+        c = F.silu(backbone.sigma_map(sigma_in))
+        if hasattr(backbone, 'label_emb') and backbone.label_emb is not None:
+            if class_labels is not None:
+                c = c + F.silu(backbone.label_emb(class_labels))
+
+        n_prefix = 0
+        if use_prefix and cond_tokens is not None:
+            n_prefix = cond_tokens.shape[1]
+            x = torch.cat([cond_tokens, x], dim=1)
+            cond_tokens = None
+
+        for blk in backbone.blocks:
+            x = blk(x, c, cond_tokens=cond_tokens)
+
+        if n_prefix > 0:
+            x = x[:, n_prefix:, :]
+
+        # x is now (B, L, hidden_size) — hidden states before output layer
+
+        # Get ground-truth per-dim codes for teacher forcing
+        target_dims = self._ar_head.flat_index_to_dims(x0)  # (B, L, D)
+
+        # Run factorized AR head with teacher forcing
+        dim_logits = self._ar_head.forward_factorized(x, c, target_dims=target_dims)
+
+        # Compute per-dim cross-entropy, sum across dims
+        # Only count loss for MASKED positions (same as standard MDLM)
+        masked = (xt == self.mask_index)  # (B, L)
+
+        total_log_p = torch.zeros_like(x0, dtype=torch.float32)  # (B, L)
+        for d in range(self._ar_head.n_dims):
+            log_probs_d = F.log_softmax(dim_logits[d], dim=-1)  # (B, L, level_d)
+            target_d = target_dims[:, :, d]  # (B, L)
+            log_p_d = torch.gather(log_probs_d, dim=-1,
+                                   index=target_d.unsqueeze(-1)).squeeze(-1)
+            total_log_p = total_log_p + log_p_d  # (B, L)
+
+        # For unmasked positions, log_p should be 0 (delta)
+        total_log_p = total_log_p * masked.float()
+
+        # Apply ELBO weighting (same as standard)
+        if self.change_of_variables or self.importance_sampling:
+            return total_log_p * torch.log1p(-torch.exp(-self.noise.sigma_min))
+        return -total_log_p * (dsigma / torch.expm1(sigma))[:, None]
 
     def _forward_pass_diffusion(self, x0: Tensor,
                                  cond_tokens: Optional[Tensor] = None,
@@ -246,9 +407,14 @@ class DiscreteDiffusion(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(x0, dtype=torch.float32)
 
-        loss_per_token = self._forward_pass_diffusion(
-            x0, cond_tokens=cond_tokens,
-            class_labels=class_labels)  # (B, L)
+        if self.factorized_head:
+            loss_per_token = self._forward_pass_diffusion_factorized(
+                x0, cond_tokens=cond_tokens,
+                class_labels=class_labels)
+        else:
+            loss_per_token = self._forward_pass_diffusion(
+                x0, cond_tokens=cond_tokens,
+                class_labels=class_labels)  # (B, L)
         nlls = loss_per_token * attention_mask
         count = attention_mask.sum()
         token_nll = nlls.sum() / count
@@ -272,7 +438,6 @@ class DiscreteDiffusion(nn.Module):
         if sigma_s.ndim > 1:
             sigma_s = sigma_s.squeeze(-1)
 
-        # FIX: use proper move_chance = 1 - exp(-sigma)
         move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
         move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
 
@@ -284,7 +449,6 @@ class DiscreteDiffusion(nn.Module):
         q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
         _x = _sample_categorical(q_xs)
 
-        # Use torch.where to keep discrete integers (avoid float contamination)
         x_new = torch.where((x != self.mask_index), x, _x)
         return p_x0, x_new
 
@@ -309,7 +473,6 @@ class DiscreteDiffusion(nn.Module):
         q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
         _x = _sample_categorical(q_xs)
 
-        # Use torch.where to keep discrete integers (avoid float contamination)
         x_new = torch.where((x != self.mask_index), x, _x)
         return x_new
 
@@ -326,6 +489,7 @@ class DiscreteDiffusion(nn.Module):
         class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         tokens_per_step: int = 0,
+        **kwargs,  # absorb unused args (e.g. guidance_scale from old configs)
     ) -> Tensor:
         """Generate samples via iterative denoising.
 
@@ -336,15 +500,12 @@ class DiscreteDiffusion(nn.Module):
             device:      target device
             sampler:     ``"ddpm"``, ``"ddpm_cache"``, or ``"confidence"``
             noise_removal: if True, apply a final argmax denoising step
-            cond_tokens: optional conditioning for cross-attn
+            cond_tokens: optional prefix conditioning
             class_labels: optional (B,) int64 class labels for adaLN cond
-            return_history: if True, return (final_x, history) where
-                history is a list of (B, L) tensors at each step
             tokens_per_step: for confidence sampler – unmask exactly this
                 many tokens per step (0 = cosine schedule, 1 = one at a time)
         Returns:
             x: (batch_size, seq_len) int64 sampled tokens
-            — or (x, history) if return_history=True
         """
         if sampler == "confidence":
             return self._sample_confidence(
@@ -431,27 +592,41 @@ class DiscreteDiffusion(nn.Module):
                 break  # all unmasked
 
             if not use_linear:
-                # cosine schedule
                 ratio = (step + 1) / num_steps
                 unmask_frac = math.cos(math.pi / 2 * (1 - ratio))
                 target_masked = ((1 - unmask_frac) * seq_len)
 
-            # t = current masked ratio (matches training distribution)
             masked_ratio = (n_masked / seq_len).clamp(1e-5, 1)
-            t = masked_ratio.view(-1, 1)  # (B, 1)
+            t = masked_ratio.view(-1, 1)
             sigma_t = self.noise(t)[0]
 
-            # get model prediction
-            log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)  # (B, L, V)
-            # exclude mask token from prediction
-            log_p_x0[:, :, self.mask_index] = NEG_INF
+            if self.factorized_head:
+                # Factorized: get tokens + proper joint confidence
+                h, c_vec = self._run_backbone_hidden(
+                    x, sigma_t, cond_tokens=cond_tokens,
+                    class_labels=class_labels)
+                sampled_tokens, log_confidence = \
+                    self._ar_head.sample_with_confidence(h, c_vec)
+                confidence = log_confidence.exp()  # (B, L)
+            else:
+                log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens,
+                                        class_labels=class_labels)
+                log_p_x0[:, :, self.mask_index] = NEG_INF
 
-            probs = torch.softmax(log_p_x0, dim=-1)  # (B, L, V)
-            pred_tokens = probs.argmax(dim=-1)      # (B, L)
-            confidence = probs.max(dim=-1).values    # (B, L)
+                probs = torch.softmax(log_p_x0, dim=-1)  # (B, L, V)
 
-            # only consider masked positions
-            confidence[~is_masked] = float('inf')   # already unmasked → don't re-select
+                # Sample tokens stochastically from p(x0|xt)
+                B_cur, L_cur, V = probs.shape
+                sampled_tokens = torch.multinomial(
+                    probs.view(B_cur * L_cur, V), 1
+                ).view(B_cur, L_cur)  # (B, L)
+
+                # Confidence = probability of the sampled token
+                confidence = torch.gather(
+                    probs, dim=-1, index=sampled_tokens[:, :, None]
+                ).squeeze(-1)  # (B, L)
+
+            confidence[~is_masked] = float('inf')
 
             for b in range(batch_size):
                 n_cur_masked = int(n_masked[b].item())
@@ -464,11 +639,11 @@ class DiscreteDiffusion(nn.Module):
                     n_to_unmask = max(1, n_cur_masked - int(target_masked))
                     n_to_unmask = min(n_to_unmask, n_cur_masked)
 
-                # select top-k most confident among masked positions
+                # Top-k most confident among masked positions
                 masked_conf = confidence[b].clone()
-                masked_conf[~is_masked[b]] = -1.0  # exclude unmasked
+                masked_conf[~is_masked[b]] = -1.0
                 _, topk_idx = masked_conf.topk(n_to_unmask)
-                x[b, topk_idx] = pred_tokens[b, topk_idx]
+                x[b, topk_idx] = sampled_tokens[b, topk_idx]
 
             if return_history:
                 history.append(x.clone().cpu())
@@ -478,10 +653,16 @@ class DiscreteDiffusion(nn.Module):
         if still_masked.any():
             t = torch.full((batch_size, 1), 1e-5, device=device)
             sigma_t = self.noise(t)[0]
-            log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens, class_labels=class_labels)
-            log_p[:, :, self.mask_index] = NEG_INF
-            final_probs = torch.softmax(log_p, dim=-1)
-            final_pred = final_probs.argmax(dim=-1)
+            if self.factorized_head:
+                h, c_vec = self._run_backbone_hidden(
+                    x, sigma_t, cond_tokens=cond_tokens,
+                    class_labels=class_labels)
+                final_pred, _ = self._ar_head.sample_with_confidence(h, c_vec)
+            else:
+                log_p = self.forward(x, sigma_t, cond_tokens=cond_tokens,
+                                     class_labels=class_labels)
+                log_p[:, :, self.mask_index] = NEG_INF
+                final_pred = log_p.argmax(dim=-1)
             x[still_masked] = final_pred[still_masked]
             if return_history:
                 history.append(x.clone().cpu())

@@ -87,7 +87,7 @@ accelerate launch \
     --level_drop_after_steps 10000 \
     --guidance_scale 3.0 \
     --log_every 100 \
-    --save_every 10000 \
+    --save_every 50000 \
     --sample_every 5000 \
     --fid_every 9999999 \
     --eval_num_steps 50 \

@@ -429,6 +429,143 @@ class CellViT(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Swin Transformer encoder components
+# ──────────────────────────────────────────────────────────────────
+
+def _swin_window_partition(x: torch.Tensor, ws: int) -> torch.Tensor:
+    """(B, H, W, C) → (B*nW, ws, ws, C)"""
+    B, H, W, C = x.shape
+    return (x.view(B, H // ws, ws, W // ws, ws, C)
+             .permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, ws, ws, C))
+
+
+def _swin_window_unpartition(w: torch.Tensor, ws: int, H: int, W: int) -> torch.Tensor:
+    """(B*nW, ws, ws, C) → (B, H, W, C)"""
+    nH, nW_ = H // ws, W // ws
+    B = w.shape[0] // (nH * nW_)
+    return (w.view(B, nH, nW_, ws, ws, -1)
+             .permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1))
+
+
+class SwinWindowAttention(nn.Module):
+    """Window multi-head self-attention with relative position bias."""
+
+    def __init__(self, dim: int, num_heads: int, window_size: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.ws = window_size
+        self.scale = (dim // num_heads) ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+        self.rpb_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) ** 2, num_heads))
+        nn.init.trunc_normal_(self.rpb_table, std=0.02)
+
+        coords = torch.stack(torch.meshgrid(
+            torch.arange(window_size), torch.arange(window_size), indexing='ij'))
+        rel = coords.flatten(1)[:, :, None] - coords.flatten(1)[:, None, :]
+        rel = rel.permute(1, 2, 0).contiguous()
+        rel[:, :, 0] += window_size - 1
+        rel[:, :, 1] += window_size - 1
+        rel[:, :, 0] *= 2 * window_size - 1
+        self.register_buffer("rpb_index", rel.sum(-1))
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+        B_, N, C = x.shape
+        hd = C // self.num_heads
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn + self.rpb_table[self.rpb_index.view(-1)].view(
+            N, N, -1).permute(2, 0, 1).unsqueeze(0)
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = (attn.view(B_ // nW, nW, self.num_heads, N, N)
+                    + mask.unsqueeze(1).unsqueeze(0)).view(-1, self.num_heads, N, N)
+        x = (attn.softmax(-1) @ v).transpose(1, 2).reshape(B_, N, C)
+        return self.proj(x)
+
+
+class SwinTransformerBlock(nn.Module):
+    """Swin block: LN → W-MSA (optionally shifted) → LN → MLP."""
+
+    def __init__(self, dim: int, num_heads: int, window_size: int,
+                 shift_size: int = 0, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.ws = window_size
+        self.shift_size = shift_size
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = SwinWindowAttention(dim, num_heads, window_size)
+        self.norm2 = nn.LayerNorm(dim)
+        h = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, h), nn.GELU(), nn.Linear(h, dim))
+
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        B, L, C = x.shape
+        shortcut = x
+        x = self.norm1(x).view(B, H, W, C)
+        ws = self.ws
+        # No shift when single window covers entire feature map
+        shift = self.shift_size if min(H, W) > ws else 0
+
+        pad_b = (ws - H % ws) % ws
+        pad_r = (ws - W % ws) % ws
+        if pad_b > 0 or pad_r > 0:
+            x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        Hp, Wp = x.shape[1], x.shape[2]
+
+        if shift > 0:
+            x = torch.roll(x, (-shift, -shift), (1, 2))
+            mask = self._attn_mask(Hp, Wp, shift, x.device)
+        else:
+            mask = None
+
+        x = _swin_window_partition(x, ws).view(-1, ws * ws, C)
+        x = self.attn(x, mask)
+        x = x.view(-1, ws, ws, C)
+        x = _swin_window_unpartition(x, ws, Hp, Wp)
+
+        if shift > 0:
+            x = torch.roll(x, (shift, shift), (1, 2))
+        if pad_b > 0 or pad_r > 0:
+            x = x[:, :H, :W, :]
+
+        x = shortcut + x.reshape(B, L, C)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+    def _attn_mask(self, Hp: int, Wp: int, shift: int, device):
+        ws = self.ws
+        m = torch.zeros(1, Hp, Wp, 1, device=device)
+        for cnt, (h, w) in enumerate(
+            (h, w)
+            for h in (slice(0, -ws), slice(-ws, -shift), slice(-shift, None))
+            for w in (slice(0, -ws), slice(-ws, -shift), slice(-shift, None))
+        ):
+            m[:, h, w, :] = cnt
+        mw = _swin_window_partition(m, ws).view(-1, ws * ws)
+        am = mw.unsqueeze(1) - mw.unsqueeze(2)
+        return am.masked_fill(am != 0, -100.0).masked_fill(am == 0, 0.0)
+
+
+class SwinPatchMerge(nn.Module):
+    """2×2 spatial merge: resolution halved, channels doubled."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(4 * dim)
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        B, _, C = x.shape
+        x = x.view(B, H, W, C)
+        x = torch.cat([x[:, 0::2, 0::2], x[:, 1::2, 0::2],
+                        x[:, 0::2, 1::2], x[:, 1::2, 1::2]], dim=-1)
+        return self.reduction(self.norm(x.view(B, -1, 4 * C)))
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Hierarchical Multi-Resolution Encoder
 # ──────────────────────────────────────────────────────────────────
 
@@ -499,6 +636,15 @@ class HierarchicalMultiResEncoder(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_use_cnn_stem: bool = True,
         vit_cnn_stem_reduction: int = 4,
+        # ── Internal dim (encoder runs at this, projects to dim at output) ──
+        encoder_internal_dim: int | None = None,
+        # ── Swin-specific ──
+        swin_patch_size: int = 16,
+        swin_embed_dim: int = 96,
+        swin_depths: list[int] | None = None,
+        swin_num_heads: list[int] | None = None,
+        swin_window_size: int = 4,
+        swin_mlp_ratio: float = 4.0,
         # ── Custom level sizes (optional) ──
         level_sizes: list[int] | None = None,
     ):
@@ -532,6 +678,7 @@ class HierarchicalMultiResEncoder(nn.Module):
 
         self.num_levels = num_levels
         self.dim = dim
+        self._enc_dim = encoder_internal_dim or dim  # internal encoder dim
         self.image_size = image_size
         self.min_patch_size = min_patch_size
         self.finest_size = finest_size
@@ -549,6 +696,12 @@ class HierarchicalMultiResEncoder(nn.Module):
                            vit_patch_size, vit_depth, vit_num_heads,
                            vit_mlp_ratio, vit_use_cnn_stem,
                            vit_cnn_stem_reduction)
+        elif encoder_type == 'swin':
+            self._init_swin(in_channels, dim, image_size,
+                            swin_patch_size, swin_embed_dim,
+                            swin_depths or [2, 2, 6, 2],
+                            swin_num_heads or [3, 6, 12, 24],
+                            swin_window_size, swin_mlp_ratio)
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
@@ -590,7 +743,12 @@ class HierarchicalMultiResEncoder(nn.Module):
 
         All levels share a single CellViT.  Each level has its own
         patch projection (because effective patch dims differ).
+
+        When encoder_internal_dim is set (self._enc_dim != dim), the ViT
+        runs at _enc_dim internally and a per-level 1×1 conv projects to dim.
         """
+        enc_d = self._enc_dim  # internal dim (may differ from output dim)
+
         finest_cell = min_patch_size  # cell size at finest level
         tokens_per_side = finest_cell // vit_patch_size
         assert finest_cell % vit_patch_size == 0, \
@@ -603,7 +761,7 @@ class HierarchicalMultiResEncoder(nn.Module):
 
         self.cell_vit = CellViT(
             in_channels=in_channels,
-            dim=dim,
+            dim=enc_d,
             vit_patch_size=vit_patch_size,
             depth=vit_depth,
             num_heads=vit_num_heads,
@@ -632,12 +790,126 @@ class HierarchicalMultiResEncoder(nn.Module):
             self.cell_vit.build_scale_emb(key)
             self._level_vit_info[s] = (eff_p, key)
 
-        # Per-level positional embedding for the grid (2D)
+        # Per-level positional embedding for the grid (2D) — at internal dim
         self.grid_pos_embs = nn.ParameterDict()
         for s in self.level_sizes:
             self.grid_pos_embs[str(s)] = nn.Parameter(
-                torch.zeros(1, dim, s, s))
+                torch.zeros(1, enc_d, s, s))
             nn.init.trunc_normal_(self.grid_pos_embs[str(s)], std=0.02)
+
+        # Output projection: enc_dim → dim (when they differ)
+        if enc_d != dim:
+            self._vit_out_projs = nn.ModuleDict()
+            for s in self.level_sizes:
+                self._vit_out_projs[str(s)] = nn.Conv2d(enc_d, dim, 1)
+        else:
+            self._vit_out_projs = None
+
+    # ──────────────────────────────────────────────────────────────
+    #  Swin backend
+    # ──────────────────────────────────────────────────────────────
+
+    def _init_swin(self, in_channels, dim, image_size,
+                   swin_patch_size, swin_embed_dim, swin_depths,
+                   swin_num_heads, swin_window_size, swin_mlp_ratio):
+        """Initialize Swin Transformer encoder backend.
+
+        Architecture (image_size=256, swin_patch_size=16):
+            PatchEmbed → 16×16 tokens, C=embed_dim
+            Stage 0 (16×16) → avg_pool 2×2 → 8×8 → proj → level 8
+              PatchMerge → 8×8, C=2D
+            Stage 1 (8×8)  → avg_pool 2×2 → 4×4 → proj → level 4
+              PatchMerge → 4×4, C=4D
+            Stage 2 (4×4)  → avg_pool 2×2 → 2×2 → proj → level 2
+              PatchMerge → 2×2, C=8D
+            Stage 3 (2×2)  → avg_pool 2×2 → 1×1 → proj → level 1
+        """
+        num_stages = len(swin_depths)
+        assert num_stages == self.num_levels, \
+            f"len(swin_depths)={num_stages} must equal num_levels={self.num_levels}"
+        assert len(swin_num_heads) == num_stages
+
+        initial_res = image_size // swin_patch_size
+        assert image_size % swin_patch_size == 0
+
+        # Validate: stage resolution = 2 × target level_size
+        res = initial_res
+        for i, ls in enumerate(self.level_sizes):
+            assert res == 2 * ls, \
+                f"Stage {i}: resolution {res} != 2 × level_size {ls}. " \
+                f"Adjust swin_patch_size (current={swin_patch_size})."
+            if i < num_stages - 1:
+                res //= 2
+
+        self._swin_patch_size = swin_patch_size
+        self._swin_initial_res = initial_res
+
+        # Patch embedding
+        self.swin_patch_embed = nn.Conv2d(
+            in_channels, swin_embed_dim,
+            kernel_size=swin_patch_size, stride=swin_patch_size)
+        self.swin_patch_norm = nn.LayerNorm(swin_embed_dim)
+
+        # Per-stage: blocks, merge, output norm + projection
+        self.swin_blocks = nn.ModuleList()
+        self.swin_merges = nn.ModuleList()
+        self.swin_out_norms = nn.ModuleList()
+        self.swin_out_projs = nn.ModuleList()
+
+        stage_res = initial_res
+        ch = swin_embed_dim
+        for i in range(num_stages):
+            ws = min(swin_window_size, stage_res)
+
+            # Transformer blocks (alternating W-MSA / SW-MSA)
+            blocks = nn.ModuleList()
+            for j in range(swin_depths[i]):
+                shift = 0 if (j % 2 == 0) else ws // 2
+                blocks.append(SwinTransformerBlock(
+                    ch, swin_num_heads[i], ws, shift, swin_mlp_ratio))
+            self.swin_blocks.append(blocks)
+
+            # Output: norm → linear → feat_channels
+            self.swin_out_norms.append(nn.LayerNorm(ch))
+            self.swin_out_projs.append(nn.Linear(ch, dim))
+
+            # PatchMerge (except last stage)
+            if i < num_stages - 1:
+                self.swin_merges.append(SwinPatchMerge(ch))
+                ch *= 2
+                stage_res //= 2
+
+    def _forward_swin(self, x: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Single-forward Swin encoder → multi-resolution features."""
+        B = x.shape[0]
+
+        # Patch embed
+        x = self.swin_patch_embed(x)           # (B, embed_dim, H', W')
+        x = x.flatten(2).transpose(1, 2)       # (B, N, embed_dim)
+        x = self.swin_patch_norm(x)
+
+        H = W = self._swin_initial_res
+        level_features = {}
+
+        for i, (blocks, level_size) in enumerate(
+            zip(self.swin_blocks, self.level_sizes)
+        ):
+            for blk in blocks:
+                x = blk(x, H, W)
+
+            # Extract feature at this stage: norm → proj → reshape → avg_pool
+            feat = self.swin_out_projs[i](self.swin_out_norms[i](x))
+            feat = feat.transpose(1, 2).view(B, self.dim, H, W)
+            feat = F.avg_pool2d(feat, 2)        # (B, dim, H/2, W/2)
+            level_features[level_size] = feat
+
+            # Merge for next stage (except last)
+            if i < len(self.swin_merges):
+                x = self.swin_merges[i](x, H, W)
+                H //= 2
+                W //= 2
+
+        return level_features
 
     # ──────────────────────────────────────────────────────────────
     #  CNN backend: patchify + hierarchy
@@ -737,14 +1009,19 @@ class HierarchicalMultiResEncoder(nn.Module):
         feat = self.cell_vit(
             cells, level_key=key, vit_patch_size=eff_p,
             mae_mask_ratio=mae_ratio,
-        )  # (B*s*s, dim) or (B, dim) if s==1
+        )  # (B*s*s, enc_dim) or (B, enc_dim) if s==1
 
-        # Reshape to (B, dim, s, s)
-        feat = feat.view(B, s * s, self.dim)
-        feat = feat.transpose(1, 2).view(B, self.dim, s, s)
+        # Reshape to (B, enc_dim, s, s)
+        enc_d = self._enc_dim
+        feat = feat.view(B, s * s, enc_d)
+        feat = feat.transpose(1, 2).view(B, enc_d, s, s)
 
-        # Grid positional embedding
+        # Grid positional embedding (at enc_dim)
         feat = feat + self.grid_pos_embs[str(s)]
+
+        # Project enc_dim → dim if they differ
+        if self._vit_out_projs is not None:
+            feat = self._vit_out_projs[str(s)](feat)
 
         return feat
 
@@ -762,6 +1039,9 @@ class HierarchicalMultiResEncoder(nn.Module):
             {spatial_size: (B, dim, S, S)} for each level
             e.g. {8: (B,256,8,8), 4: (B,256,4,4), 2: (B,256,2,2), 1: (B,256,1,1)}
         """
+        if self.encoder_type == 'swin':
+            return self._forward_swin(x)
+
         if self.encoder_type == 'vit':
             level_features = {}
             for s in self.level_sizes:

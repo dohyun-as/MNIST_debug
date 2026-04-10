@@ -1,15 +1,14 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  Sudoku 288×288 — DiT + ViT encoder (single resolution: 9×9)
+#  Sudoku 288×288 — DiT + ViT encoder (continuous features, no FSQ)
 # ──────────────────────────────────────────────────────────────────
 #
-#  DiT backbone (JiT-style) for MNIST-Sudoku generation.
-#  Encoder: ViT with single-level 9×9 grid encoding.
-#  Pixel-space diffusion (grayscale, 1 channel).
+#  FSQ 없이 continuous feature (dim=16)로 DiT conditioning.
+#  Encoder capacity 진단용.
 #
 #  Usage:
-#    bash script/train_sudoku_dit.sh
-#    GPUS=0,1,2,3 bash script/train_sudoku_dit.sh
+#    bash script/train_sudoku_dit_cont.sh
+#    GPUS=0,1,2,3 bash script/train_sudoku_dit_cont.sh
 
 set -e
 
@@ -33,14 +32,15 @@ accelerate launch \
     --multi_gpu \
     src/main_sudoku_dit.py \
     --backbone dit \
-    --output_dir runs/sudoku/dit_9x9_v2_s_fsq_888_mae75 \
+    --output_dir runs/sudoku/dit_9x9_cont_out16 \
     --sudoku_config "$SRM_CONFIG" \
     --classifier_pth "$CLASSIFIER" \
     --image_size 288 \
     --in_channels 1 \
     --cond_in_channels 1 \
     --level_sizes 9 \
-    --feat_channels 256 \
+    --feat_channels 16 \
+    --encoder_internal_dim 256 \
     --depth_per_level 2 \
     --encoder_type vit \
     --vit_patch_size 4 \
@@ -84,6 +84,4 @@ accelerate launch \
     --eval_num_samples 81 \
     --num_workers 4 \
     --seed 42 \
-    --use_fsq \
-    --fsq_levels 8 8 8 \
-    --mae_mask_ratio 0.75 \
+    --mae_mask_ratio 0.0 \

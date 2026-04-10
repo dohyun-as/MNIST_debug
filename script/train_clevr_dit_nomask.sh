@@ -1,35 +1,14 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  ImageNet 256×256 — Multi-Resolution DiT (pixel space, flow matching V-loss)
+#  CLEVR 256×256 — Multi-Resolution DiT + ViT encoder
+#  Same as train_clevr_dit.sh but with mae_mask_ratio=0
 # ──────────────────────────────────────────────────────────────────
 #
-#  DiT backbone (JiT-style): RMSNorm, SwiGLU, QK-norm, adaLN-Zero
-#  BottleneckPatchEmbed, 2D RoPE, in-context tokens, fixed sin-cos pos embed,
-#  middle-50% dropout
-#
-#  Encoder levels: 8×8, 4×4, 2×2, 1×1  (min_patch_size=32)
-#  No VAE — pixel-space diffusion
-#  Flow matching with V-prediction loss (JiT-style)
-#
-#  ── JiT variant configs ──────────────────────────────────────────
-#  (patch_size=16 for all variants below; use 32 for /32 variants)
-#
-#  JiT-B/16 (default):
-#    --dit_hidden_size 768  --dit_n_heads 12 --dit_n_blocks 12
-#    --dit_bottleneck_dim 128 --dit_in_context_len 32 --dit_in_context_start 4
-#
-#  JiT-L/16:
-#    --dit_hidden_size 1024 --dit_n_heads 16 --dit_n_blocks 24
-#    --dit_bottleneck_dim 128 --dit_in_context_len 32 --dit_in_context_start 8
-#
-#  JiT-H/16:
-#    --dit_hidden_size 1280 --dit_n_heads 16 --dit_n_blocks 32
-#    --dit_bottleneck_dim 256 --dit_in_context_len 32 --dit_in_context_start 10
-#  ──────────────────────────────────────────────────────────────────
-#
-#  Usage:
-#    bash script/train_imagenet_pixel_dit.sh
-#    GPUS=0,1,2,3 bash script/train_imagenet_pixel_dit.sh
+#  Previous run (mask075_CA): mae_mask_ratio=0.75
+#    → AllAttr plateau at ~91.8%, Shape stuck at ~93%
+#  This run: mae_mask_ratio=0 (no masking)
+#    → Hypothesis: mask=0.75 causes shape info loss in encoder
+# ──────────────────────────────────────────────────────────────────
 
 set -e
 
@@ -37,18 +16,24 @@ set -e
 export CUDA_VISIBLE_DEVICES="${GPUS:-0,1,2,3}"
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
-BATCH_PER_GPU=16
-GRAD_ACCUM=16
+BATCH_PER_GPU=64
+GRAD_ACCUM=4
 
 echo "GPUs: $CUDA_VISIBLE_DEVICES ($NUM_GPUS), batch/gpu=$BATCH_PER_GPU, accum=$GRAD_ACCUM, effective=$((BATCH_PER_GPU * NUM_GPUS * GRAD_ACCUM))"
+
+# ── Data ──
+CLEVR_DIR="../clevr-dataset-gen/output/clevr_256_varied/images"
+CLEVR_VAL="../clevr-dataset-gen/output/clevr_256_varied_val/images"
 
 accelerate launch \
     --num_processes $NUM_GPUS \
     --multi_gpu \
     src/main_multires.py \
     --backbone dit \
-    --output_dir runs/imagenet_256_pixel_dit_flow_fsq_mask0_CA_bugfix \
-    --dataset_root ../imagenet/ILSVRC/Data/CLS-LOC \
+    --output_dir runs/clevr/backbone/clevr_256_dit_vit_flow_fsq_mas75_CA_w_decay0 \
+    --train_dir "$CLEVR_DIR" \
+    --val_dir "$CLEVR_VAL" \
+    --dataset_root "$CLEVR_DIR" \
     --image_size 256 \
     --in_channels 3 \
     --vae_downsample_factor 1 \
@@ -75,7 +60,7 @@ accelerate launch \
     --max_train_steps 200000 \
     --batch_size $BATCH_PER_GPU \
     --blr 2.5e-5 \
-    --weight_decay 0.05 \
+    --weight_decay 0.0 \
     --warmup_steps 5000 \
     --max_grad_norm 3.0 \
     --grad_accum_steps $GRAD_ACCUM \
@@ -95,7 +80,6 @@ accelerate launch \
     --seed 42 \
     --use_fsq \
     --fsq_levels 8 8 8 5 5 5 \
-    # --mae_mask_ratio 0.75 \
-    # --vit_depth 12 \
-    # --vit_num_heads 12 \
-    # --feat_channels 768 \
+    --mae_mask_ratio 0.75 \
+    --clevr_eval_every 10000 \
+    --clevr_eval_samples 50 \

@@ -492,6 +492,13 @@ def parse_args():
     p.add_argument("--grid_only", action="store_true", default=False,
                    help="Skip loading images from SRM dataset; only load "
                         "sudoku grids.  Much faster when image is not needed.")
+    p.add_argument("--conditional_training", action="store_true", default=False,
+                   help="Train with random hint conditioning (inpainting-style). "
+                        "Each sample gets a random number of hint cells [0, seq_len-1].")
+    p.add_argument("--cond_hint_min", type=int, default=0,
+                   help="Minimum number of hint cells during conditional training.")
+    p.add_argument("--cond_hint_max", type=int, default=None,
+                   help="Maximum number of hint cells (default: seq_len - 1).")
 
     # grid params
     p.add_argument("--grid_hw", type=int, default=9,
@@ -510,6 +517,15 @@ def parse_args():
     p.add_argument("--cond_dim", type=int, default=128)
     p.add_argument("--mlp_ratio", type=int, default=4)
     p.add_argument("--model_dropout", type=float, default=0.1)
+
+    # TokenBridge-style factorized AR head
+    p.add_argument("--factorized_head", action="store_true", default=False,
+                   help="Use factorized per-dim AR head instead of flat softmax. "
+                        "FSQ levels are auto-detected from pretrained encoder.")
+    p.add_argument("--ar_head_dim", type=int, default=256,
+                   help="Internal dimension of the factorized AR head.")
+    p.add_argument("--ar_head_layers", type=int, default=2,
+                   help="Number of layers in the factorized AR head.")
 
     # noise schedule
     p.add_argument("--noise_type", type=str, default="loglinear",
@@ -753,6 +769,16 @@ def evaluate_and_save(
     vocab_size = args.grid_vocab_size
 
     # ── sample ──
+    cond_tokens = None
+    if args.conditional_training:
+        # All-MASK prefix → unconditional generation from conditional model
+        mask_token = model.mask_index
+        cond_prefix = torch.full(
+            (args.eval_num_samples, seq_len), mask_token,
+            dtype=torch.long, device=device)
+        backbone = model.backbone
+        cond_tokens = backbone.token_emb(cond_prefix)
+        cond_tokens = backbone.pos_emb(cond_tokens)
     tokens = model.sample(
         batch_size=args.eval_num_samples,
         seq_len=seq_len,
@@ -761,6 +787,7 @@ def evaluate_and_save(
         sampler=args.sampler,
         noise_removal=True,
         tokens_per_step=args.tokens_per_step,
+        cond_tokens=cond_tokens,
     )  # (B, seq_len)
 
     # ════════════════════════════════════════════════════════
@@ -967,22 +994,42 @@ def evaluate_difficulty(
                                       generator=rng)[:nh]
                 known_mask[b, perm] = True
 
-        # ── inpaint ──
-        completed_flat = model.sample_inpaint(
-            x_gt=x_gt,
-            known_mask=known_mask,
-            num_steps=args.eval_num_steps,
-            sampler=args.sampler,
-            noise_removal=True,
-            tokens_per_step=args.tokens_per_step,
-            return_step_logs=True,
-        )  # (B, 81) or (B, 81, step_logs)
-        
-        # Unpack if step_logs is returned
-        if isinstance(completed_flat, tuple):
-            completed_flat, step_logs = completed_flat
-        else:
+        # ── generate unknown cells ──
+        if args.conditional_training:
+            # Prefix conditioning: build masked condition prefix
+            mask_token = model.mask_index
+            cond_prefix = x_gt.clone()
+            cond_prefix[~known_mask] = mask_token  # unknown → MASK
+            # Embed condition prefix
+            backbone = model.backbone
+            cond_emb = backbone.token_emb(cond_prefix)
+            cond_emb = backbone.pos_emb(cond_emb)
+            completed_flat = model.sample(
+                batch_size=B,
+                seq_len=seq_len,
+                num_steps=args.eval_num_steps,
+                device=device,
+                sampler=args.sampler,
+                noise_removal=True,
+                cond_tokens=cond_emb,
+                tokens_per_step=args.tokens_per_step,
+            )
             step_logs = None
+        else:
+            # Inpainting: force known positions during denoising
+            completed_flat = model.sample_inpaint(
+                x_gt=x_gt,
+                known_mask=known_mask,
+                num_steps=args.eval_num_steps,
+                sampler=args.sampler,
+                noise_removal=True,
+                tokens_per_step=args.tokens_per_step,
+                return_step_logs=True,
+            )
+            if isinstance(completed_flat, tuple):
+                completed_flat, step_logs = completed_flat
+            else:
+                step_logs = None
             
         completed_grids = completed_flat.view(B, grid_hw, grid_hw)
 
@@ -2411,6 +2458,10 @@ def main():
         mlp_ratio=args.mlp_ratio,
         dropout=args.model_dropout,
         pos_emb_type=args.pos_emb_type,
+        factorized_head=args.factorized_head,
+        fsq_levels=fsq_levels if args.factorized_head else None,
+        ar_head_dim=args.ar_head_dim,
+        ar_head_layers=args.ar_head_layers,
     )
 
     # ── optionally initialize token_emb from FSQ codebook ──
@@ -2531,7 +2582,24 @@ def main():
                 tokens = grid.view(grid.shape[0], -1) - 1   # (B, 81) in range [0, 8]
 
             with accelerator.accumulate(diffusion):
-                loss_out = accelerator.unwrap_model(diffusion).compute_loss(tokens)
+                # ── Conditional training: prefix conditioning ──
+                cond_tokens = None
+                if args.conditional_training:
+                    B, L = tokens.shape
+                    model_ = accelerator.unwrap_model(diffusion)
+                    mask_token = model_.mask_index
+                    mask_ratio = torch.empty(B, 1, device=tokens.device).uniform_(0.0, 1.0)
+                    rand = torch.rand(B, L, device=tokens.device)
+                    mask = rand < mask_ratio  # True → masked in condition
+                    cond_prefix = tokens.clone()
+                    cond_prefix[mask] = mask_token
+                    # Embed via backbone's own token_emb + pos_emb → (B, L, D)
+                    backbone = model_.backbone
+                    cond_tokens = backbone.token_emb(cond_prefix)
+                    cond_tokens = backbone.pos_emb(cond_tokens)
+
+                loss_out = accelerator.unwrap_model(diffusion).compute_loss(
+                    tokens, cond_tokens=cond_tokens)
                 loss = loss_out.loss
 
                 accelerator.backward(loss)

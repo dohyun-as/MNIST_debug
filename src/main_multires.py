@@ -111,8 +111,8 @@ def parse_args():
 
     # --- ViT encoder ---
     p.add_argument("--encoder_type", type=str, default="cnn",
-                   choices=["cnn", "vit"],
-                   help="Encoder backend: 'cnn' (PatchCNN+merge) or 'vit' (shared CellViT)")
+                   choices=["cnn", "vit", "swin"],
+                   help="Encoder backend: 'cnn' (PatchCNN+merge), 'vit' (shared CellViT), or 'swin' (Swin Transformer)")
     p.add_argument("--vit_patch_size", type=int, default=4,
                    help="ViT sub-patch size for finest level")
     p.add_argument("--vit_depth", type=int, default=4,
@@ -127,6 +127,24 @@ def parse_args():
                    help="Disable CNN stem")
     p.add_argument("--vit_cnn_stem_reduction", type=int, default=4,
                    help="CNN stem spatial reduction factor")
+
+    p.add_argument("--encoder_internal_dim", type=int, default=None,
+                   help="Encoder internal dim (ViT hidden dim). If set, encoder runs at this dim "
+                        "and projects to feat_channels at output. Default: same as feat_channels.")
+
+    # --- Swin encoder ---
+    p.add_argument("--swin_patch_size", type=int, default=16,
+                   help="Swin initial patch embedding size (image_size / swin_patch_size = initial tokens per side)")
+    p.add_argument("--swin_embed_dim", type=int, default=96,
+                   help="Swin base embedding dimension (doubles per stage)")
+    p.add_argument("--swin_depths", type=int, nargs="+", default=None,
+                   help="Swin blocks per stage (e.g. 2 2 6 2). Must match num_levels.")
+    p.add_argument("--swin_num_heads", type=int, nargs="+", default=None,
+                   help="Swin attention heads per stage (e.g. 3 6 12 24)")
+    p.add_argument("--swin_window_size", type=int, default=4,
+                   help="Swin window size for local attention")
+    p.add_argument("--swin_mlp_ratio", type=float, default=4.0,
+                   help="Swin MLP expansion ratio")
 
     # --- discretization ---
     p.add_argument("--use_fsq", action="store_true", default=False)
@@ -155,8 +173,8 @@ def parse_args():
 
     # --- backbone selection ---
     p.add_argument("--backbone", type=str, default="unet",
-                   choices=["unet", "dit"],
-                   help="Denoising backbone: 'unet' (default) or 'dit'")
+                   choices=["unet", "dit", "baseline_1d"],
+                   help="Denoising backbone: 'unet', 'dit', or 'baseline_1d' (Semanticist-style)")
 
     # --- DiT (only used when --backbone dit) ---
     p.add_argument("--dit_patch_size", type=int, default=2,
@@ -172,6 +190,31 @@ def parse_args():
                    help="Number of in-context learnable tokens (JiT=32, 0=disabled)")
     p.add_argument("--dit_in_context_start", type=int, default=4,
                    help="Layer index to prepend in-context tokens (JiT-B=4, L=8, H=10)")
+
+    # --- baseline_1d (Semanticist-style, only used when --backbone baseline_1d) ---
+    p.add_argument("--num_slots", type=int, default=256,
+                   help="Number of 1D condition tokens (Semanticist-style)")
+    p.add_argument("--slot_dim", type=int, default=16,
+                   help="Per-slot dimension before projection")
+    p.add_argument("--enc_embed_dim", type=int, default=768,
+                   help="Semanticist ViT encoder hidden dim")
+    p.add_argument("--enc_depth", type=int, default=12,
+                   help="Semanticist ViT encoder depth")
+    p.add_argument("--enc_num_heads", type=int, default=12,
+                   help="Semanticist ViT encoder attention heads")
+    p.add_argument("--enc_drop_path_rate", type=float, default=0.1,
+                   help="Semanticist ViT encoder drop path rate")
+    p.add_argument("--is_causal", action="store_true", default=True,
+                   help="Use causal attention mask on slots")
+    p.add_argument("--no_causal", dest="is_causal", action="store_false")
+    p.add_argument("--enable_nest", action="store_true", default=True,
+                   help="Enable nested (progressive) token dropping")
+    p.add_argument("--no_nest", dest="enable_nest", action="store_false")
+    p.add_argument("--enable_nest_after_steps", type=int, default=-1,
+                   help="Enable nested drop after N steps (-1 = from start)")
+    p.add_argument("--eval_slot_configs", type=int, nargs="+",
+                   default=[1, 4, 16, 64, 256],
+                   help="Slot counts to evaluate during sampling (baseline_1d only)")
 
     # --- injection (UNet only) ---
     p.add_argument("--upsample_factor", type=int, default=None,
@@ -220,6 +263,9 @@ def parse_args():
                    help="Absolute LR (overrides --blr if set)")
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_steps", type=int, default=5000)
+    p.add_argument("--lr_schedule", type=str, default="constant",
+                   choices=["cosine", "constant"],
+                   help="LR schedule after warmup: cosine decay or constant")
     p.add_argument("--max_grad_norm", type=float, default=3.0)
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--mixed_precision", type=str, default="bf16",
@@ -241,6 +287,10 @@ def parse_args():
     p.add_argument("--guidance_scale", type=float, default=1.5)
     p.add_argument("--fid_num_samples", type=int, default=50000)
     p.add_argument("--eval_only", action="store_true")
+    p.add_argument("--clevr_eval_every", type=int, default=0,
+                   help="Run CLEVR detection+attribute eval every N steps (0=disabled)")
+    p.add_argument("--clevr_eval_samples", type=int, default=30,
+                   help="Number of val samples for CLEVR eval")
     p.add_argument("--num_workers", type=int, default=8)
 
     return p.parse_args()
@@ -447,6 +497,42 @@ def cache_vae_latents(args, accelerator, latent_only=False):
 # ──────────────────────────────────────────────────────────────────
 
 def build_model(args):
+    # ── Baseline 1D (Semanticist-style) ──
+    if args.backbone == "baseline_1d":
+        from model_baseline_1d import Baseline1DConditionalDiT
+        return Baseline1DConditionalDiT(
+            image_size=args.image_size,
+            in_channels=args.in_channels,
+            cond_in_channels=args.cond_in_channels,
+            vae_downsample_factor=args.vae_downsample_factor,
+            num_slots=args.num_slots,
+            slot_dim=args.slot_dim,
+            enc_embed_dim=args.enc_embed_dim,
+            enc_depth=args.enc_depth,
+            enc_num_heads=args.enc_num_heads,
+            enc_drop_path_rate=args.enc_drop_path_rate,
+            is_causal=args.is_causal,
+            enable_nest=args.enable_nest,
+            enable_nest_after_steps=args.enable_nest_after_steps,
+            dit_patch_size=args.dit_patch_size,
+            dit_hidden_size=args.dit_hidden_size,
+            dit_n_heads=args.dit_n_heads,
+            dit_n_blocks=args.dit_n_blocks,
+            dit_mlp_ratio=args.dit_mlp_ratio,
+            dit_dropout=args.dit_dropout,
+            dit_bottleneck_dim=args.dit_bottleneck_dim,
+            dit_in_context_len=args.dit_in_context_len,
+            dit_in_context_start=args.dit_in_context_start,
+            uncond_drop_prob=args.uncond_drop_prob,
+            use_fsq=args.use_fsq,
+            fsq_levels=args.fsq_levels,
+            fsq_drop_quant_p=args.fsq_drop_quant_p,
+            fsq_corrupt_tokens_p=args.fsq_corrupt_tokens_p,
+            use_vq=args.use_vq,
+            vq_codebook_size=args.vq_codebook_size,
+            vq_beta=args.vq_beta,
+        )
+
     # ── DiT backbone ──
     if args.backbone == "dit":
         from model_multires import MultiResConditionalDiT
@@ -483,6 +569,13 @@ def build_model(args):
             vit_mlp_ratio=args.vit_mlp_ratio,
             vit_use_cnn_stem=args.vit_use_cnn_stem and not args.vit_no_cnn_stem,
             vit_cnn_stem_reduction=args.vit_cnn_stem_reduction,
+            encoder_internal_dim=args.encoder_internal_dim,
+            swin_patch_size=args.swin_patch_size,
+            swin_embed_dim=args.swin_embed_dim,
+            swin_depths=args.swin_depths,
+            swin_num_heads=args.swin_num_heads,
+            swin_window_size=args.swin_window_size,
+            swin_mlp_ratio=args.swin_mlp_ratio,
             use_fsq=args.use_fsq,
             fsq_levels=args.fsq_levels,
             fsq_drop_quant_p=args.fsq_drop_quant_p,
@@ -601,11 +694,13 @@ def vae_decode(vae, latents):
 #  LR scheduler (cosine with warmup)
 # ──────────────────────────────────────────────────────────────────
 
-def get_lr(step, warmup_steps, max_steps, base_lr, min_lr=1e-6):
+def get_lr(step, warmup_steps, max_steps, base_lr, min_lr=1e-6, schedule="constant"):
     if step < warmup_steps:
         return base_lr * step / max(warmup_steps, 1)
-    progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
-    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+    if schedule == "cosine":
+        progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+        return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+    return base_lr
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -615,23 +710,30 @@ def get_lr(step, warmup_steps, max_steps, base_lr, min_lr=1e-6):
 @torch.no_grad()
 def sample_ddim(model, scheduler, cond_images, num_steps=50,
                 guidance_scale=1.5, in_channels=3, vae=None,
-                num_active_levels=None):
+                num_active_levels=None, num_active_slots=None):
     """DDIM sampling with CFG, optional VAE decode.
 
     Args:
-        model: MultiResConditionalUNet (unwrapped)
+        model: MultiResConditionalUNet or Baseline1DConditionalDiT (unwrapped)
         scheduler: DDIMScheduler
         cond_images: (B, C, H, W) conditioning images (original resolution)
         num_steps: DDIM denoising steps
         guidance_scale: CFG scale (1.0 = no guidance)
         in_channels: UNet input channels
         vae: optional VAE for latent→pixel decode
-        num_active_levels: override level count for inference
+        num_active_levels: override level count for inference (multi-res)
+        num_active_slots: override slot count for inference (baseline_1d)
     """
     device = cond_images.device
     dtype = cond_images.dtype
     B = cond_images.shape[0]
     latent_size = model.latent_size
+
+    extra_kwargs = {}
+    if num_active_levels is not None:
+        extra_kwargs["num_active_levels"] = num_active_levels
+    if num_active_slots is not None:
+        extra_kwargs["num_active_slots"] = num_active_slots
 
     scheduler.set_timesteps(num_steps, device=device)
 
@@ -642,22 +744,20 @@ def sample_ddim(model, scheduler, cond_images, num_steps=50,
         t_batch = t.expand(B)
 
         if guidance_scale == 0.0:
-            # Pure unconditional generation
             noise_pred = model(latents, t_batch, cond_image=cond_images,
                                return_uncond=True)
         elif guidance_scale != 1.0:
             noise_cond = model(latents, t_batch, cond_image=cond_images,
-                               num_active_levels=num_active_levels)
+                               **extra_kwargs)
             noise_uncond = model(latents, t_batch, cond_image=cond_images,
                                 return_uncond=True)
             noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
         else:
             noise_pred = model(latents, t_batch, cond_image=cond_images,
-                               num_active_levels=num_active_levels)
+                               **extra_kwargs)
 
         latents = scheduler.step(noise_pred, t, latents).prev_sample
 
-    # Decode if VAE
     if vae is not None:
         pixels = vae_decode(vae, latents)
         return pixels.clamp(-1, 1)
@@ -672,8 +772,8 @@ def sample_ddim(model, scheduler, cond_images, num_steps=50,
 @torch.no_grad()
 def sample_flow_ode(model, cond_images, num_steps=50,
                     guidance_scale=1.5, in_channels=3, vae=None,
-                    num_active_levels=None, method="euler",
-                    noise_scale=1.0, t_eps=0.05):
+                    num_active_levels=None, num_active_slots=None,
+                    method="euler", noise_scale=1.0, t_eps=0.05):
     """ODE-based sampling for flow matching models.
 
     Integrates from t=0 (noise) to t=1 (data).
@@ -683,6 +783,12 @@ def sample_flow_ode(model, cond_images, num_steps=50,
     dtype = cond_images.dtype
     B = cond_images.shape[0]
     latent_size = model.latent_size
+
+    extra_kwargs = {}
+    if num_active_levels is not None:
+        extra_kwargs["num_active_levels"] = num_active_levels
+    if num_active_slots is not None:
+        extra_kwargs["num_active_slots"] = num_active_slots
 
     z = noise_scale * torch.randn(B, in_channels, latent_size, latent_size,
                                   device=device, dtype=dtype)
@@ -695,7 +801,7 @@ def sample_flow_ode(model, cond_images, num_steps=50,
 
         if guidance_scale != 1.0:
             x_cond = model(z_cur, t_batch, cond_image=cond_images,
-                           num_active_levels=num_active_levels)
+                           **extra_kwargs)
             x_uncond = model(z_cur, t_batch, cond_image=cond_images,
                              return_uncond=True)
             v_cond = (x_cond - z_cur) / (1.0 - t_expand).clamp_min(t_eps)
@@ -703,7 +809,7 @@ def sample_flow_ode(model, cond_images, num_steps=50,
             return v_uncond + guidance_scale * (v_cond - v_uncond)
         else:
             x_pred = model(z_cur, t_batch, cond_image=cond_images,
-                           num_active_levels=num_active_levels)
+                           **extra_kwargs)
             return (x_pred - z_cur) / (1.0 - t_expand).clamp_min(t_eps)
 
     for i in range(num_steps):
@@ -768,13 +874,23 @@ def generate_samples(model, val_dataset, scheduler, args, accelerator, step,
     else:
         cond_input = images
 
-    # Level configs to evaluate: [all, N-1, ..., 1]
+    # Sampling configs to evaluate
     unwrapped = accelerator.unwrap_model(model)
-    num_levels = unwrapped.num_levels
-    if args.level_drop:
-        level_configs = list(range(num_levels, 0, -1))  # e.g. [4, 3, 2, 1]
+    is_baseline_1d = (args.backbone == "baseline_1d")
+
+    if is_baseline_1d:
+        # Slot count configs: progressive subset of tokens
+        total_slots = unwrapped.num_slots
+        slot_configs = [s for s in args.eval_slot_configs if s <= total_slots]
+        if total_slots not in slot_configs:
+            slot_configs.append(total_slots)
     else:
-        level_configs = [num_levels]
+        # Level configs: [all, N-1, ..., 1]
+        num_levels = unwrapped.num_levels
+        if args.level_drop:
+            level_configs = list(range(num_levels, 0, -1))
+        else:
+            level_configs = [num_levels]
 
     # Guidance scales to evaluate
     guidance_scales = [1.0]
@@ -787,7 +903,21 @@ def generate_samples(model, val_dataset, scheduler, args, accelerator, step,
     if accelerator.is_main_process:
         os.makedirs(save_dir, exist_ok=True)
 
-    for n_lv in level_configs:
+    # Build list of (sample_kwargs, description_str) configs
+    if is_baseline_1d:
+        sample_configs = []
+        for n_slots in slot_configs:
+            kwargs = {"num_active_slots": n_slots if n_slots < total_slots else None}
+            desc = "all" if n_slots >= total_slots else f"{n_slots}tok"
+            sample_configs.append((kwargs, desc))
+    else:
+        sample_configs = []
+        for n_lv in level_configs:
+            kwargs = {"num_active_levels": n_lv if n_lv < num_levels else None}
+            desc = "all" if n_lv >= num_levels else f"{n_lv}lv"
+            sample_configs.append((kwargs, desc))
+
+    for extra_kwargs, cond_desc in sample_configs:
         for gs in guidance_scales:
             if args.use_flow_matching:
                 samples = sample_flow_ode(
@@ -796,10 +926,10 @@ def generate_samples(model, val_dataset, scheduler, args, accelerator, step,
                     guidance_scale=gs,
                     in_channels=args.in_channels,
                     vae=vae,
-                    num_active_levels=n_lv if n_lv < num_levels else None,
                     method=args.flow_sampling_method,
                     noise_scale=args.flow_noise_scale,
                     t_eps=args.flow_t_eps,
+                    **extra_kwargs,
                 )
             else:
                 samples = sample_ddim(
@@ -808,7 +938,7 @@ def generate_samples(model, val_dataset, scheduler, args, accelerator, step,
                     guidance_scale=gs,
                     in_channels=args.in_channels,
                     vae=vae,
-                    num_active_levels=n_lv if n_lv < num_levels else None,
+                    **extra_kwargs,
                 )
 
             if accelerator.is_main_process:
@@ -818,9 +948,8 @@ def generate_samples(model, val_dataset, scheduler, args, accelerator, step,
                     -1, 3, args.image_size, args.image_size)
                 grid = make_grid(combined, nrow=4, padding=2)
 
-                lv_desc = "all" if n_lv >= num_levels else f"{n_lv}lv"
                 cfg_desc = f"cfg{gs:.1f}"
-                fname = f"step_{step:07d}_{lv_desc}_{cfg_desc}.png"
+                fname = f"step_{step:07d}_{cond_desc}_{cfg_desc}.png"
                 save_image(grid, os.path.join(save_dir, fname))
 
     model.train()
@@ -958,6 +1087,248 @@ def evaluate_fid(model, val_dataset, scheduler, args, accelerator, step,
     accelerator.wait_for_everyone()
     model.train()
     return fid_value
+
+
+# ──────────────────────────────────────────────────────────────────
+#  CLEVR detection + attribute evaluation
+# ──────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate_clevr(model, val_dataset, args, accelerator, step,
+                   vae=None, ema_model=None, num_samples=30):
+    """Reconstruct val images and evaluate with CLEVR detector + classifier.
+
+    Compares reconstructed images against GT scene annotations:
+      - Detection: are all objects found? (precision / recall / F1)
+      - Classification: are attributes (color, shape, size, material) correct?
+
+    Requires pre-trained detector & classifier checkpoints in clevr_eval/output/checkpoints/.
+    """
+    import sys
+    import numpy as np
+    from PIL import Image
+
+    clevr_eval_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "..", "clevr_eval")
+    clevr_eval_dir = os.path.normpath(clevr_eval_dir)
+    if not os.path.isdir(clevr_eval_dir):
+        accelerator.print(f"[CLEVR eval] clevr_eval dir not found: {clevr_eval_dir}, skipping")
+        return None
+
+    if clevr_eval_dir not in sys.path:
+        sys.path.insert(0, clevr_eval_dir)
+
+    try:
+        import config as clevr_cfg
+        from models.detector import CenterDetector
+        from models.classifier import AttributeClassifier
+        from evaluate import extract_peaks, match_detections
+    except ImportError as e:
+        accelerator.print(f"[CLEVR eval] import error: {e}, skipping")
+        return None
+
+    det_ckpt = os.path.join(clevr_cfg.CHECKPOINT_DIR, "detector_best.pt")
+    cls_ckpt = os.path.join(clevr_cfg.CHECKPOINT_DIR, "classifier_best.pt")
+    if not os.path.exists(det_ckpt) or not os.path.exists(cls_ckpt):
+        accelerator.print(f"[CLEVR eval] detector/classifier checkpoints not found, skipping")
+        return None
+
+    if not accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+        return None
+
+    device = accelerator.device
+
+    # Load detector & classifier
+    detector = CenterDetector(backbone_name=clevr_cfg.DETECTOR_BACKBONE).to(device)
+    detector.load_state_dict(
+        torch.load(det_ckpt, map_location=device, weights_only=True)["model"])
+    detector.eval()
+
+    classifier = AttributeClassifier().to(device)
+    classifier.load_state_dict(
+        torch.load(cls_ckpt, map_location=device, weights_only=True)["model"])
+    classifier.eval()
+
+    # Pick samples deterministically
+    eval_model = ema_model if ema_model is not None else accelerator.unwrap_model(model)
+    eval_model.eval()
+
+    rng = torch.Generator().manual_seed(args.seed + 7777)
+    n = min(num_samples, len(val_dataset))
+    indices = torch.randperm(len(val_dataset), generator=rng)[:n].tolist()
+
+    # Scene dir: derive from val_dir path
+    # val_dir = .../clevr_256_varied_val/images  → scenes_dir = .../clevr_256_varied_val/scenes
+    val_images_dir = args.val_dir or os.path.join(args.dataset_root, "val")
+    val_root = os.path.dirname(val_images_dir.rstrip("/"))
+    scenes_dir = os.path.join(val_root, "scenes")
+    if not os.path.isdir(scenes_dir):
+        accelerator.print(f"[CLEVR eval] scenes dir not found: {scenes_dir}, skipping")
+        return None
+
+    # Transforms for detector/classifier input (match clevr_eval conventions)
+    det_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    crop_transform = transforms.Compose([
+        transforms.Resize((clevr_cfg.CROP_SIZE, clevr_cfg.CROP_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+    attr_names = ["color", "shape", "size", "material"]
+    dist_thresholds = clevr_cfg.DETECTOR_DIST_THRESH
+    stats = {}
+    for t in dist_thresholds:
+        stats[t] = {
+            "correct": {a: 0 for a in attr_names},
+            "correct_all": 0,
+            "total_matched": 0,
+            "total_pred": 0,
+            "total_gt": 0,
+        }
+
+    for idx in indices:
+        img_path, class_idx = val_dataset.samples[idx]
+
+        # Derive scene JSON path from image path
+        # e.g. .../images/easy/CLEVR_easy_000042.png → .../scenes/easy/CLEVR_easy_000042.json
+        rel = os.path.relpath(img_path, val_images_dir)
+        scene_path = os.path.join(scenes_dir, os.path.splitext(rel)[0] + ".json")
+        if not os.path.isfile(scene_path):
+            continue
+
+        with open(scene_path) as f:
+            scene = json.load(f)
+
+        # GT info
+        gt_centers = []
+        gt_attrs = []
+        for obj in scene["objects"]:
+            cx = np.clip(obj["pixel_coords"][0], 0, clevr_cfg.IMG_SIZE - 1)
+            cy = np.clip(obj["pixel_coords"][1], 0, clevr_cfg.IMG_SIZE - 1)
+            gt_centers.append([cx, cy])
+            gt_attrs.append([
+                clevr_cfg.COLORS.index(obj["color"]),
+                clevr_cfg.SHAPES.index(obj["shape"]),
+                clevr_cfg.SIZES.index(obj["size"]),
+                clevr_cfg.MATERIALS.index(obj["material"]),
+            ])
+        gt_centers = np.array(gt_centers) if gt_centers else np.zeros((0, 2))
+        n_gt = len(gt_centers)
+
+        # Reconstruct: condition image → model → reconstructed image
+        cond_img = val_dataset[idx][0].unsqueeze(0).to(device)  # (1, 3, H, W)
+        if args.cond_use_latent and vae is not None:
+            cond_input = vae_encode(vae, cond_img)
+        else:
+            cond_input = cond_img
+
+        if args.use_flow_matching:
+            recon = sample_flow_ode(
+                eval_model, cond_input,
+                num_steps=args.eval_num_steps,
+                guidance_scale=args.guidance_scale,
+                in_channels=args.in_channels, vae=vae,
+                method=args.flow_sampling_method,
+                noise_scale=args.flow_noise_scale,
+                t_eps=args.flow_t_eps,
+            )
+        else:
+            recon = sample_ddim(
+                eval_model, None, cond_input,
+                num_steps=args.eval_num_steps,
+                guidance_scale=args.guidance_scale,
+                in_channels=args.in_channels, vae=vae,
+            )
+
+        # Convert reconstruction to PIL for cropping
+        recon_01 = (recon[0] * 0.5 + 0.5).clamp(0, 1)
+        recon_pil = transforms.ToPILImage()(recon_01.cpu())
+        w, h = recon_pil.size
+
+        # Run detector on reconstruction
+        det_input = det_transform(recon_pil).unsqueeze(0).to(device)
+        pred_heatmap = detector(det_input).cpu().numpy()[0, 0]
+        peaks = extract_peaks(pred_heatmap, threshold=0.3)
+
+        for t, s in stats.items():
+            s["total_gt"] += n_gt
+            s["total_pred"] += len(peaks)
+            mp, mg, _ = match_detections(peaks, gt_centers, t)
+            s["total_matched"] += len(mp)
+
+            if len(mp) == 0:
+                continue
+
+            # Crop and classify each matched detection
+            crops = []
+            half = clevr_cfg.CROP_SIZE // 2
+            for pi in mp:
+                px, py = int(peaks[pi][0]), int(peaks[pi][1])
+                x1, y1 = max(px - half, 0), max(py - half, 0)
+                x2, y2 = min(px + half, w), min(py + half, h)
+                crops.append(crop_transform(recon_pil.crop((x1, y1, x2, y2))))
+
+            crop_batch = torch.stack(crops).to(device)
+            preds = classifier(crop_batch)
+
+            for k, (pi, gi) in enumerate(zip(mp, mg)):
+                gt = gt_attrs[gi]
+                all_ok = True
+                for ai, a in enumerate(attr_names):
+                    if preds[a][k].argmax().item() == gt[ai]:
+                        s["correct"][a] += 1
+                    else:
+                        all_ok = False
+                if all_ok:
+                    s["correct_all"] += 1
+
+    # Print & log results
+    results = {}
+    accelerator.print(f"\n=== CLEVR Eval (step {step}, {n} samples) ===")
+    for t, s in stats.items():
+        nm = max(s["total_matched"], 1)
+        det_prec = s["total_matched"] / max(s["total_pred"], 1)
+        det_rec = s["total_matched"] / max(s["total_gt"], 1)
+        det_f1 = 2 * det_prec * det_rec / max(det_prec + det_rec, 1e-8)
+        attr_acc = {a: s["correct"][a] / nm * 100 for a in attr_names}
+        all_acc = s["correct_all"] / nm * 100
+
+        accelerator.print(
+            f"  @{t}px  Det: P={det_prec:.3f} R={det_rec:.3f} F1={det_f1:.3f}  "
+            f"Attr: " + " ".join(f"{a}={attr_acc[a]:.1f}%" for a in attr_names) +
+            f"  all={all_acc:.1f}%"
+        )
+        results[t] = {
+            "det_P": det_prec, "det_R": det_rec, "det_F1": det_f1,
+            "attr_acc": attr_acc, "all_attrs_acc": all_acc,
+        }
+
+    # Save to JSON
+    save_path = os.path.join(args.output_dir, "clevr_eval",
+                             f"step_{step:07d}.json")
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    # Log scalar to tensorboard (use @10px as representative)
+    if 10 in results:
+        r = results[10]
+        accelerator.log({
+            "clevr/det_F1@10px": r["det_F1"],
+            "clevr/all_attrs_acc@10px": r["all_attrs_acc"],
+        }, step=step)
+
+    # Cleanup: remove clevr_eval from sys.path to avoid conflicts
+    if clevr_eval_dir in sys.path:
+        sys.path.remove(clevr_eval_dir)
+
+    model.train()
+    accelerator.wait_for_everyone()
+    return results
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1240,7 +1611,7 @@ def train(args):
                 x0 = None
 
             # LR schedule
-            cur_lr = get_lr(global_step, args.warmup_steps, args.max_train_steps, lr)
+            cur_lr = get_lr(global_step, args.warmup_steps, args.max_train_steps, lr, schedule=args.lr_schedule)
             for pg in optimizer.param_groups:
                 pg["lr"] = cur_lr
 
@@ -1376,6 +1747,15 @@ def train(args):
                                    ema_model=ema_eval)
                 if fid is not None:
                     accelerator.log({"fid": fid}, step=global_step)
+
+            # ── CLEVR eval ──
+            if (args.clevr_eval_every > 0
+                    and global_step % args.clevr_eval_every == 0
+                    and global_step > 0):
+                ema_eval = ema.shadow if ema is not None else None
+                evaluate_clevr(model, val_ds, args, accelerator, global_step,
+                               vae=get_eval_vae(), ema_model=ema_eval,
+                               num_samples=args.clevr_eval_samples)
 
         epoch += 1
 

@@ -1,23 +1,8 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  CLEVR — Discrete Diffusion (MDLM-style) on multi-res FSQ tokens
-#  JSON-conditioned (tokenized entity/relation) via prefix concat
-# ──────────────────────────────────────────────────────────────────
-#
-#  Requires: pretrained continuous diffusion model (e.g., from
-#  train_clevr_dit.sh) with FSQ encoder + discretizer.
-#
-#  Token extraction: encoder(image) → FSQ → flat token sequence (85 tokens)
-#  Conditioning: CLEVR JSON → word tokenizer → prefix context tokens
-#  Positional embedding: multires (level + 2D row/col per level)
-# ──────────────────────────────────────────────────────────────────
-#
-#  v1 (discrete_diff):       768/12/12, lr=3e-4, bs=64, accum=4 → eff 1024
-#                            → plateau at ~66% satisfaction, no overfit, underfitting
-#  v2 (discrete_diff_large): 1024/16/18, lr=1e-4, bs=16, accum=32 → eff 2048
-#                            → loss dropped too slowly, lr=1e-4 too low
-#  v3 (discrete_diff_large_v2): 1024/16/18, lr=3e-4, bs=16, accum=32 → eff 2048
-#                            → bigger model (387M), same lr as v1, larger eff batch
+#  CLEVR — Discrete Diffusion on OUR multi-res encoder
+#  Same discrete diffusion hyperparams as semanticist run
+#  Encoder: dit_vit_flow_fsq_mask075_CA → 85 tokens (multi-res)
 # ──────────────────────────────────────────────────────────────────
 
 # ── GPU config ──
@@ -30,7 +15,7 @@ CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_vari
 CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied/conditions_margin50_augmented"}
 CLEVR_VAL_IMAGE_ROOT=${CLEVR_VAL_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied_val/images"}
 CLEVR_VAL_COND_DIR=${CLEVR_VAL_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied_val/conditions_margin50_augmented"}
-OUTPUT_DIR="./runs/clevr/discrete_diff_large_v2"
+OUTPUT_DIR="./runs/clevr/discrete_diff_ours"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -45,13 +30,13 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --pretrained_output_dir ${PRETRAINED_DIR} \
   --image_size 256 \
   --max_train_steps 200000 \
-  --batch_size 16 \
+  --batch_size 64 \
   --lr 3e-4 \
   --weight_decay 0.01 \
   --warmup_steps 2000 \
-  --hidden_size 1024 \
-  --n_heads 16 \
-  --n_blocks 18 \
+  --hidden_size 768 \
+  --n_heads 12 \
+  --n_blocks 12 \
   --cond_dim 256 \
   --mlp_ratio 4 \
   --model_dropout 0.1 \
@@ -62,22 +47,16 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --save_every 50000 \
   --eval_every 10000 \
   --log_every 100 \
-  --eval_num_samples 100 \
+  --eval_num_samples 30 \
   --eval_num_steps 128 \
   --decode_num_steps 50 \
   --seed 42 \
   --mixed_precision bf16 \
   --log_with tensorboard \
-  --grad_accum_steps 32 \
+  --grad_accum_steps 4 \
   --sampler ddpm_cache \
   ${RESUME_DIR:+--resume_dir $RESUME_DIR} \
 "
-# Sampler alternatives (change --sampler and related):
-#   --sampler ddpm_cache              # default: cached DDPM
-#   --sampler ddpm                    # no-cache DDPM
-#   --sampler confidence              # MaskGIT-style top-k unmasking
-#     --tokens_per_step 1             #   linear: unmask 1 token/step
-#     --tokens_per_step 0             #   cosine schedule (default)
 
 PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
 if [ ${NUM_GPUS} -gt 1 ]; then

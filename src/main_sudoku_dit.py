@@ -96,9 +96,13 @@ def parse_args():
     p.add_argument("--cnn_base_channels", type=int, default=64)
     p.add_argument("--mae_mask_ratio", type=float, default=0.0)
 
+    p.add_argument("--encoder_internal_dim", type=int, default=None,
+                   help="Encoder internal dim. If set, encoder runs at this dim "
+                        "and projects to feat_channels at output.")
+
     # --- ViT encoder ---
     p.add_argument("--encoder_type", type=str, default="vit",
-                   choices=["cnn", "vit"])
+                   choices=["cnn", "vit", "swin"])
     p.add_argument("--vit_patch_size", type=int, default=4)
     p.add_argument("--vit_depth", type=int, default=4)
     p.add_argument("--vit_num_heads", type=int, default=4)
@@ -163,6 +167,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_steps", type=int, default=5000)
+    p.add_argument("--lr_schedule", type=str, default="constant",
+                   choices=["cosine", "constant"],
+                   help="LR schedule after warmup: cosine decay or constant")
     p.add_argument("--max_grad_norm", type=float, default=3.0)
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--mixed_precision", type=str, default="fp16",
@@ -224,6 +231,7 @@ def build_model(args):
         vit_mlp_ratio=args.vit_mlp_ratio,
         vit_use_cnn_stem=args.vit_use_cnn_stem and not args.vit_no_cnn_stem,
         vit_cnn_stem_reduction=args.vit_cnn_stem_reduction,
+        encoder_internal_dim=args.encoder_internal_dim,
         use_fsq=args.use_fsq,
         fsq_levels=args.fsq_levels,
         fsq_drop_quant_p=args.fsq_drop_quant_p,
@@ -239,9 +247,11 @@ def build_model(args):
 #  LR scheduler (cosine with warmup)
 # ──────────────────────────────────────────────────────────────────
 
-def get_lr(step, warmup_steps, max_steps, base_lr, min_lr=1e-6):
+def get_lr(step, warmup_steps, max_steps, base_lr, min_lr=1e-6, schedule="cosine"):
     if step < warmup_steps:
         return base_lr * step / max(warmup_steps, 1)
+    if schedule == "constant":
+        return base_lr
     progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
@@ -332,12 +342,99 @@ def sample_ddim(model, scheduler, cond_images, num_steps=50,
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Grid visualization helpers (PIL)
+# ──────────────────────────────────────────────────────────────────
+
+def render_digit_grid(
+    grid_9x9,
+    wrong_mask_9x9=None,     # 빨간 테두리 (GT vs PRED mismatch)
+    bg_mask_9x9=None,        # 연분홍 배경 (GT vs TOK2DIG mismatch)
+    cell=34, pad=3, border=3, title=None,
+    font_size=18,
+):
+    """Render a 9x9 digit grid as a PIL image with optional error highlighting."""
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    grid_np = grid_9x9.detach().cpu().numpy() if torch.is_tensor(grid_9x9) else grid_9x9
+    if wrong_mask_9x9 is not None and torch.is_tensor(wrong_mask_9x9):
+        wrong_mask_9x9 = wrong_mask_9x9.detach().cpu().numpy()
+    if bg_mask_9x9 is not None and torch.is_tensor(bg_mask_9x9):
+        bg_mask_9x9 = bg_mask_9x9.detach().cpu().numpy()
+
+    H, W = grid_np.shape
+    title_h = 18 if title else 0
+    img_w = W * cell + 2 * pad
+    img_h = H * cell + 2 * pad + title_h
+
+    img = Image.new("RGB", (img_w, img_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    if title:
+        draw.text((pad, 0), title, fill=(0, 0, 0), font=font)
+
+    y0 = title_h
+    pink = (255, 230, 235)
+
+    for r in range(H):
+        for c in range(W):
+            x1 = pad + c * cell
+            y1 = y0 + pad + r * cell
+            x2 = x1 + cell
+            y2 = y1 + cell
+
+            # 연분홍 배경 (GT vs TOK2DIG mismatch)
+            if bg_mask_9x9 is not None and bool(bg_mask_9x9[r, c]):
+                draw.rectangle([x1, y1, x2, y2], fill=pink)
+
+            # 기본 셀 테두리
+            draw.rectangle([x1, y1, x2, y2], outline=(200, 200, 200), width=1)
+
+            val = int(grid_np[r, c])
+            s = str(val)
+            bbox = draw.textbbox((0, 0), s, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = x1 + (cell - tw) / 2
+            ty = y1 + (cell - th) / 2
+            draw.text((tx, ty), s, fill=(0, 0, 0), font=font)
+
+            # 빨간 테두리 (GT vs PRED mismatch)
+            if wrong_mask_9x9 is not None and bool(wrong_mask_9x9[r, c]):
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=border)
+
+    return img
+
+
+def tile_images(img_list, nrow, pad_px=6, bg=(255, 255, 255)):
+    """Tile a list of PIL images into a grid."""
+    from PIL import Image
+    if not img_list:
+        return None
+    w, h = img_list[0].size
+    ncol = nrow
+    nrows = math.ceil(len(img_list) / ncol)
+    out_w = ncol * w + (ncol + 1) * pad_px
+    out_h = nrows * h + (nrows + 1) * pad_px
+    canvas = Image.new("RGB", (out_w, out_h), bg)
+    for i, im in enumerate(img_list):
+        rr, cc = i // ncol, i % ncol
+        canvas.paste(im, (pad_px + cc * (w + pad_px), pad_px + rr * (h + pad_px)))
+    return canvas
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Sudoku evaluation
 # ──────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def run_sudoku_eval(model, eval_dataset, noise_scheduler, args, accelerator,
-                    global_step, sudoku_evaluator, ema_model=None):
+                    global_step, sudoku_evaluator, ema_model=None, tag=""):
     """Generate samples and evaluate rule_acc / cell_acc."""
     eval_model = ema_model if ema_model is not None else accelerator.unwrap_model(model)
     eval_model.eval()
@@ -408,9 +505,10 @@ def run_sudoku_eval(model, eval_dataset, noise_scheduler, args, accelerator,
     pair_imgs = torch.cat(pair_imgs, dim=0)
     grid = make_grid(pair_imgs, nrow=4, padding=2)
 
+    tag_suffix = f"_{tag}" if tag else ""
     save_dir = os.path.join(args.output_dir, "eval_samples")
     os.makedirs(save_dir, exist_ok=True)
-    save_image(grid, os.path.join(save_dir, f"step_{global_step:07d}.png"))
+    save_image(grid, os.path.join(save_dir, f"step_{global_step:07d}{tag_suffix}.png"))
 
     # Sudoku evaluation
     fake_m11 = fake_01 * 2.0 - 1.0
@@ -436,19 +534,129 @@ def run_sudoku_eval(model, eval_dataset, noise_scheduler, args, accelerator,
     cell_acc_img = (~wrong_mask_img).float().mean().item()
 
     # Log
-    msg = (f"[Eval] step={global_step} rule_acc={rule_acc:.4f} "
+    tag_label = f"[{tag}]" if tag else ""
+    msg = (f"[Eval]{tag_label} step={global_step} rule_acc={rule_acc:.4f} "
            f"dist_mean={dist_mean:.2f} cell_acc_img={cell_acc_img:.4f}")
     if cell_acc is not None:
         msg += f" cell_acc_grid={cell_acc:.4f}"
     accelerator.print(msg)
 
+    prefix = f"eval_{tag}" if tag else "eval"
     log_dict = {
-        "eval/sudoku_rule_acc": rule_acc,
-        "eval/sudoku_dist_mean": dist_mean,
-        "eval/sudoku_cell_acc_img": cell_acc_img,
+        f"{prefix}/sudoku_rule_acc": rule_acc,
+        f"{prefix}/sudoku_dist_mean": dist_mean,
+        f"{prefix}/sudoku_cell_acc_img": cell_acc_img,
     }
     if cell_acc is not None:
-        log_dict["eval/sudoku_cell_acc_grid"] = cell_acc
+        log_dict[f"{prefix}/sudoku_cell_acc_grid"] = cell_acc
+
+    # ============================================================
+    # Token-to-Digit mapping analysis + digit grid visualization
+    # ============================================================
+    if eval_model.discretizer is not None and ref_grids is not None:
+        pred_9 = s_eval["discrete"].to(device).long()   # (B, 9, 9) from classifier
+        gt_9 = ref_grids.to(device).long()               # (B, 9, 9) ground truth
+        B = gt_9.shape[0]
+
+        # Extract token IDs from encoder + discretizer
+        level_features = eval_model.encoder.forward_injection(ref_images)
+        # Get token IDs for the 9x9 level (should be the main/only level)
+        tok_ids_2d = None
+        for s, feat_2d in level_features.items():
+            D = feat_2d.shape[1]
+            tokens_flat = feat_2d.flatten(2).transpose(1, 2)  # (B, S*S, D)
+            _, t_ids = eval_model.discretizer(tokens_flat)     # (B, S*S)
+            if s == 9:  # 9x9 sudoku level
+                tok_ids_2d = t_ids.view(B, 9, 9).long()
+                break
+
+        if tok_ids_2d is not None:
+            # 1) GT vs pred mismatch mask (빨간 테두리용)
+            wrong_mask_pred = (pred_9 != gt_9)  # (B, 9, 9)
+
+            # 2) tok_id -> digit 통계 매핑 (batch 전체)
+            vocab = int(tok_ids_2d.max().item()) + 1
+            tid_flat = tok_ids_2d.reshape(-1)
+            gt_flat = gt_9.reshape(-1).clamp(0, 9)
+
+            idx = (tid_flat * 10 + gt_flat).to(torch.long)
+            counts = torch.bincount(idx, minlength=vocab * 10).view(vocab, 10)
+
+            tok2digit = counts.argmax(dim=1)
+            tok_conf = counts.max(dim=1).values.float() / (counts.sum(dim=1).float() + 1e-9)
+
+            # 3) tok_id grid -> digit grid
+            pred_from_tok = tok2digit[tok_ids_2d]  # (B, 9, 9)
+
+            # 4) Accuracy metrics
+            wrong_tok_vs_gt = (pred_from_tok != gt_9)
+            acc_tok_vs_gt = (~wrong_tok_vs_gt).float().mean().item()
+            wrong_tok_vs_pred = (pred_from_tok != pred_9)
+            acc_tok_vs_pred = (~wrong_tok_vs_pred).float().mean().item()
+
+            accelerator.print(
+                f"[Eval][Tok2Digit] vocab={vocab} "
+                f"acc(tok->digit vs GT)={acc_tok_vs_gt:.4f} "
+                f"acc(tok->digit vs PRED)={acc_tok_vs_pred:.4f}"
+            )
+
+            log_dict[f"{prefix}/tok2digit_acc_vs_gt"] = acc_tok_vs_gt
+            log_dict[f"{prefix}/tok2digit_acc_vs_pred"] = acc_tok_vs_pred
+
+            # 5) Confusion matrix (GT vs PRED, GT vs TOK2DIG)
+            def confusion_10x10(gt_grid, pr_grid):
+                g = gt_grid.reshape(-1).clamp(0, 9).to(torch.long)
+                p = pr_grid.reshape(-1).clamp(0, 9).to(torch.long)
+                return torch.bincount(g * 10 + p, minlength=100).view(10, 10)
+
+            cm_pred = confusion_10x10(gt_9, pred_9)
+            cm_tok = confusion_10x10(gt_9, pred_from_tok)
+
+            def print_full_confusion(cm, name):
+                accelerator.print(f"[Eval][ConfusionFull] {name} (rows=GT, cols=Pred)")
+                for gt_d in range(10):
+                    row = cm[gt_d]
+                    total = int(row.sum().item())
+                    if total == 0:
+                        continue
+                    parts = [f"{pr_d}:{int(row[pr_d].item())}"
+                             for pr_d in range(10) if int(row[pr_d].item()) > 0]
+                    accelerator.print(f"  GT {gt_d} (n={total}) -> " + ", ".join(parts))
+
+            print_full_confusion(cm_pred, "GT->PRED")
+            print_full_confusion(cm_tok, "GT->TOK2DIG")
+
+            # 6) Digit grid rendering (PIL) — GT / TOK2DIG / PRED
+            wrong_mask_tok = (pred_from_tok != gt_9)
+            gt_imgs, tok_imgs, pred_imgs = [], [], []
+
+            n_viz = min(B, 16)
+            for i in range(n_viz):
+                wm_red = wrong_mask_pred[i]
+                wm_pink = wrong_mask_tok[i]
+
+                gt_imgs.append(render_digit_grid(
+                    gt_9[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
+                tok_imgs.append(render_digit_grid(
+                    pred_from_tok[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
+                pred_imgs.append(render_digit_grid(
+                    pred_9[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
+
+            nrow = min(n_viz, 9)
+            gt_canvas = tile_images(gt_imgs, nrow=nrow)
+            tok_canvas = tile_images(tok_imgs, nrow=nrow)
+            pr_canvas = tile_images(pred_imgs, nrow=nrow)
+
+            viz_dir = os.path.join(save_dir, "grid_digits")
+            os.makedirs(viz_dir, exist_ok=True)
+
+            gt_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_GT.png"))
+            tok_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_TOK2DIG.png"))
+            pr_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_PRED.png"))
+
+            accelerator.print(
+                f"[Eval] Saved digit grids to {viz_dir}/step_{global_step:07d}_*.png")
+
     accelerator.log(log_dict, step=global_step)
 
     model.train()
@@ -636,7 +844,7 @@ def train(args):
             x0 = images
 
             # LR schedule
-            cur_lr = get_lr(global_step, args.warmup_steps, args.max_train_steps, lr)
+            cur_lr = get_lr(global_step, args.warmup_steps, args.max_train_steps, lr, schedule=args.lr_schedule)
             for pg in optimizer.param_groups:
                 pg["lr"] = cur_lr
 
@@ -656,9 +864,6 @@ def train(args):
                     e = torch.randn_like(x0) * args.flow_noise_scale
                     noisy = t_expand * x0 + (1 - t_expand) * e
 
-                    v_target = ((x0 - noisy)
-                                / (1 - t_expand).clamp_min(args.flow_t_eps))
-
                     with accelerator.autocast():
                         use_aux = args.use_vq
                         if use_aux:
@@ -670,8 +875,9 @@ def train(args):
                                            cond_image=cond_images)
                             aux = {}
 
-                        v_pred = ((x_pred - noisy)
-                                  / (1 - t_expand).clamp_min(args.flow_t_eps))
+                        # JiT-style velocity loss
+                        v_target = (x0 - noisy) / (1 - t_expand).clamp_min(args.flow_t_eps)
+                        v_pred = (x_pred - noisy) / (1 - t_expand).clamp_min(args.flow_t_eps)
                         loss = F.mse_loss(v_pred, v_target)
 
                         if "vq_loss" in aux:
@@ -737,12 +943,19 @@ def train(args):
 
             # ── Eval (sudoku rule_acc / cell_acc) ──
             if global_step % args.eval_every == 0:
-                ema_eval = ema.shadow if ema is not None else None
+                # Evaluate original model
                 run_sudoku_eval(
                     model, val_ds, noise_scheduler, args,
                     accelerator, global_step, sudoku_evaluator,
-                    ema_model=ema_eval,
+                    ema_model=None, tag="online",
                 )
+                # Evaluate EMA model (if enabled)
+                if ema is not None:
+                    run_sudoku_eval(
+                        model, val_ds, noise_scheduler, args,
+                        accelerator, global_step, sudoku_evaluator,
+                        ema_model=ema.shadow, tag="ema",
+                    )
 
             # ── Save ──
             if global_step % args.save_every == 0:

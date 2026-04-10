@@ -1,33 +1,26 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  ImageNet — Discrete Diffusion (MDLM-style) on multi-res FSQ tokens
+#  ImageNet — Autoregressive (AR) on multi-res FSQ tokens
 #  Class-label conditioned via adaLN
 # ──────────────────────────────────────────────────────────────────
+#  Requires: pretrained continuous diffusion model with FSQ encoder.
+#  Token extraction is identical to discrete diffusion version.
 #
-#  Requires: pretrained continuous diffusion model (e.g., from
-#  train_imagenet_pixel_dit.sh) with FSQ encoder + discretizer.
-#
-#  Token extraction: encoder(image) → FSQ → flat token sequence
-#  Conditioning: class label embedding added to timestep via adaLN
-#  Positional embedding: multires (level + 2D row/col per level)
-#
-#  Level sizes: [8, 4, 2, 1] → seq_len = 64+16+4+1 = 85
-#  Vocab size: prod(fsq_levels) e.g. 8*8*8*5*5*5 = 64000
-# ──────────────────────────────────────────────────────────────────
+#  Usage:
+#    bash script/train_ar_imagenet.sh
+#    GPUS=0,1 bash script/train_ar_imagenet.sh
 
-# ── GPU config ──
 GPUS=${GPUS:-"0,1"}
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
-# ── Paths ──
-# Pretrained continuous model output dir (contains checkpoints/ and run_config.json)
 PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/imagenet_256_pixel_dit_flow_fsq_mask075_CA"}
 IMAGENET_ROOT=${IMAGENET_ROOT:-"../imagenet/ILSVRC/Data/CLS-LOC"}
-OUTPUT_DIR="./runs/imagenet_discrete_diff_v2"
+OUTPUT_DIR="./runs/imagenet_ar"
 
 mkdir -p "${OUTPUT_DIR}"
 
 COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
+  --model_type ar \
   --dataset_type imagenet \
   --dataset_root ${IMAGENET_ROOT} \
   --pretrained_output_dir ${PRETRAINED_DIR} \
@@ -45,7 +38,6 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --mlp_ratio 4 \
   --model_dropout 0.1 \
   --pos_emb_type multires \
-  --noise_type loglinear \
   --uncond_drop_prob 0.0 \
   --ema_decay 0 \
   --save_every 10000 \
@@ -58,16 +50,12 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --mixed_precision bf16 \
   --log_with tensorboard \
   --grad_accum_steps 1 \
-  --sampler ddpm_cache \
+  --ar_temperature 0.9 \
+  --ar_top_k 0 \
+  --ar_top_p 0.95 \
   --fid_every 50000 \
   --fid_num_samples 5000 \
 "
-# Sampler alternatives (change --sampler and related):
-#   --sampler ddpm_cache              # default: cached DDPM
-#   --sampler ddpm                    # no-cache DDPM
-#   --sampler confidence              # MaskGIT-style top-k unmasking
-#     --tokens_per_step 1             #   linear: unmask 1 token/step
-#     --tokens_per_step 0             #   cosine schedule (default)
 
 PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
 if [ ${NUM_GPUS} -gt 1 ]; then

@@ -1,22 +1,24 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  Sudoku — Discrete Diffusion V2 (grid-only, compatible with v1)
+#  Sudoku — Autoregressive (AR) on 9x9 grids
 # ──────────────────────────────────────────────────────────────────
-
-export NCCL_P2P_DISABLE=1
-export NCCL_SHM_DISABLE=1
-export NCCL_IB_DISABLE=1
-export NCCL_ASYNC_ERROR_HANDLING=1
+#  Same backbone (causal DIT) + same data as discrete diffusion.
+#  Next-token prediction cross-entropy, left-to-right sampling.
+#
+#  Usage:
+#    bash script/train_ar_sudoku.sh
+#    GPUS=0,1 bash script/train_ar_sudoku.sh
 
 GPUS=${GPUS:-"0,1"}
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
 SRM_CONFIG="./config/sudoku_config.json"
-OUTPUT_DIR="./runs/sudoku_discrete_diff_v2"
+OUTPUT_DIR="./runs/sudoku_ar"
 
 mkdir -p "${OUTPUT_DIR}"
 
 COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
+  --model_type ar \
   --dataset_type sudoku \
   --sudoku_config ${SRM_CONFIG} \
   --grid_only \
@@ -34,7 +36,6 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --mlp_ratio 4 \
   --model_dropout 0.1 \
   --pos_emb_type 2d \
-  --noise_type loglinear \
   --ema_decay 0 \
   --save_every 10000 \
   --eval_every 3000 \
@@ -45,8 +46,9 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --mixed_precision fp16 \
   --log_with tensorboard \
   --grad_accum_steps 1 \
-  --sampler confidence \
-  --tokens_per_step 1 \
+  --ar_temperature 0.8 \
+  --ar_top_k 0 \
+  --ar_top_p 1.0 \
 "
 
 PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")

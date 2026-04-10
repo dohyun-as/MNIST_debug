@@ -1,34 +1,26 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  CLEVR 256×256 — Multi-Resolution DiT + ViT encoder
-#  (pixel space, flow matching V-loss, JiT-style)
+#  CLEVR 256x256 — Baseline 1D-Conditioned DiT (Semanticist-style)
+#  (pixel space, flow matching V-loss, JiT-style DiT backbone)
 # ──────────────────────────────────────────────────────────────────
 #
-#  DiT backbone: BottleneckPatchEmbed, 2D RoPE, in-context tokens,
-#  fixed sin-cos pos embed, middle-50% dropout, adaLN-Zero, RMSNorm,
-#  QK-norm, SwiGLU
+#  Encoder: SemanticistViTEncoder (vit_base_patch16, 256 causal slots)
+#    - Causal attention on slots (earlier = more informative)
+#    - NestedSampler progressive dropping
+#    - slot_dim=16 (same as Semanticist paper)
 #
-#  ViT encoder for multi-resolution conditioning
-#  Encoder levels: 8×8, 4×4, 2×2, 1×1  (min_patch_size=32)
-#  Flow matching with V-prediction loss (JiT-style)
+#  DiT backbone: Same JiT-B/16 architecture as ours
+#    - Conditioning: 1D token concatenation (no spatial masking)
+#    - Self-attention only (no cross-attention)
 #
-#  ── JiT variant configs ──────────────────────────────────────────
-#  JiT-B/16 (default):
-#    --dit_hidden_size 768  --dit_n_heads 12 --dit_n_blocks 12
-#    --dit_bottleneck_dim 128 --dit_in_context_len 32 --dit_in_context_start 4
+#  FSQ: Same [8,8,8,5,5,5] as ours (applied to 16-dim slots)
 #
-#  JiT-L/16:
-#    --dit_hidden_size 1024 --dit_n_heads 16 --dit_n_blocks 24
-#    --dit_bottleneck_dim 128 --dit_in_context_len 32 --dit_in_context_start 8
-#
-#  JiT-H/16:
-#    --dit_hidden_size 1280 --dit_n_heads 16 --dit_n_blocks 32
-#    --dit_bottleneck_dim 256 --dit_in_context_len 32 --dit_in_context_start 10
-#  ──────────────────────────────────────────────────────────────────
+#  Purpose: Baseline comparison — spatially-aligned multi-res (ours)
+#           vs. 1D unstructured (Semanticist-style)
 #
 #  Usage:
-#    bash script/train_clevr_dit.sh
-#    GPUS=0,1 bash script/train_clevr_dit.sh
+#    bash script/train_clevr_dit_baseline.sh
+#    GPUS=0,1 bash script/train_clevr_dit_baseline.sh
 
 set -e
 
@@ -49,19 +41,23 @@ accelerate launch \
     --num_processes $NUM_GPUS \
     --multi_gpu \
     src/main_multires.py \
-    --backbone dit \
-    --output_dir runs/clevr_256_dit_vit_flow_fsq_mask075_CA_bugfix \
+    --backbone baseline_1d \
+    --output_dir runs/clevr_256_dit_baseline_1d_semanticist \
     --train_dir "$CLEVR_DIR" \
     --val_dir "$CLEVR_VAL" \
     --dataset_root "$CLEVR_DIR" \
     --image_size 256 \
     --in_channels 3 \
     --vae_downsample_factor 1 \
-    --min_patch_size 32 \
-    --feat_channels 256 \
-    --depth_per_level 2 \
-    --cnn_base_channels 64 \
-    --encoder_type vit \
+    --num_slots 256 \
+    --slot_dim 16 \
+    --enc_embed_dim 768 \
+    --enc_depth 12 \
+    --enc_num_heads 12 \
+    --enc_drop_path_rate 0.1 \
+    --is_causal \
+    --enable_nest \
+    --enable_nest_after_steps 10000 \
     --dit_patch_size 16 \
     --dit_hidden_size 768 \
     --dit_n_heads 12 \
@@ -87,9 +83,7 @@ accelerate launch \
     --mixed_precision bf16 \
     --ema_decay 0 \
     --uncond_drop_prob 0.1 \
-    --level_drop \
-    --min_keep_levels 1 \
-    --level_drop_after_steps 10000 \
+    --no_level_drop \
     --guidance_scale 3.0 \
     --log_every 100 \
     --save_every 50000 \
@@ -100,9 +94,6 @@ accelerate launch \
     --seed 42 \
     --use_fsq \
     --fsq_levels 8 8 8 5 5 5 \
-    --mae_mask_ratio 0.75 \
     --clevr_eval_every 10000 \
     --clevr_eval_samples 50 \
-    # --vit_depth 12 \
-    # --vit_num_heads 12 \
-    # --feat_channels 768 \
+    --eval_slot_configs 1 4 16 64 256 \

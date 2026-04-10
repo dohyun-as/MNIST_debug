@@ -88,18 +88,22 @@ class LearnedPosEmb(nn.Module):
 
 class DDiTBlock(nn.Module):
     """Adaptive-LN DiT block (without flash-attn).
-    
+
     Optionally supports cross-attention conditioning when
     ``use_cross_attn=True``.  If ``cond_tokens`` is ``None`` during
     forward, the cross-attention is simply skipped.
+
+    When ``causal=True``, self-attention uses a causal mask so each
+    position can only attend to itself and earlier positions.
     """
 
     def __init__(self, dim: int, n_heads: int, cond_dim: int,
                  mlp_ratio: int = 4, dropout: float = 0.1,
-                 use_cross_attn: bool = False):
+                 use_cross_attn: bool = False, causal: bool = False):
         super().__init__()
         self.n_heads = n_heads
         self.use_cross_attn = use_cross_attn
+        self.causal = causal
         head_dim = dim // n_heads
 
         self.norm1 = LayerNorm(dim)
@@ -152,7 +156,8 @@ class DDiTBlock(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v)  # (B, H, L, Dh)
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=self.causal)  # (B, H, L, Dh)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
 
         x = x + gate_msa * self.dropout(self.out_proj(attn_out))
@@ -193,6 +198,222 @@ class DDiTFinalLayer(nn.Module):
         shift, scale = self.adaLN_modulation(c).unsqueeze(1).chunk(2, dim=-1)
         x = modulate(self.norm(x), shift.squeeze(1), scale.squeeze(1))
         return self.linear(x)
+
+
+# ────────────────────────────────────────────────────────────
+#  TokenBridge-style Factorized AR Head for FSQ tokens
+# ────────────────────────────────────────────────────────────
+
+class FactorizedARHead(nn.Module):
+    """Predicts FSQ token by autoregressively predicting each dimension.
+
+    Instead of a single (hidden_size → vocab_size) linear layer,
+    this decomposes prediction into D sequential steps:
+        p(token) = Π_{d=0}^{D-1} p(dim_d | dim_{<d}, hidden_state)
+
+    Each step is a small classifier over L_d levels (e.g., 5 or 8),
+    conditioned on the backbone hidden state + previously predicted dims.
+
+    Args:
+        hidden_size:  backbone output dimension
+        cond_dim:     adaLN conditioning dimension
+        fsq_levels:   list of FSQ levels, e.g. [8, 8, 8, 5, 5, 5]
+        ar_dim:       internal dimension of the AR head
+        n_ar_layers:  number of transformer layers in the AR head
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        cond_dim: int,
+        fsq_levels: list[int],
+        ar_dim: int = 256,
+        n_ar_layers: int = 2,
+    ):
+        super().__init__()
+        self.fsq_levels = list(fsq_levels)
+        self.n_dims = len(fsq_levels)
+        self.ar_dim = ar_dim
+        self.hidden_size = hidden_size
+
+        # Compute flat vocab properties for compatibility
+        import functools, operator
+        self.vocab_size = functools.reduce(operator.mul, fsq_levels, 1)
+
+        # Basis for flat index ↔ per-dim code conversion
+        basis = [1]
+        for l in fsq_levels[:-1]:
+            basis.append(basis[-1] * l)
+        self.register_buffer("_basis", torch.tensor(basis, dtype=torch.long))
+        self.register_buffer("_levels", torch.tensor(fsq_levels, dtype=torch.long))
+
+        # adaLN (same interface as DDiTFinalLayer)
+        self.norm = LayerNorm(hidden_size)
+        self.adaLN_modulation = nn.Linear(cond_dim, 2 * hidden_size)
+        nn.init.zeros_(self.adaLN_modulation.weight)
+        nn.init.zeros_(self.adaLN_modulation.bias)
+
+        # Project backbone hidden → AR dim
+        self.input_proj = nn.Linear(hidden_size, ar_dim)
+
+        # Per-dim embeddings (for already-predicted dims)
+        # Each dim value is embedded and added to the running state
+        max_level = max(fsq_levels)
+        self.dim_value_embs = nn.ModuleList([
+            nn.Embedding(fsq_levels[d], ar_dim)
+            for d in range(self.n_dims)
+        ])
+        # Dim position embedding (which dim are we predicting)
+        self.dim_pos_emb = nn.Embedding(self.n_dims, ar_dim)
+
+        # Small AR transformer (shared across all dims)
+        if n_ar_layers > 0:
+            ar_layer = nn.TransformerEncoderLayer(
+                d_model=ar_dim,
+                nhead=max(1, ar_dim // 64),
+                dim_feedforward=ar_dim * 2,
+                dropout=0.0,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.ar_transformer = nn.TransformerEncoder(
+                ar_layer, num_layers=n_ar_layers)
+        else:
+            # Simple MLP fallback
+            self.ar_transformer = None
+
+        # Per-dim output heads
+        self.output_heads = nn.ModuleList([
+            nn.Linear(ar_dim, fsq_levels[d])
+            for d in range(self.n_dims)
+        ])
+        # Zero-init output heads
+        for head in self.output_heads:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+    def flat_index_to_dims(self, flat_indices: torch.Tensor) -> torch.Tensor:
+        """Convert flat token IDs to per-dim codes.
+        Args:
+            flat_indices: (...) int64 in [0, vocab_size)
+        Returns:
+            dims: (..., n_dims) int64, each in [0, level_d)
+        """
+        indices = flat_indices.unsqueeze(-1)  # (..., 1)
+        return ((indices // self._basis) % self._levels).long()
+
+    def dims_to_flat_index(self, dim_codes: torch.Tensor) -> torch.Tensor:
+        """Convert per-dim codes back to flat token IDs.
+        Args:
+            dim_codes: (..., n_dims) int64
+        Returns:
+            flat_indices: (...) int64
+        """
+        return (dim_codes * self._basis).sum(dim=-1)
+
+    def forward_factorized(
+        self, x: torch.Tensor, c: torch.Tensor,
+        target_dims: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Compute per-dim logits.
+
+        Args:
+            x:  (B, L, hidden_size) backbone output (pre-output-layer)
+            c:  (B, cond_dim) timestep conditioning
+            target_dims: (B, L, n_dims) int64 ground-truth dim codes
+                         (teacher forcing during training)
+        Returns:
+            list of D tensors, each (B, L, level_d) — logits per dim
+        """
+        # adaLN
+        shift, scale = self.adaLN_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        x = modulate(self.norm(x), shift.squeeze(1), scale.squeeze(1))
+
+        B, L, _ = x.shape
+        h = self.input_proj(x)  # (B, L, ar_dim)
+
+        dim_logits = []
+        for d in range(self.n_dims):
+            # Add dim position embedding
+            h_d = h + self.dim_pos_emb.weight[d]  # (B, L, ar_dim)
+
+            # Predict dim d
+            logits_d = self.output_heads[d](h_d)  # (B, L, level_d)
+            dim_logits.append(logits_d)
+
+            # Update h with the (teacher-forced) value of dim d
+            if d < self.n_dims - 1:
+                if target_dims is not None:
+                    # Training: teacher forcing
+                    dim_val = target_dims[:, :, d]  # (B, L)
+                else:
+                    # Inference: use argmax of predicted logits
+                    dim_val = logits_d.argmax(dim=-1)  # (B, L)
+                dim_emb = self.dim_value_embs[d](dim_val)  # (B, L, ar_dim)
+                h = h + dim_emb
+
+        return dim_logits
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Compatible interface: returns flat (B, L, vocab_size+1) logits.
+
+        Runs AR head greedily per-dim, returns sparse logits with the
+        predicted token having high probability.
+        """
+        tokens, log_conf = self.sample_with_confidence(x, c)
+        # Build sparse logits: predicted token = 0, everything else = -100
+        B, L = tokens.shape
+        logits = torch.full((B, L, self.vocab_size + 1), -100.0,
+                           device=x.device, dtype=x.dtype)
+        logits.scatter_(-1, tokens.unsqueeze(-1), 0.0)
+        return logits
+
+    def sample_with_confidence(
+        self, x: torch.Tensor, c: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """AR-greedy sample + proper confidence for each position.
+
+        Runs the AR head autoregressively:
+          dim0 ~ p(d0|h), dim1 ~ p(d1|d0,h), ..., dimD ~ p(dD|d<D,h)
+
+        Returns:
+            tokens: (B, L) flat token IDs
+            log_confidence: (B, L) log p(token) = Σ_d log p(d_d | d_{<d}, h)
+        """
+        # adaLN
+        shift, scale = self.adaLN_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        x_norm = modulate(self.norm(x), shift.squeeze(1), scale.squeeze(1))
+
+        B, L, _ = x_norm.shape
+        h = self.input_proj(x_norm)  # (B, L, ar_dim)
+
+        dim_codes = []
+        log_conf = torch.zeros(B, L, device=x.device, dtype=x.dtype)
+
+        for d in range(self.n_dims):
+            h_d = h + self.dim_pos_emb.weight[d]
+            logits_d = self.output_heads[d](h_d)       # (B, L, level_d)
+            log_probs_d = F.log_softmax(logits_d, dim=-1)
+
+            # Sample (or argmax)
+            pred_d = logits_d.argmax(dim=-1)            # (B, L)
+            dim_codes.append(pred_d)
+
+            # Accumulate confidence
+            lp = torch.gather(log_probs_d, dim=-1,
+                             index=pred_d.unsqueeze(-1)).squeeze(-1)
+            log_conf = log_conf + lp
+
+            # Feed back for next dim
+            if d < self.n_dims - 1:
+                dim_emb = self.dim_value_embs[d](pred_d)
+                h = h + dim_emb
+
+        dim_codes = torch.stack(dim_codes, dim=-1)  # (B, L, D)
+        tokens = self.dims_to_flat_index(dim_codes)  # (B, L)
+
+        return tokens, log_conf
 
 
 # ────────────────────────────────────────────────────────────
@@ -242,12 +463,19 @@ class DIT(nn.Module):
         pos_emb_type: str = "2d",
         num_classes: int = 0,
         level_sizes: list | None = None,
+        causal: bool = False,
+        # ── TokenBridge-style factorized AR head ──
+        factorized_head: bool = False,
+        fsq_levels: list[int] | None = None,
+        ar_head_dim: int = 256,
+        ar_head_layers: int = 2,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.use_cross_attn = use_cross_attn
         self.num_classes = num_classes
+        self.causal = causal
 
         # backward compat: old use_sudoku_pos_emb=True → pos_emb_type="sudoku"
         if use_sudoku_pos_emb:
@@ -329,11 +557,23 @@ class DIT(nn.Module):
 
         self.blocks = nn.ModuleList([
             DDiTBlock(hidden_size, n_heads, cond_dim, mlp_ratio, dropout,
-                      use_cross_attn=use_cross_attn)
+                      use_cross_attn=use_cross_attn, causal=causal)
             for _ in range(n_blocks)
         ])
 
-        self.output_layer = DDiTFinalLayer(hidden_size, vocab_size, cond_dim)
+        self.factorized_head = factorized_head
+        if factorized_head:
+            assert fsq_levels is not None, \
+                "fsq_levels required when factorized_head=True"
+            self.output_layer = FactorizedARHead(
+                hidden_size=hidden_size,
+                cond_dim=cond_dim,
+                fsq_levels=fsq_levels,
+                ar_dim=ar_head_dim,
+                n_ar_layers=ar_head_layers,
+            )
+        else:
+            self.output_layer = DDiTFinalLayer(hidden_size, vocab_size, cond_dim)
 
     def embed_cond(self, cond_indices: torch.Tensor) -> torch.Tensor:
         """Embed conditioning token indices → hidden states for cross-attn.
@@ -352,13 +592,18 @@ class DIT(nn.Module):
 
     def forward(self, indices: torch.Tensor, sigma: torch.Tensor,
                 cond_tokens: Optional[torch.Tensor] = None,
-                class_labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+                class_labels: Optional[torch.Tensor] = None,
+                prefix_mode: bool = False) -> torch.Tensor:
         """Args:
             indices:      (B, L) int64 token indices
             sigma:        (B,) float  noise level
-            cond_tokens:  (B, L_cond, D) optional cross-attn conditioning.
+            cond_tokens:  (B, L_cond, D) float — external condition embeddings.
                           Can also be (B, L_cond) int64 if cond_emb exists.
             class_labels: (B,) int64 optional class labels for adaLN cond.
+            prefix_mode:  if True, prepend cond_tokens as prefix to the
+                          data sequence (no cross-attention).  The output
+                          is sliced to return only data positions:
+                          (B, L, vocab_size).
         Returns:
             logits: (B, L, vocab_size)
         """
@@ -388,8 +633,20 @@ class DIT(nn.Module):
         if class_labels is not None and self.label_emb is not None:
             c = c + F.silu(self.label_emb(class_labels))
 
+        # Prefix mode: prepend cond_tokens, skip cross-attention
+        n_prefix = 0
+        if prefix_mode and cond_tokens is not None:
+            n_prefix = cond_tokens.shape[1]
+            x = torch.cat([cond_tokens, x], dim=1)  # (B, C+L, D)
+            cond_tokens = None  # don't also use cross-attention
+
         for blk in self.blocks:
             x = blk(x, c, cond_tokens=cond_tokens)
 
+        # Strip prefix BEFORE output layer (so output layer sees only data)
+        if n_prefix > 0:
+            x = x[:, n_prefix:, :]
+
         x = self.output_layer(x, c)  # (B, L, vocab_size)
+
         return x

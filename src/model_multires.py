@@ -143,6 +143,14 @@ class MultiResConditionalUNet(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_use_cnn_stem: bool = True,
         vit_cnn_stem_reduction: int = 4,
+        encoder_internal_dim: int | None = None,
+        # --- Swin encoder ---
+        swin_patch_size: int = 16,
+        swin_embed_dim: int = 96,
+        swin_depths: list[int] | None = None,
+        swin_num_heads: list[int] | None = None,
+        swin_window_size: int = 4,
+        swin_mlp_ratio: float = 4.0,
         # --- Discretization ---
         use_fsq: bool = False,
         fsq_levels: list[int] | None = None,
@@ -199,6 +207,13 @@ class MultiResConditionalUNet(nn.Module):
             vit_mlp_ratio=vit_mlp_ratio,
             vit_use_cnn_stem=vit_use_cnn_stem,
             vit_cnn_stem_reduction=vit_cnn_stem_reduction,
+            encoder_internal_dim=encoder_internal_dim,
+            swin_patch_size=swin_patch_size,
+            swin_embed_dim=swin_embed_dim,
+            swin_depths=swin_depths,
+            swin_num_heads=swin_num_heads,
+            swin_window_size=swin_window_size,
+            swin_mlp_ratio=swin_mlp_ratio,
             level_sizes=level_sizes,
         )
 
@@ -972,6 +987,14 @@ class MultiResConditionalDiT(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_use_cnn_stem: bool = True,
         vit_cnn_stem_reduction: int = 4,
+        encoder_internal_dim: int | None = None,
+        # --- Swin encoder ---
+        swin_patch_size: int = 16,
+        swin_embed_dim: int = 96,
+        swin_depths: list[int] | None = None,
+        swin_num_heads: list[int] | None = None,
+        swin_window_size: int = 4,
+        swin_mlp_ratio: float = 4.0,
         # --- Discretization ---
         use_fsq: bool = False,
         fsq_levels: list[int] | None = None,
@@ -1036,6 +1059,13 @@ class MultiResConditionalDiT(nn.Module):
             vit_mlp_ratio=vit_mlp_ratio,
             vit_use_cnn_stem=vit_use_cnn_stem,
             vit_cnn_stem_reduction=vit_cnn_stem_reduction,
+            encoder_internal_dim=encoder_internal_dim,
+            swin_patch_size=swin_patch_size,
+            swin_embed_dim=swin_embed_dim,
+            swin_depths=swin_depths,
+            swin_num_heads=swin_num_heads,
+            swin_window_size=swin_window_size,
+            swin_mlp_ratio=swin_mlp_ratio,
             level_sizes=level_sizes,
         )
 

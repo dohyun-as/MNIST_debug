@@ -469,6 +469,9 @@ class DIT(nn.Module):
         fsq_levels: list[int] | None = None,
         ar_head_dim: int = 256,
         ar_head_layers: int = 2,
+        # ── Continuous input mode (for diffusion head) ──
+        continuous_mode: bool = False,
+        continuous_dim: int = 0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -476,6 +479,7 @@ class DIT(nn.Module):
         self.use_cross_attn = use_cross_attn
         self.num_classes = num_classes
         self.causal = causal
+        self.continuous_mode = continuous_mode
 
         # backward compat: old use_sudoku_pos_emb=True → pos_emb_type="sudoku"
         if use_sudoku_pos_emb:
@@ -486,7 +490,39 @@ class DIT(nn.Module):
             f"got '{pos_emb_type}'")
         self.pos_emb_type = pos_emb_type
 
-        self.token_emb = nn.Embedding(vocab_size, hidden_size)
+        self.factorized_head = factorized_head
+
+        # ── Continuous mode: linear projection + mask embedding ──
+        if continuous_mode:
+            assert continuous_dim > 0, "continuous_dim required for continuous_mode"
+            self.cont_input_proj = nn.Linear(continuous_dim, hidden_size)
+            self.cont_mask_emb = nn.Parameter(torch.randn(hidden_size) * 0.02)
+            self.dim_embs = None
+            self.mask_emb = None
+            self.token_emb = None
+        elif factorized_head and fsq_levels is not None:
+            # Factorized embedding: per-dim embeddings summed together
+            # Token ID → FSQ dim codes → sum of per-dim embeddings
+            # Much fewer params (39 vs 64K) and structurally meaningful
+            import functools, operator
+            _levels = fsq_levels
+            _basis = [1]
+            for l in _levels[:-1]:
+                _basis.append(_basis[-1] * l)
+            self.register_buffer("_emb_basis",
+                                 torch.tensor(_basis, dtype=torch.long))
+            self.register_buffer("_emb_levels",
+                                 torch.tensor(_levels, dtype=torch.long))
+            self.dim_embs = nn.ModuleList([
+                nn.Embedding(l, hidden_size) for l in _levels
+            ])
+            # Mask token gets its own embedding (last index = vocab_size - 1)
+            self.mask_emb = nn.Parameter(torch.randn(hidden_size) * 0.02)
+            self.token_emb = None  # not used
+        else:
+            self.dim_embs = None
+            self.mask_emb = None
+            self.token_emb = nn.Embedding(vocab_size, hidden_size)
         self.pos_emb = LearnedPosEmb(seq_len, hidden_size)
 
         if pos_emb_type in ("2d", "sudoku"):
@@ -561,8 +597,10 @@ class DIT(nn.Module):
             for _ in range(n_blocks)
         ])
 
-        self.factorized_head = factorized_head
-        if factorized_head:
+        if continuous_mode:
+            # No output_layer — returns hidden states for diffusion head
+            self.output_layer = None
+        elif factorized_head:
             assert fsq_levels is not None, \
                 "fsq_levels required when factorized_head=True"
             self.output_layer = FactorizedARHead(
@@ -574,6 +612,37 @@ class DIT(nn.Module):
             )
         else:
             self.output_layer = DDiTFinalLayer(hidden_size, vocab_size, cond_dim)
+
+    def _factorized_embed(self, indices: torch.Tensor) -> torch.Tensor:
+        """Factorized token embedding: decompose flat ID into per-dim codes,
+        embed each dim separately, and sum.
+
+        Mask token (last index) gets a special learned embedding.
+
+        Args:
+            indices: (B, L) int64 token IDs, may include mask_index
+        Returns:
+            (B, L, hidden_size)
+        """
+        is_mask = (indices == self.vocab_size - 1)
+
+        # Decompose flat index → per-dim codes
+        # Clamp to valid range first (mask tokens would be out of range)
+        safe_indices = indices.clamp(0, self.vocab_size - 2)
+        idx = safe_indices.unsqueeze(-1)  # (B, L, 1)
+        dim_codes = ((idx // self._emb_basis) % self._emb_levels).long()  # (B, L, D)
+
+        # Sum per-dim embeddings
+        x = torch.zeros(*indices.shape, self.dim_embs[0].embedding_dim,
+                        device=indices.device, dtype=self.dim_embs[0].weight.dtype)
+        for d, emb in enumerate(self.dim_embs):
+            x = x + emb(dim_codes[:, :, d])
+
+        # Replace mask positions with mask embedding
+        if is_mask.any():
+            x[is_mask] = self.mask_emb
+
+        return x
 
     def embed_cond(self, cond_indices: torch.Tensor) -> torch.Tensor:
         """Embed conditioning token indices → hidden states for cross-attn.
@@ -593,27 +662,47 @@ class DIT(nn.Module):
     def forward(self, indices: torch.Tensor, sigma: torch.Tensor,
                 cond_tokens: Optional[torch.Tensor] = None,
                 class_labels: Optional[torch.Tensor] = None,
-                prefix_mode: bool = False) -> torch.Tensor:
+                prefix_mode: bool = False,
+                # ── continuous mode inputs ──
+                cont_tokens: Optional[torch.Tensor] = None,
+                mask: Optional[torch.Tensor] = None,
+                ) -> torch.Tensor:
         """Args:
-            indices:      (B, L) int64 token indices
+            indices:      (B, L) int64 token indices  [discrete mode]
             sigma:        (B,) float  noise level
             cond_tokens:  (B, L_cond, D) float — external condition embeddings.
                           Can also be (B, L_cond) int64 if cond_emb exists.
             class_labels: (B,) int64 optional class labels for adaLN cond.
             prefix_mode:  if True, prepend cond_tokens as prefix to the
                           data sequence (no cross-attention).  The output
-                          is sliced to return only data positions:
-                          (B, L, vocab_size).
+                          is sliced to return only data positions.
+            cont_tokens:  (B, L, D_feat) float continuous tokens  [continuous mode]
+            mask:         (B, L) bool — True = masked positions  [continuous mode]
         Returns:
-            logits: (B, L, vocab_size)
+            logits: (B, L, vocab_size)  [discrete mode]
+            hidden: (B, L, hidden_size) [continuous mode]
         """
         # auto-embed integer conditioning
         if cond_tokens is not None and cond_tokens.dtype in (torch.long, torch.int):
             cond_tokens = self.embed_cond(cond_tokens)
 
-        # ensure indices are int (accelerate fp16 autocast can cast them to float)
-        indices = indices.long()
-        x = self.token_emb(indices)  # (B, L, D)
+        if self.continuous_mode:
+            # ── Continuous input: project tokens, apply mask embedding ──
+            assert cont_tokens is not None, \
+                "cont_tokens required in continuous_mode"
+            x = self.cont_input_proj(cont_tokens)  # (B, L, hidden)
+            if mask is not None:
+                # Replace masked positions with learned mask embedding
+                mask_expanded = mask.unsqueeze(-1)  # (B, L, 1)
+                x = torch.where(mask_expanded, self.cont_mask_emb.unsqueeze(0).unsqueeze(0), x)
+        else:
+            # ── Discrete input: embed token indices ──
+            indices = indices.long()
+            if self.dim_embs is not None:
+                x = self._factorized_embed(indices)  # (B, L, D)
+            else:
+                x = self.token_emb(indices)  # (B, L, D)
+
         x = self.pos_emb(x)
         if self.pos_emb_type in ("2d", "sudoku"):
             pos = (self.row_emb(self.row_idx) +
@@ -646,6 +735,10 @@ class DIT(nn.Module):
         # Strip prefix BEFORE output layer (so output layer sees only data)
         if n_prefix > 0:
             x = x[:, n_prefix:, :]
+
+        if self.continuous_mode:
+            # Return hidden states — diffusion head will process them
+            return x  # (B, L, hidden_size)
 
         x = self.output_layer(x, c)  # (B, L, vocab_size)
 

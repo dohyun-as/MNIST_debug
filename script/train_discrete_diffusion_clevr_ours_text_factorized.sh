@@ -46,7 +46,7 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --uncond_drop_prob 0.0 \
   --ema_decay 0.9999 \
   --save_every 50000 \
-  --eval_every 10000 \
+  --eval_every 100 \
   --log_every 100 \
   --eval_num_samples 30 \
   --eval_num_steps 128 \
@@ -58,7 +58,6 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --sampler ddpm_cache \
   --factorized_head \
   --ar_head_dim 256 \
-  --ar_head_layers 2 \
   --ar_head_layers 2 \
   ${RESUME_DIR:+--resume_dir $RESUME_DIR} \
 "

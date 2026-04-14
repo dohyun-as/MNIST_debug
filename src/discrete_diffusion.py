@@ -95,16 +95,27 @@ class DiscreteDiffusion(nn.Module):
         importance_sampling: bool = False,
         change_of_variables: bool = False,
         sampling_eps: float = 1e-3,
+        # ── Continuous mode with diffusion head (MAR-style) ──
+        diff_head: Optional[nn.Module] = None,
+        diffusion_batch_mul: int = 1,
+        # ── MDLM-style time-conditioning toggle ──
+        time_conditioning: bool = False,
     ):
         super().__init__()
         assert not (change_of_variables and importance_sampling), \
             "Cannot use both change_of_variables and importance_sampling"
+        self.time_conditioning = time_conditioning
 
         self.backbone = backbone
         self.data_vocab_size = vocab_size
         # mask token = last index (appended category)
         self.mask_index = vocab_size
         self.vocab_size = vocab_size + 1   # includes mask
+
+        # ── Continuous mode with diffusion head ──
+        self.continuous_mode = getattr(backbone, 'continuous_mode', False)
+        self.diff_head = diff_head
+        self.diffusion_batch_mul = diffusion_batch_mul
 
         # Detect factorized head from backbone
         from dit_model import FactorizedARHead
@@ -118,6 +129,20 @@ class DiscreteDiffusion(nn.Module):
         self.importance_sampling = importance_sampling
         self.change_of_variables = change_of_variables
         self.sampling_eps = sampling_eps
+
+    # ─────────────── time-conditioning helper ──────────────
+
+    def _t(self, sigma: Tensor) -> Tensor:
+        """Return sigma or zeros based on time_conditioning flag.
+
+        MDLM paper: for absorbing-state diffusion, network can infer
+        noise level from input (presence of [MASK]) so explicit time
+        conditioning is not needed. When ``time_conditioning=False``
+        we pass zero to sigma_map everywhere.
+        """
+        if self.time_conditioning:
+            return sigma
+        return torch.zeros_like(sigma)
 
     # ─────────────── forward-process noising ───────────────
 
@@ -169,11 +194,15 @@ class DiscreteDiffusion(nn.Module):
         x_long = x.long()
         if sigma.ndim > 1:
             sigma = sigma.squeeze(-1)
+        sigma = self._t(sigma)
 
         if cond_tokens is not None and cond_tokens.dtype in (torch.long, torch.int):
             cond_tokens = backbone.embed_cond(cond_tokens)
 
-        h = backbone.token_emb(x_long)
+        if backbone.dim_embs is not None:
+            h = backbone._factorized_embed(x_long)
+        else:
+            h = backbone.token_emb(x_long)
         h = backbone.pos_emb(h)
         if backbone.pos_emb_type in ("2d", "sudoku"):
             pos = (backbone.row_emb(backbone.row_idx) +
@@ -226,6 +255,7 @@ class DiscreteDiffusion(nn.Module):
         x = x.long()
         if sigma.ndim > 1:
             sigma = sigma.squeeze(-1)
+        sigma = self._t(sigma)
         # Use prefix_mode when cond_tokens are provided
         use_prefix = (cond_tokens is not None)
         logits = self.backbone(x, sigma, cond_tokens=cond_tokens,
@@ -281,12 +311,16 @@ class DiscreteDiffusion(nn.Module):
             sigma_in = unet_conditioning
 
         use_prefix = (cond_tokens is not None)
+        sigma_in = self._t(sigma_in)
         # We need the hidden states before the output layer
         # Run backbone manually: embed → blocks → (skip output_layer)
         backbone = self.backbone
         if cond_tokens is not None and cond_tokens.dtype in (torch.long, torch.int):
             cond_tokens = backbone.embed_cond(cond_tokens)
-        x = backbone.token_emb(xt_long)
+        if backbone.dim_embs is not None:
+            x = backbone._factorized_embed(xt_long)
+        else:
+            x = backbone.token_emb(xt_long)
         x = backbone.pos_emb(x)
         if backbone.pos_emb_type in ("2d", "sudoku"):
             pos = (backbone.row_emb(backbone.row_idx) +
@@ -421,6 +455,359 @@ class DiscreteDiffusion(nn.Module):
 
         return LossOutput(loss=token_nll, nlls=nlls, token_mask=attention_mask)
 
+    # ─────────────── continuous mode (diffusion head) ──────
+
+    def q_xt_continuous(self, x: Tensor, move_chance: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply absorbing noise to continuous tokens by masking positions.
+
+        Args:
+            x:           (B, L, D) float continuous tokens
+            move_chance: (B, 1) float in [0, 1]
+        Returns:
+            mask: (B, L) bool — True = masked (absorbed)
+        """
+        mask = torch.rand(x.shape[0], x.shape[1], device=x.device) < move_chance
+        return mask
+
+    def compute_loss_continuous(
+        self, x0: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
+    ) -> LossOutput:
+        """Loss for continuous mode with diffusion head.
+
+        Args:
+            x0:             (B, L, D) float clean continuous tokens
+            attention_mask: (B, L) float mask (1 = valid, 0 = padding)
+            cond_tokens:    optional prefix conditioning
+            class_labels:   optional class labels
+        Returns:
+            LossOutput with scalar loss.
+        """
+        assert self.diff_head is not None, \
+            "diff_head required for continuous mode"
+        B, L, D = x0.shape
+        device = x0.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(B, L, device=device, dtype=torch.float32)
+
+        # Sample time t and compute mask probability
+        t = self._sample_t(B, device)
+        sigma, dsigma = self.noise(t)
+        move_chance = 1 - torch.exp(-sigma[:, None])  # (B, 1)
+
+        # Mask some positions
+        mask = self.q_xt_continuous(x0, move_chance)  # (B, L) bool
+
+        # Run backbone → hidden states (B, L, hidden_size)
+        if sigma.ndim > 1:
+            sigma_in = sigma.squeeze(-1)
+        else:
+            sigma_in = sigma
+        sigma_in = self._t(sigma_in)
+
+        use_prefix = (cond_tokens is not None)
+        hidden = self.backbone(
+            indices=None, sigma=sigma_in,
+            cond_tokens=cond_tokens, class_labels=class_labels,
+            prefix_mode=use_prefix,
+            cont_tokens=x0, mask=mask,
+        )  # (B, L, hidden_size)
+
+        # Extract masked positions for diffusion head
+        # mask: (B, L) bool, hidden: (B, L, H), x0: (B, L, D)
+        masked_hidden = hidden[mask]  # (N_masked, H)
+        masked_target = x0[mask]      # (N_masked, D)
+
+        if masked_hidden.shape[0] == 0:
+            # Edge case: no masked tokens — return zero loss
+            return LossOutput(
+                loss=torch.tensor(0.0, device=device, requires_grad=True),
+                nlls=torch.zeros(B, L, device=device),
+                token_mask=attention_mask,
+            )
+
+        # Optionally multiply the diffusion head batch (for variance reduction)
+        if self.diffusion_batch_mul > 1:
+            masked_hidden = masked_hidden.repeat(self.diffusion_batch_mul, 1)
+            masked_target = masked_target.repeat(self.diffusion_batch_mul, 1)
+
+        # Diffusion head loss on masked positions
+        loss = self.diff_head(target=masked_target, z=masked_hidden)
+
+        return LossOutput(
+            loss=loss,
+            nlls=torch.zeros(B, L, device=device),
+            token_mask=attention_mask,
+        )
+
+    def _cheap_confidence(self, hidden: Tensor) -> Tensor:
+        """Estimate confidence with a single forward pass at t=1 (pure noise).
+
+        Evaluates the diffusion head once on Gaussian noise at t=1 and uses
+        the predicted log_variance as a confidence signal.  Lower variance
+        means the model is more confident about this position.
+
+        Args:
+            hidden: (N, H) backbone hidden states for masked positions
+        Returns:
+            confidence: (N,) higher = more confident
+        """
+        D = self.diff_head.in_channels
+        device = hidden.device
+        N = hidden.shape[0]
+
+        x = torch.randn(N, D, device=device)
+        t = torch.ones(N, device=device)  # t=1, pure noise
+
+        out = self.diff_head.net(x, t, hidden)  # (N, 2*D)
+        log_var = out[:, D:]
+
+        # Lower sigma → higher confidence
+        return -torch.exp(0.5 * log_var).mean(dim=-1)
+
+    @torch.no_grad()
+    def sample_continuous(
+        self,
+        batch_size: int,
+        seq_len: int,
+        feat_dim: int,
+        num_steps: int = 128,
+        device: torch.device = torch.device("cpu"),
+        sampler: str = "confidence",
+        cond_tokens: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
+        temperature: float = 1.0,
+        cfg: float = 1.0,
+        return_history: bool = False,
+        tokens_per_step: int = 0,
+        known_mask: Optional[Tensor] = None,
+        known_tokens: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Generate continuous tokens via MaskGIT-style iterative unmasking.
+
+        Inpainting-style conditioning (when known_mask/known_tokens given):
+          - known positions are initialized to clean token values and marked
+            unmasked from step 0.
+          - MDLM carry-over parameterization keeps them fixed throughout.
+          - Sampler only touches masked (unknown) positions.
+
+        Each step:
+        1. Backbone forward (1×) → hidden states for all positions
+        2. Cheap confidence (1 MLP forward, no ODE) → rank masked positions
+        3. Select top-k positions to unmask (cosine schedule)
+        4. Full ODE only for selected positions → get actual token values
+        5. Place tokens, repeat
+
+        Cost per step: 1 backbone fwd + N_masked cheap MLP + k ODE (k << N_masked)
+        Total ODE calls across all steps = seq_len (each token denoised exactly once)
+
+        Args:
+            batch_size, seq_len, feat_dim: output shape
+            num_steps:  number of unmasking steps
+            temperature: diffusion head sampling temperature
+            cfg: classifier-free guidance scale
+        Returns:
+            x: (batch_size, seq_len, feat_dim) sampled continuous tokens
+        """
+        import math as _math
+        assert self.diff_head is not None, \
+            "diff_head required for continuous sampling"
+
+        x = torch.zeros(batch_size, seq_len, feat_dim, device=device)
+        is_masked = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+
+        # Inpainting init: fix known positions with clean tokens
+        if known_mask is not None:
+            assert known_tokens is not None, \
+                "known_tokens required when known_mask is given"
+            # (B, L) bool, (B, L, D) float
+            x = torch.where(known_mask.unsqueeze(-1), known_tokens, x)
+            is_masked = is_masked & (~known_mask)
+
+        history = None
+        mask_history = None
+        if return_history:
+            history = [x.clone().cpu()]
+            mask_history = [is_masked.clone().cpu()]
+
+        # DDPM-style: random unmask based on noise schedule probability
+        if sampler in ("ddpm", "ddpm_cache"):
+            dt = 1.0 / num_steps
+            for step in range(num_steps):
+                if not is_masked.any():
+                    break
+                t_cur = torch.full((batch_size,), 1.0 - step * dt, device=device)
+                t_nxt = (t_cur - dt).clamp(min=1e-5)
+                sigma_t = self.noise(t_cur)[0]
+                sigma_s = self.noise(t_nxt)[0]
+                if sigma_t.ndim > 1:
+                    sigma_t = sigma_t.squeeze(-1)
+                if sigma_s.ndim > 1:
+                    sigma_s = sigma_s.squeeze(-1)
+                move_t = (1 - torch.exp(-sigma_t)).clamp(min=1e-8)
+                move_s = (1 - torch.exp(-sigma_s))
+                unmask_prob = (1 - move_s / move_t).clamp(0, 1)  # (B,)
+
+                use_prefix = (cond_tokens is not None)
+                hidden = self.backbone(
+                    indices=None, sigma=self._t(sigma_t),
+                    cond_tokens=cond_tokens, class_labels=class_labels,
+                    prefix_mode=use_prefix,
+                    cont_tokens=x, mask=is_masked,
+                )  # (B, L, H)
+
+                rand = torch.rand(batch_size, seq_len, device=device)
+                do_unmask = (rand < unmask_prob[:, None]) & is_masked
+                if do_unmask.any():
+                    sel_hidden = hidden[do_unmask]
+                    sel_tokens = self.diff_head.sample(
+                        sel_hidden, temperature=temperature, cfg=cfg)
+                    x[do_unmask] = sel_tokens
+                    is_masked[do_unmask] = False
+
+                if return_history:
+                    history.append(x.clone().cpu())
+                    mask_history.append(is_masked.clone().cpu())
+
+            # Final pass: unmask leftovers
+            if is_masked.any():
+                n_masked_b = is_masked.float().sum(dim=1)
+                masked_ratio = (n_masked_b / seq_len).clamp(1e-5, 1)
+                sigma_t = self.noise(masked_ratio.view(-1, 1))[0]
+                if sigma_t.ndim > 1:
+                    sigma_t = sigma_t.squeeze(-1)
+                use_prefix = (cond_tokens is not None)
+                hidden = self.backbone(
+                    indices=None, sigma=self._t(sigma_t),
+                    cond_tokens=cond_tokens, class_labels=class_labels,
+                    prefix_mode=use_prefix,
+                    cont_tokens=x, mask=is_masked,
+                )
+                masked_hidden = hidden[is_masked]
+                sampled_tokens = self.diff_head.sample(
+                    masked_hidden, temperature=temperature, cfg=cfg)
+                x[is_masked] = sampled_tokens
+                is_masked.fill_(False)
+                if return_history:
+                    history.append(x.clone().cpu())
+                    mask_history.append(is_masked.clone().cpu())
+
+            if return_history:
+                return x, mask_history
+            return x
+
+        for step in range(num_steps):
+            n_masked = is_masked.float().sum(dim=1)  # (B,)
+            if n_masked.max().item() == 0:
+                break
+
+            # Compute t from current masked ratio
+            masked_ratio = (n_masked / seq_len).clamp(1e-5, 1)
+            sigma_t = self.noise(masked_ratio.view(-1, 1))[0]
+            if sigma_t.ndim > 1:
+                sigma_t = sigma_t.squeeze(-1)
+
+            # 1) Backbone forward — 1 pass
+            use_prefix = (cond_tokens is not None)
+            hidden = self.backbone(
+                indices=None, sigma=self._t(sigma_t),
+                cond_tokens=cond_tokens, class_labels=class_labels,
+                prefix_mode=use_prefix,
+                cont_tokens=x, mask=is_masked,
+            )  # (B, L, H)
+
+            masked_indices = is_masked.nonzero(as_tuple=False)  # (N_masked, 2)
+            if masked_indices.shape[0] == 0:
+                break
+
+            masked_hidden = hidden[is_masked]  # (N_masked, H)
+
+            # 2) Cheap confidence — 1 MLP forward, no ODE loop
+            confidence = self._cheap_confidence(masked_hidden)  # (N_masked,)
+
+            # 3) Schedule: how many to unmask this step (cumulative target)
+            if tokens_per_step > 0:
+                # Linear: unmask exactly tokens_per_step per iteration
+                target_unmasked = min(seq_len, (step + 1) * tokens_per_step)
+            else:
+                # Cosine
+                ratio = (step + 1) / num_steps
+                unmask_frac = _math.cos(_math.pi / 2 * (1 - ratio))
+                target_unmasked = int(unmask_frac * seq_len)
+
+            # 4) Select top-k per batch, gather, single ODE call
+            all_selected_hidden = []
+            all_batch_ids = []
+            all_positions = []
+
+            for b in range(batch_size):
+                b_mask = is_masked[b]
+                n_cur = int(b_mask.sum().item())
+                if n_cur == 0:
+                    continue
+                n_already_unmasked = seq_len - n_cur
+                n_to_unmask = max(1, target_unmasked - n_already_unmasked)
+                n_to_unmask = min(n_to_unmask, n_cur)
+
+                b_masked_pos = b_mask.nonzero(as_tuple=False).squeeze(-1)
+                b_selector = (masked_indices[:, 0] == b)
+                b_conf = confidence[b_selector]
+                b_hidden = masked_hidden[b_selector]  # (n_cur, H)
+
+                _, topk = b_conf.topk(n_to_unmask)
+                all_selected_hidden.append(b_hidden[topk])
+                all_batch_ids.extend([b] * n_to_unmask)
+                all_positions.append(b_masked_pos[topk])
+
+            if all_selected_hidden:
+                cat_hidden = torch.cat(all_selected_hidden, dim=0)  # (K_total, H)
+                cat_tokens = self.diff_head.sample(
+                    cat_hidden, temperature=temperature, cfg=cfg
+                )  # (K_total, D)
+
+                # Scatter back (vectorized)
+                bid = torch.tensor(all_batch_ids, device=device, dtype=torch.long)
+                pos = torch.cat(all_positions, dim=0)  # (K_total,)
+                x[bid, pos] = cat_tokens
+                is_masked[bid, pos] = False
+
+            if return_history:
+                history.append(x.clone().cpu())
+                mask_history.append(is_masked.clone().cpu())
+
+        # Final pass: unmask any remaining
+        if is_masked.any():
+            n_masked = is_masked.float().sum(dim=1)
+            masked_ratio = (n_masked / seq_len).clamp(1e-5, 1)
+            sigma_t = self.noise(masked_ratio.view(-1, 1))[0]
+            if sigma_t.ndim > 1:
+                sigma_t = sigma_t.squeeze(-1)
+
+            use_prefix = (cond_tokens is not None)
+            hidden = self.backbone(
+                indices=None, sigma=self._t(sigma_t),
+                cond_tokens=cond_tokens, class_labels=class_labels,
+                prefix_mode=use_prefix,
+                cont_tokens=x, mask=is_masked,
+            )
+            masked_hidden = hidden[is_masked]
+            sampled_tokens = self.diff_head.sample(
+                masked_hidden, temperature=temperature, cfg=cfg)
+
+            x[is_masked] = sampled_tokens
+            is_masked.fill_(False)
+
+            if return_history:
+                history.append(x.clone().cpu())
+                mask_history.append(is_masked.clone().cpu())
+
+        if return_history:
+            return x, mask_history
+        return x
+
     # ─────────────── sampling (reverse process) ────────────
 
     @torch.no_grad()
@@ -440,6 +827,28 @@ class DiscreteDiffusion(nn.Module):
 
         move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
         move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
+
+        if self.factorized_head:
+            # Factorized head: AR head gives a one-hot (delta) distribution,
+            # so we sample x0 directly and apply the ddpm transition
+            # analytically without allocating a (B, L, vocab_size) tensor.
+            #
+            # For one-hot p_x0 at token k, the ddpm transition simplifies to:
+            #   P(unmask to k) = (move_t - move_s) / move_t = 1 - move_s/move_t
+            #   P(stay masked) = move_s / move_t
+            h, c_vec = self._run_backbone_hidden(
+                x, sigma_t, cond_tokens=cond_tokens,
+                class_labels=class_labels)
+            sampled_x0, _ = self._ar_head.sample_with_confidence(h, c_vec)
+
+            # For masked positions: unmask with prob 1 - move_s/move_t
+            ratio = move_chance_s / move_chance_t.clamp(min=1e-8)  # (B, 1, 1)
+            unmask_prob = (1 - ratio).squeeze(-1)  # (B, 1)
+            do_unmask = torch.rand_like(x.float()) < unmask_prob
+            is_masked = (x == self.mask_index)
+            x_new = torch.where(is_masked & do_unmask, sampled_x0, x)
+            # No caching for factorized (each step re-runs AR head)
+            return None, x_new
 
         if p_x0 is None:
             p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens,
@@ -467,6 +876,18 @@ class DiscreteDiffusion(nn.Module):
         move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
         move_chance_s = (1 - torch.exp(-sigma_s))[:, None, None]
 
+        if self.factorized_head:
+            # Same analytic transition as _ddpm_caching_update
+            h, c_vec = self._run_backbone_hidden(
+                x, sigma_t, cond_tokens=cond_tokens,
+                class_labels=class_labels)
+            sampled_x0, _ = self._ar_head.sample_with_confidence(h, c_vec)
+            ratio = move_chance_s / move_chance_t.clamp(min=1e-8)
+            unmask_prob = (1 - ratio).squeeze(-1)
+            do_unmask = torch.rand_like(x.float()) < unmask_prob
+            is_masked = (x == self.mask_index)
+            return torch.where(is_masked & do_unmask, sampled_x0, x)
+
         log_p_x0 = self.forward(x, sigma_t, cond_tokens=cond_tokens,
                                 class_labels=class_labels)
         q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)
@@ -489,9 +910,15 @@ class DiscreteDiffusion(nn.Module):
         class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         tokens_per_step: int = 0,
+        known_mask: Optional[Tensor] = None,
+        known_tokens: Optional[Tensor] = None,
         **kwargs,  # absorb unused args (e.g. guidance_scale from old configs)
     ) -> Tensor:
         """Generate samples via iterative denoising.
+
+        Inpainting conditioning: pass known_mask (B,L bool) and known_tokens
+        (B,L int64). Known positions are initialized unmasked; MDLM carry-over
+        keeps them fixed. Only masked positions are denoised.
 
         Args:
             batch_size:  number of samples
@@ -512,11 +939,15 @@ class DiscreteDiffusion(nn.Module):
                 batch_size, seq_len, num_steps, device, cond_tokens,
                 class_labels=class_labels,
                 return_history=return_history,
-                tokens_per_step=tokens_per_step)
+                tokens_per_step=tokens_per_step,
+                known_mask=known_mask, known_tokens=known_tokens)
 
         eps = 1e-5
         x = torch.full((batch_size, seq_len), self.mask_index,
                         dtype=torch.long, device=device)
+        if known_mask is not None:
+            assert known_tokens is not None
+            x = torch.where(known_mask, known_tokens.long(), x)
         timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
         dt = (1 - eps) / num_steps
         p_x0_cache = None
@@ -542,8 +973,17 @@ class DiscreteDiffusion(nn.Module):
         if noise_removal:
             t = timesteps[-1] * torch.ones(batch_size, 1, device=device)
             sigma_t = self.noise(t)[0]
-            x = self.forward(x, sigma_t, cond_tokens=cond_tokens,
-                             class_labels=class_labels).argmax(dim=-1)
+            if self.factorized_head:
+                # Use AR head directly — avoids allocating (B, L, 64K) logits
+                h, c_vec = self._run_backbone_hidden(
+                    x, sigma_t, cond_tokens=cond_tokens,
+                    class_labels=class_labels)
+                final_pred, _ = self._ar_head.sample_with_confidence(h, c_vec)
+                still_masked = (x == self.mask_index)
+                x = torch.where(still_masked, final_pred, x)
+            else:
+                x = self.forward(x, sigma_t, cond_tokens=cond_tokens,
+                                 class_labels=class_labels).argmax(dim=-1)
             if return_history:
                 history.append(x.clone().cpu())
 
@@ -562,6 +1002,8 @@ class DiscreteDiffusion(nn.Module):
         class_labels: Optional[Tensor] = None,
         return_history: bool = False,
         tokens_per_step: int = 0,
+        known_mask: Optional[Tensor] = None,
+        known_tokens: Optional[Tensor] = None,
     ) -> Tensor:
         """MaskGIT-style confidence-based sampling.
 
@@ -581,6 +1023,9 @@ class DiscreteDiffusion(nn.Module):
 
         x = torch.full((batch_size, seq_len), self.mask_index,
                         dtype=torch.long, device=device)
+        if known_mask is not None:
+            assert known_tokens is not None
+            x = torch.where(known_mask, known_tokens.long(), x)
 
         history = [x.clone().cpu()] if return_history else None
 

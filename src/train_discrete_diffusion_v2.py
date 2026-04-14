@@ -51,7 +51,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import set_seed, ProjectConfiguration, tqdm
 from PIL import Image
 from torchvision import transforms
@@ -456,6 +456,33 @@ class CachedTokenDataset(Dataset):
         return {}
 
 
+class CachedContinuousTokenDataset(Dataset):
+    """Returns cached continuous feature vectors + optional conditions."""
+    def __init__(self, features, labels=None, clevr_conditions=None,
+                 cond_tokenizer_fn=None, sudoku_digit_grids=None):
+        self.features = features  # (N, seq_len, feat_dim) float
+        self.labels = labels
+        self.clevr_conditions = clevr_conditions
+        self.cond_tokenizer_fn = cond_tokenizer_fn or clevr_json_to_token_ids
+        self.sudoku_digit_grids = sudoku_digit_grids
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        item = {"cont_tokens": self.features[idx].float()}
+        if self.labels is not None:
+            item["class_label"] = self.labels[idx]
+        if self.clevr_conditions is not None:
+            cond = self.clevr_conditions[idx]
+            item["cond_token_ids"] = self.cond_tokenizer_fn(cond)
+        if self.sudoku_digit_grids is not None:
+            grid = self.sudoku_digit_grids[idx]
+            digits = grid.reshape(-1).long() - 1  # (81,) in [0, 8]
+            item["cond_token_ids"] = digits
+        return item
+
+
 class GridOnlyDataset(Dataset):
     """Sudoku grids only (no images)."""
     def __init__(self, inner_dataset):
@@ -548,6 +575,7 @@ def load_pretrained_model(pretrained_output_dir: str, device: str = "cpu"):
             min_patch_size=cfg.get("min_patch_size", 32),
             num_levels=cfg.get("num_levels", None),
             feat_channels=cfg.get("feat_channels", 256),
+            encoder_internal_dim=cfg.get("encoder_internal_dim", None),
             dit_patch_size=cfg.get("dit_patch_size", 2),
             dit_hidden_size=cfg.get("dit_hidden_size", 768),
             dit_n_heads=cfg.get("dit_n_heads", 12),
@@ -637,7 +665,8 @@ def load_pretrained_model(pretrained_output_dir: str, device: str = "cpu"):
         else:
             vocab_size = 512
     else:
-        raise ValueError("Pretrained model has no discretizer")
+        # No discretizer — continuous mode (diffusion head) only
+        vocab_size = 0
 
     return model, encoder, discretizer, level_sizes, vocab_size, cfg
 
@@ -672,6 +701,111 @@ def extract_tokens(encoder, discretizer, images, device):
         slots = encoder(images)  # (B, num_slots, slot_dim)
         _, tok_indices = discretizer(slots)  # (B, num_slots)
         return tok_indices
+
+
+@torch.no_grad()
+def extract_continuous_tokens(encoder, images, device):
+    """Extract flat continuous feature vectors from a batch of images.
+
+    Args:
+        encoder: HierarchicalMultiResEncoder
+        images: (B, C, H, W) tensor
+        device: target device
+    Returns:
+        features: (B, total_tokens, feat_dim) float
+    """
+    images = images.to(device)
+
+    if hasattr(encoder, 'forward_injection'):
+        level_features = encoder.forward_injection(images)
+        all_feats = []
+        for s in sorted(level_features.keys(), reverse=True):
+            feat_2d = level_features[s]  # (B, D, S, S)
+            tokens_2d = feat_2d.flatten(2).transpose(1, 2)  # (B, S*S, D)
+            all_feats.append(tokens_2d)
+        return torch.cat(all_feats, dim=1)  # (B, total_tokens, D)
+    else:
+        slots = encoder(images)  # (B, num_slots, slot_dim)
+        return slots
+
+
+@torch.no_grad()
+def cache_all_continuous_tokens(encoder, dataset, device,
+                                batch_size=64, cache_path=None,
+                                accelerator=None):
+    """Extract and cache continuous feature vectors for an entire dataset."""
+    if cache_path is not None and os.path.isfile(cache_path):
+        feats = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if accelerator:
+            accelerator.print(f"[cache] Loaded from {cache_path}, shape={feats.shape}")
+        return feats
+
+    from torch.utils.data import DataLoader, DistributedSampler
+
+    use_distributed = accelerator is not None and accelerator.num_processes > 1
+
+    if use_distributed:
+        sampler = DistributedSampler(
+            dataset, num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index, shuffle=False, drop_last=False)
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                            num_workers=4, pin_memory=True, drop_last=False)
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True, drop_last=False)
+
+    local_feats = []
+    for batch in loader:
+        if isinstance(batch, (tuple, list)):
+            images = batch[0]
+        elif isinstance(batch, dict) and "image" in batch:
+            images = batch["image"]
+        else:
+            images = batch
+        images = images.to(device)
+        feat = extract_continuous_tokens(encoder, images, device)
+        local_feats.append(feat.cpu())
+
+    local_feat = torch.cat(local_feats, dim=0)  # (local_N, seq_len, feat_dim)
+
+    if use_distributed:
+        import torch.distributed as dist
+        world_size = accelerator.num_processes
+        local_size = torch.tensor([local_feat.shape[0]], dtype=torch.long, device=device)
+        all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
+        dist.all_gather(all_sizes, local_size)
+        max_size = max(s.item() for s in all_sizes)
+
+        if local_feat.shape[0] < max_size:
+            pad = torch.zeros(max_size - local_feat.shape[0], *local_feat.shape[1:],
+                              dtype=local_feat.dtype)
+            local_feat_padded = torch.cat([local_feat, pad], dim=0)
+        else:
+            local_feat_padded = local_feat
+
+        local_feat_gpu = local_feat_padded.to(device)
+        gathered = [torch.zeros_like(local_feat_gpu) for _ in range(world_size)]
+        dist.all_gather(gathered, local_feat_gpu)
+
+        total_len = len(dataset)
+        feats = torch.zeros(total_len, *local_feat.shape[1:], dtype=local_feat.dtype)
+        for rank_idx in range(world_size):
+            rank_size = int(all_sizes[rank_idx].item())
+            rank_data = gathered[rank_idx][:rank_size].cpu()
+            indices = list(range(rank_idx, total_len, world_size))
+            feats[indices[:rank_size]] = rank_data
+
+        accelerator.print(f"[cache] Distributed caching done: {world_size} GPUs, shape={feats.shape}")
+    else:
+        feats = local_feat
+
+    if cache_path is not None and (not use_distributed or accelerator.is_main_process):
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save(feats, cache_path)
+        if accelerator:
+            accelerator.print(f"[cache] Saved to {cache_path}, shape={feats.shape}")
+
+    return feats
 
 
 @torch.no_grad()
@@ -914,10 +1048,16 @@ class CLEVRImageDataset(Dataset):
 #  LR scheduler
 # ────────────────────────────────────────────────────────────
 
-def get_lr_scheduler(optimizer, warmup_steps: int, total_steps: int):
+def get_lr_scheduler(optimizer, warmup_steps: int, total_steps: int,
+                     schedule: str = "constant", min_lr_ratio: float = 0.1):
+    """Warmup + {constant | cosine decay to min_lr_ratio * base_lr}."""
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_steps:
             return current_step / max(1, warmup_steps)
+        if schedule == "cosine":
+            progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
         return 1.0
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -949,6 +1089,27 @@ def check_sudoku_rules(grids):
 # ────────────────────────────────────────────────────────────
 #  Sample visualization
 # ────────────────────────────────────────────────────────────
+
+def _cont_tokens_to_level_features(cont_tokens, level_sizes, device):
+    """Decode flat continuous feature vectors → per-level 2D feature maps.
+
+    Args:
+        cont_tokens: (B, total_tokens, feat_dim) float
+        level_sizes: list of spatial sizes, finest-first (e.g., [9])
+    Returns:
+        level_features: {spatial_size: (B, feat_dim, S, S)}
+    """
+    B = cont_tokens.shape[0]
+    offset = 0
+    level_features = {}
+    for s in sorted(level_sizes, reverse=True):
+        n_tok = s * s
+        level_feat = cont_tokens[:, offset:offset + n_tok, :].to(device)  # (B, s*s, D)
+        offset += n_tok
+        feat_dim = level_feat.shape[-1]
+        level_features[s] = level_feat.transpose(1, 2).view(B, feat_dim, s, s)
+    return level_features
+
 
 def _tok_ids_to_level_features(tok_ids, level_sizes, discretizer, device):
     """Decode flat token IDs → per-level 2D feature maps.
@@ -1173,12 +1334,148 @@ def decode_tokens_to_images(
     return torch.cat(all_images, dim=0).clamp(-1, 1)
 
 
+@torch.no_grad()
+def decode_continuous_tokens_to_images(
+    cont_tokens, level_sizes, pretrained_model, device,
+    num_steps=50, guidance_scale=1.0, batch_size=16,
+    noise_scale=1.0, t_eps=0.05,
+):
+    """Decode generated continuous feature vectors back to images.
+
+    Same as decode_tokens_to_images but skips the discretizer decode step.
+
+    Args:
+        cont_tokens: (N, total_tokens, feat_dim) float
+        level_sizes: list of spatial sizes
+        pretrained_model: full multi-res model
+        device: torch device
+    Returns:
+        images: (N, C, H, W) float32 in [-1, 1]
+    """
+    pretrained_model.eval()
+    pretrained_model.to(device)
+    N = cont_tokens.shape[0]
+    all_images = []
+
+    image_size = pretrained_model.image_size
+    in_channels = pretrained_model._in_channels if hasattr(pretrained_model, '_in_channels') else 3
+    vae_factor = getattr(pretrained_model, 'vae_downsample_factor', 1)
+    latent_size = image_size // vae_factor
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch_cont = cont_tokens[start:end].to(device)
+        B_cur = batch_cont.shape[0]
+
+        z = noise_scale * torch.randn(
+            B_cur, in_channels, latent_size, latent_size, device=device)
+
+        # Convert continuous tokens → per-level feature maps
+        level_features = _cont_tokens_to_level_features(
+            batch_cont, level_sizes, device)
+
+        # Flow matching ODE (Euler)
+        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        for i in range(num_steps):
+            t_cur = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t_cur
+            t_batch = t_cur.expand(B_cur)
+            t_expand = t_cur.view(1, 1, 1, 1)
+
+            if guidance_scale != 1.0:
+                x_cond = pretrained_model.forward_from_level_features(
+                    z, t_batch, level_features, return_uncond=False)
+                x_uncond = pretrained_model.forward_from_level_features(
+                    z, t_batch, level_features, return_uncond=True)
+                v_cond = (x_cond - z) / (1.0 - t_expand).clamp_min(t_eps)
+                v_uncond = (x_uncond - z) / (1.0 - t_expand).clamp_min(t_eps)
+                v = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                x_pred = pretrained_model.forward_from_level_features(
+                    z, t_batch, level_features, return_uncond=False)
+                v = (x_pred - z) / (1.0 - t_expand).clamp_min(t_eps)
+
+            z = z + dt * v
+
+        # VAE decode if needed
+        if vae_factor > 1 and hasattr(pretrained_model, 'vae'):
+            z = pretrained_model.vae.decode(z / pretrained_model.vae_scaling).sample
+        all_images.append(z.cpu().float())
+
+    return torch.cat(all_images, dim=0).clamp(-1, 1)
+
+
 def save_sample_grid(images, path, nrow=8):
     """Save a grid of images as PNG."""
     from torchvision.utils import make_grid
     grid = make_grid(images * 0.5 + 0.5, nrow=nrow, padding=2)
     grid = grid.clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
     Image.fromarray(grid).save(path)
+
+
+def save_sample_grid_with_hints(
+    images, path, cond_digits, known_mask, grid_hw=9, nrow=8,
+    border_color=(0, 200, 0), text_color=(0, 180, 0), text_bg=(255, 255, 255),
+):
+    """Save image grid with hint cells outlined and the given digit overlaid.
+
+    Args:
+        images: (B, C, H, W) in [-1, 1] — each image is a grid_hw × grid_hw board
+        cond_digits: (B, grid_hw*grid_hw) long — condition digits (0-8 = digit 1-9, SUDOKU_MASK_ID = unknown)
+        known_mask:  (B, grid_hw*grid_hw) bool — True for hint cells
+    """
+    from torchvision.utils import make_grid
+    from PIL import ImageDraw, ImageFont
+
+    grid = make_grid(images * 0.5 + 0.5, nrow=nrow, padding=2)
+    grid = grid.clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+    img = Image.fromarray(grid).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    B, _, H, W = images.shape
+    cell_h = H // grid_hw
+    cell_w = W // grid_hw
+    padding = 2
+    ncol = nrow
+
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            max(8, cell_h // 3))
+    except Exception:
+        font = ImageFont.load_default()
+
+    km = known_mask.detach().cpu().numpy() if hasattr(known_mask, "detach") else known_mask
+    cd = cond_digits.detach().cpu().numpy() if hasattr(cond_digits, "detach") else cond_digits
+
+    for b in range(B):
+        row = b // ncol
+        col = b % ncol
+        ox = padding + col * (W + padding)
+        oy = padding + row * (H + padding)
+        for idx in range(grid_hw * grid_hw):
+            if not bool(km[b, idx]):
+                continue
+            r = idx // grid_hw
+            c = idx % grid_hw
+            x0 = ox + c * cell_w
+            y0 = oy + r * cell_h
+            x1 = x0 + cell_w - 1
+            y1 = y0 + cell_h - 1
+            draw.rectangle([x0, y0, x1, y1], outline=border_color, width=2)
+            digit_val = int(cd[b, idx]) + 1  # 0-8 → 1-9
+            txt = str(digit_val)
+            bbox = font.getbbox(txt)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = x0 + 1
+            ty = y0 + 1
+            draw.rectangle([tx - 1, ty - 1, tx + tw + 1, ty + th + 1],
+                           fill=text_bg)
+            draw.text((tx, ty - bbox[1]), txt, fill=text_color, font=font)
+
+    img.save(path)
 
 
 @torch.no_grad()
@@ -1338,52 +1635,82 @@ def evaluate_and_save(
 ):
     """All ranks participate in eval (distributed sampling + decode).
     Only rank 0 does condition eval and saves files."""
+    import time as _time
+    _rank = accelerator.process_index
     device = accelerator.device
+
+    print(f"[eval/debug] rank={_rank} entering evaluate_and_save step={step} "
+          f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB / "
+          f"reserved: {torch.cuda.memory_reserved(device)/1e9:.2f}GB)", flush=True)
+
+    # Free fragmented CUDA cache BEFORE heavy eval allocations
+    torch.cuda.empty_cache()
+
     model = accelerator.unwrap_model(diffusion)
     model.eval()
 
     params = list(model.parameters())
     if ema is not None:
+        print(f"[eval/debug] rank={_rank} ema.store start "
+              f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB / "
+              f"reserved: {torch.cuda.memory_reserved(device)/1e9:.2f}GB)", flush=True)
         ema.store(params)
         ema.copy_to(params)
+        print(f"[eval/debug] rank={_rank} ema.copy_to done "
+              f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB)", flush=True)
 
     save_dir = os.path.join(args.output_dir, "eval_samples")
     if accelerator.is_main_process:
         os.makedirs(save_dir, exist_ok=True)
 
+    # Barrier: ensure all ranks enter eval together before any collective ops
+    print(f"[eval/debug] rank={_rank} entering wait_for_everyone (pre-eval barrier)", flush=True)
+    _tb0 = _time.time()
+    accelerator.wait_for_everyone()
+    print(f"[eval/debug] rank={_rank} wait_for_everyone done ({_time.time()-_tb0:.1f}s)", flush=True)
+
     if args.dataset_type == "sudoku" and args.grid_only:
         if accelerator.is_main_process:
             _eval_sudoku(model, step, args, accelerator, save_dir)
     elif args.dataset_type == "sudoku" and not args.grid_only:
-        if accelerator.is_main_process:
-            cond_enc = clevr_cond_encoder
-            if cond_enc is not None and hasattr(cond_enc, 'module'):
-                cond_enc = cond_enc.module
-            _eval_sudoku_image(model, step, args, accelerator, save_dir,
-                               pretrained_model, discretizer, level_sizes,
-                               val_dataset=val_dataset,
-                               sudoku_cond_encoder=cond_enc)
+        # All ranks participate in eval (sampling can be slow with diffusion head)
+        cond_enc = clevr_cond_encoder
+        if cond_enc is not None and hasattr(cond_enc, 'module'):
+            cond_enc = cond_enc.module
+        _eval_sudoku_image(model, step, args, accelerator, save_dir,
+                           pretrained_model, discretizer, level_sizes,
+                           val_dataset=val_dataset,
+                           sudoku_cond_encoder=cond_enc)
     elif args.dataset_type == "imagenet":
         if accelerator.is_main_process:
             _eval_imagenet(model, step, args, accelerator, save_dir,
                            pretrained_model, discretizer, level_sizes)
     elif args.dataset_type == "clevr":
+        print(f"[eval/debug] rank={_rank} starting _eval_clevr (val)", flush=True)
+        _teval0 = _time.time()
         _eval_clevr(model, step, args, accelerator, save_dir,
                     pretrained_model, discretizer, level_sizes,
                     clevr_cond_encoder, val_dataset,
                     clevr_detector=clevr_detector,
                     clevr_classifier=clevr_classifier)
+        print(f"[eval/debug] rank={_rank} _eval_clevr (val) done "
+              f"({_time.time()-_teval0:.1f}s, "
+              f"GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB)", flush=True)
         # Also eval on train set if provided
         if train_dataset is not None:
             train_save_dir = os.path.join(args.output_dir, "eval_train_samples")
             if accelerator.is_main_process:
                 os.makedirs(train_save_dir, exist_ok=True)
+            print(f"[eval/debug] rank={_rank} starting _eval_clevr (train)", flush=True)
+            _teval1 = _time.time()
             _eval_clevr(model, step, args, accelerator, train_save_dir,
                         pretrained_model, discretizer, level_sizes,
                         clevr_cond_encoder, train_dataset,
                         clevr_detector=clevr_detector,
                         clevr_classifier=clevr_classifier,
                         log_prefix="eval_train")
+            print(f"[eval/debug] rank={_rank} _eval_clevr (train) done "
+                  f"({_time.time()-_teval1:.1f}s)", flush=True)
 
     # Move pretrained model back to CPU to free GPU for training
     if pretrained_model is not None:
@@ -1391,10 +1718,11 @@ def evaluate_and_save(
         torch.cuda.empty_cache()
 
     # Sync all ranks before restoring EMA / resuming training.
-    # NOTE: _eval_clevr already syncs after distributed work;
-    # its deferred rank-0-only condition eval runs after that sync,
-    # so this barrier waits for it to finish.
+    print(f"[eval/debug] rank={_rank} entering final wait_for_everyone", flush=True)
+    _tb1 = _time.time()
     accelerator.wait_for_everyone()
+    print(f"[eval/debug] rank={_rank} final wait_for_everyone done "
+          f"({_time.time()-_tb1:.1f}s)", flush=True)
 
     if ema is not None:
         ema.restore(params)
@@ -1574,7 +1902,9 @@ def _render_sudoku_grid_video(
     else:
         indices = list(range(n_total))
 
-    mask_index = history[0].max().item()
+    # Support both discrete history (int tokens) and continuous mask_history (bool)
+    _is_bool_history = (history[0].dtype == torch.bool)
+    mask_index = None if _is_bool_history else history[0].max().item()
     grid = final_grid[sample_idx].cpu().numpy()  # (9, 9)
     error_cells = _find_error_cells(grid, grid_hw)
 
@@ -1604,7 +1934,10 @@ def _render_sudoku_grid_video(
 
     frames_np = []
     for fi, idx in enumerate(indices):
-        mask_positions = (history[idx][sample_idx] == mask_index)  # (L,)
+        if _is_bool_history:
+            mask_positions = history[idx][sample_idx]  # (L,) bool
+        else:
+            mask_positions = (history[idx][sample_idx] == mask_index)  # (L,)
         n_masked = mask_positions.sum().item()
         n_total_tok = mask_positions.numel()
         pct = 100.0 * (1 - n_masked / n_total_tok)
@@ -1701,7 +2034,17 @@ def _eval_sudoku_image(model, step, args, accelerator, save_dir,
         grid_size=(args.grid_hw, args.grid_hw))
 
     # ── Define sampler configs (like ImageNet/CLEVR) ──
-    if args.model_type == "ar":
+    if getattr(args, 'use_diffusion_head', False):
+        # Continuous mode: support ddpm + confidence (top1/cosine)
+        sampler_configs = [
+            {"name": "ddpm_cache", "sampler": "ddpm_cache",
+             "tokens_per_step": 0},
+            {"name": "confidence_top1", "sampler": "confidence",
+             "tokens_per_step": 1},
+            {"name": "confidence_cosine", "sampler": "confidence",
+             "tokens_per_step": 0},
+        ]
+    elif args.model_type == "ar":
         sampler_configs = [{"name": "ar", "sampler": "ar"}]
     else:
         sampler_configs = [
@@ -1726,76 +2069,116 @@ def _eval_sudoku_image(model, step, args, accelerator, save_dir,
                               SUDOKU_MASK_ID, dtype=torch.long, device=device)
         uncond_cond_tokens = sudoku_cond_encoder(all_mask)
 
+    use_diffusion_head = getattr(args, 'use_diffusion_head', False)
+    # For diffusion head: get feat_dim from pretrained encoder
+    _diff_head_feat_dim = getattr(args, '_diff_head_feat_dim', 16)
+    if use_diffusion_head and hasattr(model, 'diff_head') and model.diff_head is not None:
+        _diff_head_feat_dim = model.diff_head.in_channels
+
     for sc in sampler_configs:
         tag = sc["name"]
-        sample_kwargs = dict(
-            batch_size=n_samples, seq_len=seq_len,
-            num_steps=args.eval_num_steps, device=device,
-            sampler=sc["sampler"], noise_removal=True,
-            tokens_per_step=sc.get("tokens_per_step", 0),
-            cond_tokens=uncond_cond_tokens,
-        )
-        if args.model_type == "ar":
-            sample_kwargs.update(temperature=args.ar_temperature,
-                                 top_k=args.ar_top_k, top_p=args.ar_top_p)
 
-        # Sample with history for video rendering
-        need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
-        if need_video:
-            sample_kwargs["return_history"] = True
-            result = model.sample(**sample_kwargs)
-            tokens, history = result
-        else:
-            tokens = model.sample(**sample_kwargs)
-            history = None
-
-        # Decode tokens → images
-        images = decode_tokens_to_images(
-            tokens, level_sizes, pretrained_model, discretizer, device,
-            num_steps=args.decode_num_steps, batch_size=16)
-
-        # Save image grid
-        img_path = os.path.join(save_dir, f"step_{step:07d}_sudoku_{tag}.png")
-        save_sample_grid(images, img_path, nrow=8)
-        accelerator.print(
-            f"[eval/sudoku_image] step={step} [{tag}] saved → {img_path}")
-
-        # Save denoising grid videos
-        if need_video and history is not None:
-            # Classify final images once → digit grids for all samples
-            if images.shape[1] == 3:
-                eval_imgs = images.mean(dim=1, keepdim=True)
+        if use_diffusion_head:
+            # ── Continuous mode: sample_continuous ──
+            sample_kwargs = dict(
+                batch_size=n_samples, seq_len=seq_len,
+                feat_dim=_diff_head_feat_dim,
+                num_steps=args.eval_num_steps, device=device,
+                sampler=sc["sampler"],
+                tokens_per_step=sc.get("tokens_per_step", 0),
+                cond_tokens=uncond_cond_tokens,
+                temperature=getattr(args, 'diff_head_temperature', 1.0),
+                cfg=getattr(args, 'diff_head_cfg', 1.0),
+            )
+            need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
+            if need_video:
+                sample_kwargs["return_history"] = True
+                cont_tokens_sampled, mask_history = model.sample_continuous(**sample_kwargs)
             else:
-                eval_imgs = images
-            final_grids = evaluator.eval_images(eval_imgs.to(device))["discrete"]  # (B, 9, 9)
+                cont_tokens_sampled = model.sample_continuous(**sample_kwargs)
+                mask_history = None
 
-            vid_dir = os.path.join(save_dir, "videos")
-            os.makedirs(vid_dir, exist_ok=True)
-            n_vid = min(eval_video_samples, n_samples)
-            for vi in range(n_vid):
-                grid_vid_path = os.path.join(
-                    vid_dir,
-                    f"step_{step:07d}_sudoku_{tag}_sample{vi}_grid.{eval_save_format}")
-                _render_sudoku_grid_video(
-                    history, final_grids,
-                    sample_idx=vi, save_path=grid_vid_path,
-                    max_frames=args.eval_num_steps, fps=8,
-                    grid_hw=args.grid_hw, title=f"uncond / {tag}")
+            # Decode continuous tokens → images
+            images = decode_continuous_tokens_to_images(
+                cont_tokens_sampled, level_sizes, pretrained_model, device,
+                num_steps=args.decode_num_steps, batch_size=16)
+            history = mask_history  # list of (B, L) bool tensors
+        else:
+            # ── Discrete mode: standard sampling ──
+            sample_kwargs = dict(
+                batch_size=n_samples, seq_len=seq_len,
+                num_steps=args.eval_num_steps, device=device,
+                sampler=sc["sampler"], noise_removal=True,
+                tokens_per_step=sc.get("tokens_per_step", 0),
+                cond_tokens=uncond_cond_tokens,
+            )
+            if args.model_type == "ar":
+                sample_kwargs.update(temperature=args.ar_temperature,
+                                     top_k=args.ar_top_k, top_p=args.ar_top_p)
+
+            # Sample with history for video rendering
+            need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
+            if need_video:
+                sample_kwargs["return_history"] = True
+                result = model.sample(**sample_kwargs)
+                tokens, history = result
+            else:
+                tokens = model.sample(**sample_kwargs)
+                history = None
+
+            # Decode tokens → images
+            images = decode_tokens_to_images(
+                tokens, level_sizes, pretrained_model, discretizer, device,
+                num_steps=args.decode_num_steps, batch_size=16)
+
+        # Decode + save + eval — only rank 0
+        if accelerator.is_main_process:
+            # Save image grid
+            img_path = os.path.join(save_dir, f"step_{step:07d}_sudoku_{tag}.png")
+            save_sample_grid(images, img_path, nrow=8)
             accelerator.print(
-                f"[eval/sudoku_image] step={step} [{tag}] "
-                f"saved {n_vid} grid videos → {vid_dir}/")
+                f"[eval/sudoku_image] step={step} [{tag}] saved → {img_path}")
 
-        # MNIST classify → grid → rule check
-        _log_sudoku_image_metrics(
-            images, evaluator, tag, step, n_samples,
-            save_dir, accelerator, args, prefix="eval")
+            # Save denoising grid videos
+            if need_video and history is not None:
+                if images.shape[1] == 3:
+                    eval_imgs = images.mean(dim=1, keepdim=True)
+                else:
+                    eval_imgs = images
+                final_grids = evaluator.eval_images(eval_imgs.to(device))["discrete"]
+
+                vid_dir = os.path.join(save_dir, "videos")
+                os.makedirs(vid_dir, exist_ok=True)
+                n_vid = min(eval_video_samples, n_samples)
+                for vi in range(n_vid):
+                    grid_vid_path = os.path.join(
+                        vid_dir,
+                        f"step_{step:07d}_sudoku_{tag}_sample{vi}_grid.{eval_save_format}")
+                    _render_sudoku_grid_video(
+                        history, final_grids,
+                        sample_idx=vi, save_path=grid_vid_path,
+                        max_frames=args.eval_num_steps, fps=8,
+                        grid_hw=args.grid_hw, title=f"uncond / {tag}")
+                accelerator.print(
+                    f"[eval/sudoku_image] step={step} [{tag}] "
+                    f"saved {n_vid} grid videos → {vid_dir}/")
+
+            # MNIST classify → grid → rule check
+            _log_sudoku_image_metrics(
+                images, evaluator, tag, step, n_samples,
+                save_dir, accelerator, args, prefix="eval")
 
     # ─────────────────────────────────────────────────────
     #  2) Difficulty-based conditioned generation
     #     (like train_AR_cond.sh easy/medium/hard)
     # ─────────────────────────────────────────────────────
-    if val_dataset is not None and hasattr(val_dataset, 'sudoku_grids') \
-            and sudoku_cond_encoder is not None and args.model_type != "ar":
+    has_prefix = (sudoku_cond_encoder is not None)
+    has_val_tokens = (val_dataset is not None
+                      and hasattr(val_dataset, 'sudoku_grids')
+                      and (has_prefix
+                           or hasattr(val_dataset, 'features')
+                           or hasattr(val_dataset, 'tok_ids')))
+    if has_val_tokens and args.model_type != "ar":
         _eval_sudoku_image_difficulty(
             model, step, args, accelerator, save_dir,
             pretrained_model, discretizer, level_sizes,
@@ -1817,11 +2200,19 @@ def _eval_sudoku_image_difficulty(
 ):
     """Conditioned generation eval with easy/medium/hard difficulty.
 
+    Two conditioning modes:
+      * prefix (legacy, --use_sudoku_prefix): masked digit grid → encoder →
+        prefix tokens prepended during sampling.
+      * inpainting (default): each val sample's own image tokens at known
+        cells are fixed as clean tokens; unknown cells start [MASK] and are
+        denoised. MDLM carry-over preserves known cells throughout.
+
     For each difficulty level:
     1. Take GT digit grids from val set
     2. Mask digits according to difficulty (fewer hints = harder)
-    3. Encode masked digit grid → condition prefix
-    4. Generate FSQ tokens conditioned on the prefix
+    3a. (prefix mode) Encode masked digit grid → condition prefix
+    3b. (inpainting mode) Build known_mask/known_tokens from val features
+    4. Generate FSQ tokens
     5. Decode to images → MNIST classify → rule check
     """
     device = accelerator.device
@@ -1829,11 +2220,22 @@ def _eval_sudoku_image_difficulty(
     seq_len = sum(level_sizes) if is_baseline_1d else sum(s * s for s in level_sizes)
     n_eval = min(len(val_dataset), args.eval_num_samples, 64)
 
+    use_prefix_cond = (sudoku_cond_encoder is not None)
+
     # Gather GT digit grids from val set
     grids = val_dataset.sudoku_grids[:n_eval]  # (n_eval, 9, 9)
     if not isinstance(grids, torch.Tensor):
         grids = torch.tensor(grids)
     x_gt = grids.reshape(n_eval, -1).long().to(device) - 1  # (n_eval, 81) in [0, 8]
+
+    # Gather val image tokens (continuous feats or discrete ids) for inpainting
+    val_cont_tokens = None
+    val_tok_ids = None
+    if not use_prefix_cond:
+        if hasattr(val_dataset, 'features') and val_dataset.features is not None:
+            val_cont_tokens = val_dataset.features[:n_eval].to(device).float()
+        elif hasattr(val_dataset, 'tok_ids') and val_dataset.tok_ids is not None:
+            val_tok_ids = val_dataset.tok_ids[:n_eval].to(device).long()
 
     # Use ddpm_cache for conditioned generation
     sampler = "ddpm_cache"
@@ -1858,71 +2260,169 @@ def _eval_sudoku_image_difficulty(
                                       generator=rng)[:nh]
                 known_mask[b, perm] = True
 
-        # Build masked condition digits
+        # Build masked condition digits (also used for hint-grid viz)
         cond_digits = torch.full((n_eval, SUDOKU_GRID_LEN),
                                  SUDOKU_MASK_ID, dtype=torch.long, device=device)
         cond_digits[known_mask] = x_gt[known_mask]
 
-        # Encode condition → prefix embeddings
-        cond_tokens = sudoku_cond_encoder(cond_digits)
+        # Build conditioning tensors for the two modes
+        cond_tokens = None
+        known_cont_tokens = None
+        known_discrete_tokens = None
+        if use_prefix_cond:
+            # Legacy: encode masked grid → prefix
+            cond_tokens = sudoku_cond_encoder(cond_digits)
+        else:
+            # Inpainting: fix known positions with this val sample's own
+            # image tokens; leave unknowns masked.
+            if val_cont_tokens is not None:
+                known_cont_tokens = val_cont_tokens
+            elif val_tok_ids is not None:
+                known_discrete_tokens = val_tok_ids
 
-        # Generate FSQ tokens conditioned on digit prefix
+        # Generate tokens conditioned on digit prefix
         eval_video_samples = getattr(args, "eval_video_samples", 4)
         eval_save_format = getattr(args, "eval_save_format", "mp4")
-        need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
+        use_diffusion_head = getattr(args, 'use_diffusion_head', False)
 
-        sample_kwargs = dict(
-            batch_size=n_eval, seq_len=seq_len,
-            num_steps=args.eval_num_steps, device=device,
-            sampler=sampler, noise_removal=True,
-            cond_tokens=cond_tokens, tokens_per_step=0,
-        )
-        if need_video:
-            sample_kwargs["return_history"] = True
-            tokens, history = model.sample(**sample_kwargs)
+        if use_diffusion_head:
+            _dh_feat_dim = model.diff_head.in_channels if model.diff_head is not None else 16
+            dh_sampler_configs = [
+                {"name": "ddpm_cache", "sampler": "ddpm_cache", "tokens_per_step": 0},
+                {"name": "confidence_top1", "sampler": "confidence", "tokens_per_step": 1},
+                {"name": "confidence_cosine", "sampler": "confidence", "tokens_per_step": 0},
+            ]
+            need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
+            for sc in dh_sampler_configs:
+                sc_tag = sc["name"]
+                sample_kwargs = dict(
+                    batch_size=n_eval, seq_len=seq_len,
+                    feat_dim=_dh_feat_dim,
+                    num_steps=args.eval_num_steps, device=device,
+                    sampler=sc["sampler"],
+                    tokens_per_step=sc.get("tokens_per_step", 0),
+                    cond_tokens=cond_tokens,
+                    temperature=getattr(args, 'diff_head_temperature', 1.0),
+                    cfg=getattr(args, 'diff_head_cfg', 1.0),
+                    known_mask=known_mask if known_cont_tokens is not None else None,
+                    known_tokens=known_cont_tokens,
+                )
+                if need_video:
+                    sample_kwargs["return_history"] = True
+                    cont_tokens_sampled, mask_history = model.sample_continuous(**sample_kwargs)
+                else:
+                    cont_tokens_sampled = model.sample_continuous(**sample_kwargs)
+                    mask_history = None
+                images = decode_continuous_tokens_to_images(
+                    cont_tokens_sampled, level_sizes, pretrained_model, device,
+                    num_steps=args.decode_num_steps, batch_size=16)
+                history = mask_history
+
+                if accelerator.is_main_process:
+                    img_path = os.path.join(
+                        task_dir,
+                        f"step_{step:07d}_sudoku_{level_name}_{sc_tag}.png")
+                    save_sample_grid(images, img_path, nrow=8)
+                    hint_img_path = os.path.join(
+                        task_dir,
+                        f"step_{step:07d}_sudoku_{level_name}_{sc_tag}_hints.png")
+                    save_sample_grid_with_hints(
+                        images, hint_img_path,
+                        cond_digits=cond_digits, known_mask=known_mask,
+                        grid_hw=args.grid_hw, nrow=8)
+
+                    if need_video and history is not None:
+                        if images.shape[1] == 3:
+                            eval_imgs = images.mean(dim=1, keepdim=True)
+                        else:
+                            eval_imgs = images
+                        final_grids = evaluator.eval_images(eval_imgs.to(device))["discrete"]
+                        vid_dir = os.path.join(task_dir, "videos")
+                        os.makedirs(vid_dir, exist_ok=True)
+                        n_vid = min(eval_video_samples, n_eval)
+                        for vi in range(n_vid):
+                            grid_vid_path = os.path.join(
+                                vid_dir,
+                                f"step_{step:07d}_sudoku_{level_name}_{sc_tag}_sample{vi}_grid.{eval_save_format}")
+                            _render_sudoku_grid_video(
+                                history, final_grids,
+                                sample_idx=vi, save_path=grid_vid_path,
+                                max_frames=args.eval_num_steps, fps=8,
+                                grid_hw=args.grid_hw, hint_mask=known_mask,
+                                title=f"{level_name} / {sc_tag}")
+                        accelerator.print(
+                            f"[eval_cond/sudoku_image] step={step} "
+                            f"[{level_name}/{sc_tag}] saved {n_vid} grid videos → {vid_dir}/")
+
+                    _log_sudoku_image_metrics(
+                        images, evaluator, f"{level_name}_{sc_tag}",
+                        step, n_eval, task_dir, accelerator, args,
+                        prefix="eval_cond")
+            continue  # skip the shared save/eval block below
         else:
-            tokens = model.sample(**sample_kwargs)
-            history = None
-
-        # Decode tokens → images
-        images = decode_tokens_to_images(
-            tokens, level_sizes, pretrained_model, discretizer, device,
-            num_steps=args.decode_num_steps, batch_size=16)
-
-        # Save image grid
-        img_path = os.path.join(
-            task_dir, f"step_{step:07d}_sudoku_{level_name}.png")
-        save_sample_grid(images, img_path, nrow=8)
-
-        # Save denoising grid videos with hint highlighting
-        if need_video and history is not None:
-            if images.shape[1] == 3:
-                eval_imgs = images.mean(dim=1, keepdim=True)
+            need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
+            sample_kwargs = dict(
+                batch_size=n_eval, seq_len=seq_len,
+                num_steps=args.eval_num_steps, device=device,
+                sampler=sampler, noise_removal=True,
+                cond_tokens=cond_tokens, tokens_per_step=0,
+                known_mask=known_mask if known_discrete_tokens is not None else None,
+                known_tokens=known_discrete_tokens,
+            )
+            if need_video:
+                sample_kwargs["return_history"] = True
+                tokens, history = model.sample(**sample_kwargs)
             else:
-                eval_imgs = images
-            final_grids = evaluator.eval_images(eval_imgs.to(device))["discrete"]
+                tokens = model.sample(**sample_kwargs)
+                history = None
 
-            vid_dir = os.path.join(task_dir, "videos")
-            os.makedirs(vid_dir, exist_ok=True)
-            n_vid = min(eval_video_samples, n_eval)
-            for vi in range(n_vid):
-                grid_vid_path = os.path.join(
-                    vid_dir,
-                    f"step_{step:07d}_sudoku_{level_name}_sample{vi}_grid.{eval_save_format}")
-                _render_sudoku_grid_video(
-                    history, final_grids,
-                    sample_idx=vi, save_path=grid_vid_path,
-                    max_frames=args.eval_num_steps, fps=8,
-                    grid_hw=args.grid_hw, hint_mask=known_mask,
-                    title=level_name)
-            accelerator.print(
-                f"[eval_cond/sudoku_image] step={step} [{level_name}] "
-                f"saved {n_vid} grid videos → {vid_dir}/")
+            # Decode tokens → images
+            images = decode_tokens_to_images(
+                tokens, level_sizes, pretrained_model, discretizer, device,
+                num_steps=args.decode_num_steps, batch_size=16)
 
-        # MNIST classify → grid → rule check
-        _log_sudoku_image_metrics(
-            images, evaluator, level_name, step, n_eval,
-            task_dir, accelerator, args, prefix="eval_cond")
+        # Decode + save + eval — only rank 0
+        if accelerator.is_main_process:
+            # Save image grid
+            img_path = os.path.join(
+                task_dir, f"step_{step:07d}_sudoku_{level_name}.png")
+            save_sample_grid(images, img_path, nrow=8)
+            hint_img_path = os.path.join(
+                task_dir, f"step_{step:07d}_sudoku_{level_name}_hints.png")
+            save_sample_grid_with_hints(
+                images, hint_img_path,
+                cond_digits=cond_digits, known_mask=known_mask,
+                grid_hw=args.grid_hw, nrow=8)
+
+            # Save denoising grid videos with hint highlighting
+            if need_video and history is not None:
+                if images.shape[1] == 3:
+                    eval_imgs = images.mean(dim=1, keepdim=True)
+                else:
+                    eval_imgs = images
+                final_grids = evaluator.eval_images(eval_imgs.to(device))["discrete"]
+
+                vid_dir = os.path.join(task_dir, "videos")
+                os.makedirs(vid_dir, exist_ok=True)
+                n_vid = min(eval_video_samples, n_eval)
+                for vi in range(n_vid):
+                    grid_vid_path = os.path.join(
+                        vid_dir,
+                        f"step_{step:07d}_sudoku_{level_name}_sample{vi}_grid.{eval_save_format}")
+                    _render_sudoku_grid_video(
+                        history, final_grids,
+                        sample_idx=vi, save_path=grid_vid_path,
+                        max_frames=args.eval_num_steps, fps=8,
+                        grid_hw=args.grid_hw, hint_mask=known_mask,
+                        title=level_name)
+                accelerator.print(
+                    f"[eval_cond/sudoku_image] step={step} [{level_name}] "
+                    f"saved {n_vid} grid videos → {vid_dir}/")
+
+            # MNIST classify → grid → rule check
+            _log_sudoku_image_metrics(
+                images, evaluator, level_name, step, n_eval,
+                task_dir, accelerator, args, prefix="eval_cond")
 
 
 def _log_sudoku_image_metrics(
@@ -2147,6 +2647,13 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
     # ── Define sampler configs ──
     if args.model_type == "ar":
         sampler_configs = [{"name": "ar", "sampler": "ar"}]
+    elif getattr(args, "factorized_head", False):
+        # Factorized head does not produce per-token confidence scores,
+        # so only use ddpm_cache sampler for eval.
+        sampler_configs = [
+            {"name": "ddpm_cache", "sampler": "ddpm_cache",
+             "tokens_per_step": 0},
+        ]
     else:
         sampler_configs = [
             {"name": "ddpm_cache", "sampler": "ddpm_cache",
@@ -2164,7 +2671,19 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                        and clevr_classifier is not None
                        and len(cond_jsons) > 0)
 
+    # Synchronize has_eval_models across all ranks to avoid collective mismatch.
+    # If any rank failed to load eval models, skip cond eval on ALL ranks.
+    if world_size > 1:
+        _flag = torch.tensor([1.0 if has_eval_models else 0.0], device=device)
+        torch.distributed.all_reduce(_flag, op=torch.distributed.ReduceOp.MIN)
+        has_eval_models = (_flag.item() > 0.5)
+        del _flag
+
     import time as _time
+
+    # Barrier: ensure all ranks enter eval together (training may desync slightly)
+    if world_size > 1:
+        torch.distributed.barrier()
 
     # Free training-related GPU cache before eval sampling
     torch.cuda.empty_cache()
@@ -2206,6 +2725,9 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
         # ── 2. Each rank decodes its shard to images ──
         my_images = None
         if can_decode and my_n > 0:
+            print(f"[eval/debug] rank={rank} [{tag}] decode start "
+                  f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB / "
+                  f"{torch.cuda.max_memory_allocated(device)/1e9:.2f}GB peak)", flush=True)
             try:
                 my_images = decode_tokens_to_images(
                     my_tokens, level_sizes, pretrained_model,
@@ -2214,8 +2736,9 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                     batch_size=min(4, my_n),
                 )  # (my_n, 3, H, W) in [0, 1]
             except Exception as e:
-                accelerator.print(
-                    f"[{log_prefix}/clevr] [{tag}] rank {rank} decode failed: {e}")
+                import traceback
+                print(f"[eval/debug] rank={rank} [{tag}] decode FAILED: {e}\n"
+                      f"{traceback.format_exc()}", flush=True)
             torch.cuda.empty_cache()
 
         torch.cuda.synchronize()
@@ -2306,7 +2829,10 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
             padded_img = torch.zeros(max_n, 3, img_size, img_size,
                                      device=device)
 
+        print(f"[eval/debug] rank={rank} [{tag}] entering gather "
+              f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB)", flush=True)
         all_padded_img = accelerator.gather(padded_img)
+        print(f"[eval/debug] rank={rank} [{tag}] gather done", flush=True)
         del padded_img
         torch.cuda.empty_cache()
         # shape: (world_size * max_n, 3, H, W) — move to CPU to save GPU mem
@@ -2508,6 +3034,38 @@ def parse_args():
     p.add_argument("--ar_head_dim", type=int, default=256)
     p.add_argument("--ar_head_layers", type=int, default=2)
 
+    # ── Diffusion head (MAR-style continuous tokens) ──
+    p.add_argument("--use_diffusion_head", action="store_true", default=False,
+                   help="Use diffusion head on continuous tokens (MAR-style). "
+                        "Encoder features are NOT discretized; instead, the "
+                        "backbone outputs hidden states that condition a small "
+                        "diffusion MLP to predict continuous token vectors.")
+    p.add_argument("--diff_head_depth", type=int, default=6,
+                   help="Number of ResBlocks in diffusion head MLP.")
+    p.add_argument("--diff_head_width", type=int, default=1024,
+                   help="Hidden dim of diffusion head MLP.")
+    p.add_argument("--diff_head_num_sampling_steps", type=int, default=100,
+                   help="Euler ODE steps for diffusion head sampling.")
+    p.add_argument("--diff_head_batch_mul", type=int, default=4,
+                   help="Batch multiplier for diffusion head loss (variance reduction).")
+    p.add_argument("--diff_head_cond_drop_prob", type=float, default=0.1,
+                   help="Prob of replacing backbone-z with learned null embedding "
+                        "during diff-head training (MAR/semanticist-style CFG).")
+    p.add_argument("--diff_head_cfg", type=float, default=1.0,
+                   help="Classifier-free guidance scale used when sampling from "
+                        "the diff head at eval time. 1.0 = no guidance.")
+    p.add_argument("--diff_head_temperature", type=float, default=1.0,
+                   help="Temperature for diffusion head sampling.")
+
+    # ── Sudoku conditioning mode ──
+    p.add_argument("--use_sudoku_prefix", action="store_true", default=False,
+                   help="Use digit-grid prefix (SudokuConditionEncoder). "
+                        "Default: no prefix. Condition is injected at "
+                        "inference by fixing known cells' image tokens.")
+    p.add_argument("--time_conditioning", action="store_true", default=False,
+                   help="Feed sigma/t into AdaLN (MDLM flag). Default False "
+                        "(MDLM paper: absorbing diffusion doesn't need it).")
+
     # ── model type ──
     p.add_argument("--model_type", type=str, default="diffusion",
                    choices=["diffusion", "ar"],
@@ -2540,6 +3098,11 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--warmup_steps", type=int, default=2000)
+    p.add_argument("--lr_schedule", type=str, default="constant",
+                   choices=["constant", "cosine"],
+                   help="LR schedule after warmup. 'cosine' decays to min_lr_ratio * lr.")
+    p.add_argument("--min_lr_ratio", type=float, default=0.1,
+                   help="Min LR as a fraction of base LR for cosine schedule.")
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--ema_decay", type=float, default=0.9999)
@@ -2606,6 +3169,8 @@ def main():
         mixed_precision=args.mixed_precision,
         log_with=args.log_with,
         project_config=project_config,
+        dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
+        rng_types=[],
     )
     accelerator.print("=" * 60)
     accelerator.print(f"Discrete Diffusion V2 — dataset={args.dataset_type}")
@@ -2631,6 +3196,7 @@ def main():
     pretrained_model = None
     data_vocab_size = 0
     seq_len = 0
+    cont_feat_dim = 0  # set when use_diffusion_head=True
 
     needs_pretrained = (
         args.dataset_type in ("imagenet", "clevr")
@@ -2812,38 +3378,79 @@ def main():
             val_grids = val_raw.sudoku_grids
 
             cache_dir = args.token_cache_dir or os.path.join(args.output_dir, "token_cache")
-            train_cache_path = os.path.join(cache_dir, "sudoku_train_tok.pt")
-            val_cache_path = os.path.join(cache_dir, "sudoku_val_tok.pt")
 
-            train_tok = cache_all_tokens(
-                encoder, discretizer, train_raw, accelerator.device,
-                batch_size=64, cache_path=train_cache_path, accelerator=accelerator)
-            val_tok = cache_all_tokens(
-                encoder, discretizer, val_raw, accelerator.device,
-                batch_size=64, cache_path=val_cache_path, accelerator=accelerator)
-            accelerator.wait_for_everyone()
+            if args.use_diffusion_head:
+                # ── Continuous mode: extract feature vectors (no discretizer) ──
+                train_cache_path = os.path.join(cache_dir, "sudoku_train_cont.pt")
+                val_cache_path = os.path.join(cache_dir, "sudoku_val_cont.pt")
 
-            # Convert grids to tensors if needed
-            if not isinstance(train_grids, torch.Tensor):
-                train_grids = torch.tensor(train_grids)
-            if not isinstance(val_grids, torch.Tensor):
-                val_grids = torch.tensor(val_grids)
+                train_feats = cache_all_continuous_tokens(
+                    encoder, train_raw, accelerator.device,
+                    batch_size=64, cache_path=train_cache_path,
+                    accelerator=accelerator)
+                val_feats = cache_all_continuous_tokens(
+                    encoder, val_raw, accelerator.device,
+                    batch_size=64, cache_path=val_cache_path,
+                    accelerator=accelerator)
+                accelerator.wait_for_everyone()
 
-            train_dataset = CachedTokenDataset(
-                train_tok, sudoku_digit_grids=train_grids)
-            val_dataset = CachedTokenDataset(
-                val_tok, sudoku_digit_grids=val_grids)
-            # Attach grids for eval
-            train_dataset.sudoku_grids = train_grids
-            val_dataset.sudoku_grids = val_grids
+                if not isinstance(train_grids, torch.Tensor):
+                    train_grids = torch.tensor(train_grids)
+                if not isinstance(val_grids, torch.Tensor):
+                    val_grids = torch.tensor(val_grids)
+
+                cont_feat_dim = train_feats.shape[-1]
+                seq_len = train_feats.shape[1]
+                accelerator.print(
+                    f"[sudoku-diffhead] Continuous tokens: seq_len={seq_len}, "
+                    f"feat_dim={cont_feat_dim}, shape={train_feats.shape}")
+
+                train_dataset = CachedContinuousTokenDataset(
+                    train_feats, sudoku_digit_grids=train_grids)
+                val_dataset = CachedContinuousTokenDataset(
+                    val_feats, sudoku_digit_grids=val_grids)
+                train_dataset.sudoku_grids = train_grids
+                val_dataset.sudoku_grids = val_grids
+
+            else:
+                # ── Discrete mode: extract token IDs via discretizer ──
+                train_cache_path = os.path.join(cache_dir, "sudoku_train_tok.pt")
+                val_cache_path = os.path.join(cache_dir, "sudoku_val_tok.pt")
+
+                train_tok = cache_all_tokens(
+                    encoder, discretizer, train_raw, accelerator.device,
+                    batch_size=64, cache_path=train_cache_path, accelerator=accelerator)
+                val_tok = cache_all_tokens(
+                    encoder, discretizer, val_raw, accelerator.device,
+                    batch_size=64, cache_path=val_cache_path, accelerator=accelerator)
+                accelerator.wait_for_everyone()
+
+                if not isinstance(train_grids, torch.Tensor):
+                    train_grids = torch.tensor(train_grids)
+                if not isinstance(val_grids, torch.Tensor):
+                    val_grids = torch.tensor(val_grids)
+
+                train_dataset = CachedTokenDataset(
+                    train_tok, sudoku_digit_grids=train_grids)
+                val_dataset = CachedTokenDataset(
+                    val_tok, sudoku_digit_grids=val_grids)
+                train_dataset.sudoku_grids = train_grids
+                val_dataset.sudoku_grids = val_grids
 
             # Sudoku condition encoder (digit grid → prefix embeddings)
             # Reuse clevr_cond_encoder variable (only one dataset type active)
-            clevr_cond_encoder = SudokuConditionEncoder(args.hidden_size)
-            accelerator.print(
-                f"[sudoku] Condition encoder: digit grid (81) → "
-                f"prefix embeddings, mask_ratio=[{args.mask_ratio_min}, "
-                f"{args.mask_ratio_max}]")
+            if args.use_sudoku_prefix:
+                clevr_cond_encoder = SudokuConditionEncoder(args.hidden_size)
+                accelerator.print(
+                    f"[sudoku] Condition encoder: digit grid (81) → "
+                    f"prefix embeddings, mask_ratio=[{args.mask_ratio_min}, "
+                    f"{args.mask_ratio_max}]")
+            else:
+                clevr_cond_encoder = None
+                accelerator.print(
+                    "[sudoku] No prefix condition encoder. "
+                    "Training = standard MDLM on 81 image tokens. "
+                    "Inference conditioning via fixed known image tokens.")
 
     accelerator.print(f"[data] Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
@@ -2894,6 +3501,15 @@ def main():
         ar_head_layers=args.ar_head_layers,
     )
 
+    # ── Continuous mode with diffusion head ──
+    if args.use_diffusion_head:
+        dit_kwargs["continuous_mode"] = True
+        dit_kwargs["continuous_dim"] = cont_feat_dim
+        # Override: no discrete vocab needed
+        dit_kwargs["vocab_size"] = 1  # placeholder, unused in continuous mode
+        dit_kwargs["factorized_head"] = False
+        dit_kwargs["fsq_levels"] = None
+
     if args.dataset_type == "sudoku" and args.grid_only:
         dit_kwargs["pos_emb_type"] = args.pos_emb_type if args.pos_emb_type != "multires" else "2d"
         dit_kwargs["sudoku_hw"] = args.grid_hw
@@ -2913,7 +3529,7 @@ def main():
     backbone = DIT(**dit_kwargs)
 
     # ── optionally initialize token_emb from FSQ codebook ──
-    if args.init_embed_from_fsq and discretizer is not None:
+    if args.init_embed_from_fsq and discretizer is not None and not args.use_diffusion_head:
         all_ids = torch.arange(data_vocab_size, device="cpu")
         with torch.no_grad():
             codebook_vecs = discretizer.decode(all_ids.unsqueeze(0)).squeeze(0)  # (V, slot_dim)
@@ -2927,6 +3543,27 @@ def main():
         accelerator.print(
             f"[init] token_emb[:{data_vocab_size}] from FSQ codebook "
             f"({slot_dim}→{hidden}), mask token [{data_vocab_size}] left random")
+
+    # ── Build diffusion head (MAR-style) ──
+    diff_head = None
+    if args.use_diffusion_head:
+        from diffloss import DiffLoss
+        diff_head = DiffLoss(
+            target_channels=cont_feat_dim,
+            z_channels=args.hidden_size,
+            depth=args.diff_head_depth,
+            width=args.diff_head_width,
+            num_sampling_steps=args.diff_head_num_sampling_steps,
+            cond_drop_prob=args.diff_head_cond_drop_prob,
+        )
+        dh_total, dh_train = count_params(diff_head)
+        accelerator.print(
+            f"[diffusion-head] DiffLoss: target_dim={cont_feat_dim}, "
+            f"z_dim={args.hidden_size}, depth={args.diff_head_depth}, "
+            f"width={args.diff_head_width}, "
+            f"sampling_steps={args.diff_head_num_sampling_steps}, "
+            f"batch_mul={args.diff_head_batch_mul}, "
+            f"params={format_n(dh_total)}")
 
     if is_ar:
         diffusion = AutoregressiveModel(
@@ -2947,11 +3584,21 @@ def main():
             importance_sampling=args.importance_sampling,
             change_of_variables=args.change_of_variables,
             sampling_eps=args.sampling_eps,
+            diff_head=diff_head,
+            diffusion_batch_mul=args.diff_head_batch_mul,
+            time_conditioning=args.time_conditioning,
         )
-        accelerator.print(
-            f"[model] Diffusion: hidden={args.hidden_size}, heads={args.n_heads}, "
-            f"blocks={args.n_blocks}, seq_len={seq_len}, "
-            f"data_vocab={data_vocab_size}, mask_idx={diffusion.mask_index}")
+        if args.use_diffusion_head:
+            accelerator.print(
+                f"[model] Diffusion + DiffHead (continuous): "
+                f"hidden={args.hidden_size}, heads={args.n_heads}, "
+                f"blocks={args.n_blocks}, seq_len={seq_len}, "
+                f"feat_dim={cont_feat_dim}")
+        else:
+            accelerator.print(
+                f"[model] Diffusion: hidden={args.hidden_size}, heads={args.n_heads}, "
+                f"blocks={args.n_blocks}, seq_len={seq_len}, "
+                f"data_vocab={data_vocab_size}, mask_idx={diffusion.mask_index}")
 
     total_p, train_p = count_params(diffusion)
     accelerator.print(
@@ -2967,7 +3614,10 @@ def main():
     optimizer = torch.optim.AdamW(
         all_params, lr=args.lr, betas=(0.9, 0.999),
         eps=1e-8, weight_decay=args.weight_decay)
-    lr_scheduler = get_lr_scheduler(optimizer, args.warmup_steps, args.max_train_steps)
+    lr_scheduler = get_lr_scheduler(
+        optimizer, args.warmup_steps, args.max_train_steps,
+        schedule=args.lr_schedule, min_lr_ratio=args.min_lr_ratio,
+    )
 
     # Prepare
     prepare_list = [diffusion, optimizer, train_loader, lr_scheduler]
@@ -3027,16 +3677,41 @@ def main():
         clevr_cond_encoder.train()
     running_loss = 0.0
 
+    _epoch = 0
+    _batches_in_epoch = len(train_loader)
+    _usable = (_batches_in_epoch // args.grad_accum_steps) * args.grad_accum_steps
+    _skipped = _batches_in_epoch - _usable
+    if _skipped > 0:
+        accelerator.print(
+            f"[train] batches/epoch={_batches_in_epoch}, grad_accum={args.grad_accum_steps} "
+            f"→ usable={_usable}, SKIPPING last {_skipped} batches per epoch")
+
     while global_step < args.max_train_steps:
+        # Ensure DistributedSampler uses a different shuffle per epoch
+        if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(_epoch)
+        _epoch += 1
+
+        _batch_idx = 0
         for batch in train_loader:
             if global_step >= args.max_train_steps:
                 break
 
+            # Skip incomplete accumulation batches at end-of-epoch to keep
+            # all ranks synchronised on the same global_step.
+            _batch_idx += 1
+            if _batch_idx > _usable:
+                continue
+
             # ── Prepare batch ──
             class_labels = None
             cond_tokens = None
+            cont_tokens = None  # for diffusion head mode
 
-            if args.dataset_type == "sudoku" and args.grid_only:
+            if args.use_diffusion_head:
+                cont_tokens = batch["cont_tokens"].to(accelerator.device)
+                tokens = None  # not used in continuous mode
+            elif args.dataset_type == "sudoku" and args.grid_only:
                 grid = batch["grid"].to(accelerator.device).long()
                 tokens = grid.view(grid.shape[0], -1) - 1  # (B, 81) in [0, 8]
             else:
@@ -3051,8 +3726,9 @@ def main():
                     class_labels = torch.where(
                         drop_mask, args.num_classes, class_labels)  # num_classes = null index
 
-            elif args.dataset_type == "sudoku" and not args.grid_only:
-                # Sudoku image mode: digit grid → condition prefix
+            elif args.dataset_type == "sudoku" and not args.grid_only \
+                    and args.use_sudoku_prefix:
+                # Sudoku image mode (legacy): digit grid → condition prefix
                 cond_ids = batch["cond_token_ids"].to(accelerator.device)  # (B, 81) in [0, 8]
                 B_cond = cond_ids.shape[0]
 
@@ -3070,8 +3746,9 @@ def main():
                 cond_tokens = cond_enc(cond_ids)
 
                 # CFG dropout: zero out all cond tokens
+                B_for_drop = cont_tokens.shape[0] if cont_tokens is not None else tokens.shape[0]
                 if args.uncond_drop_prob > 0 and diffusion.training:
-                    drop_mask = (torch.rand(tokens.shape[0],
+                    drop_mask = (torch.rand(B_for_drop,
                                             device=accelerator.device) < args.uncond_drop_prob)
                     cond_tokens = cond_tokens * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
 
@@ -3085,15 +3762,20 @@ def main():
                 cond_tokens = cond_enc(cond_ids)
 
                 # CFG dropout: zero out all cond tokens
+                B_for_drop = cont_tokens.shape[0] if cont_tokens is not None else tokens.shape[0]
                 if args.uncond_drop_prob > 0 and diffusion.training:
-                    drop_mask = (torch.rand(tokens.shape[0],
+                    drop_mask = (torch.rand(B_for_drop,
                                             device=accelerator.device) < args.uncond_drop_prob)
                     cond_tokens = cond_tokens * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
 
             # ── Forward + backward ──
             with accelerator.accumulate(diffusion):
-                loss_out = accelerator.unwrap_model(diffusion).compute_loss(
-                    tokens, cond_tokens=cond_tokens, class_labels=class_labels)
+                if args.use_diffusion_head:
+                    loss_out = accelerator.unwrap_model(diffusion).compute_loss_continuous(
+                        cont_tokens, cond_tokens=cond_tokens, class_labels=class_labels)
+                else:
+                    loss_out = accelerator.unwrap_model(diffusion).compute_loss(
+                        tokens, cond_tokens=cond_tokens, class_labels=class_labels)
                 loss = loss_out.loss
 
                 accelerator.backward(loss)
@@ -3129,6 +3811,15 @@ def main():
 
             # ── Eval ──
             if global_step % args.eval_every == 0:
+                # Verify all ranks agree on global_step before collective eval
+                if accelerator.num_processes > 1:
+                    _gs = torch.tensor([global_step], dtype=torch.long,
+                                       device=accelerator.device)
+                    _gs_all = accelerator.gather(_gs)
+                    if not (_gs_all == global_step).all():
+                        print(f"[FATAL] rank={accelerator.process_index} "
+                              f"step desync detected: {_gs_all.tolist()}",
+                              flush=True)
                 evaluate_and_save(
                     diffusion, global_step, args, accelerator, ema,
                     pretrained_model=pretrained_model,

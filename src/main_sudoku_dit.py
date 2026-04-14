@@ -553,109 +553,113 @@ def run_sudoku_eval(model, eval_dataset, noise_scheduler, args, accelerator,
     # ============================================================
     # Token-to-Digit mapping analysis + digit grid visualization
     # ============================================================
-    if eval_model.discretizer is not None and ref_grids is not None:
+    if ref_grids is not None:
         pred_9 = s_eval["discrete"].to(device).long()   # (B, 9, 9) from classifier
         gt_9 = ref_grids.to(device).long()               # (B, 9, 9) ground truth
         B = gt_9.shape[0]
+        wrong_mask_pred = (pred_9 != gt_9)  # (B, 9, 9)
 
-        # Extract token IDs from encoder + discretizer
-        level_features = eval_model.encoder.forward_injection(ref_images)
-        # Get token IDs for the 9x9 level (should be the main/only level)
+        # --- Token-to-Digit analysis (FSQ / VQ only) ---
         tok_ids_2d = None
-        for s, feat_2d in level_features.items():
-            D = feat_2d.shape[1]
-            tokens_flat = feat_2d.flatten(2).transpose(1, 2)  # (B, S*S, D)
-            _, t_ids = eval_model.discretizer(tokens_flat)     # (B, S*S)
-            if s == 9:  # 9x9 sudoku level
-                tok_ids_2d = t_ids.view(B, 9, 9).long()
-                break
+        pred_from_tok = None
+        if eval_model.discretizer is not None:
+            # Extract token IDs from encoder + discretizer
+            level_features = eval_model.encoder.forward_injection(ref_images)
+            for s, feat_2d in level_features.items():
+                D = feat_2d.shape[1]
+                tokens_flat = feat_2d.flatten(2).transpose(1, 2)  # (B, S*S, D)
+                _, t_ids = eval_model.discretizer(tokens_flat)     # (B, S*S)
+                if s == 9:  # 9x9 sudoku level
+                    tok_ids_2d = t_ids.view(B, 9, 9).long()
+                    break
 
-        if tok_ids_2d is not None:
-            # 1) GT vs pred mismatch mask (빨간 테두리용)
-            wrong_mask_pred = (pred_9 != gt_9)  # (B, 9, 9)
+            if tok_ids_2d is not None:
+                # tok_id -> digit 통계 매핑 (batch 전체)
+                vocab = int(tok_ids_2d.max().item()) + 1
+                tid_flat = tok_ids_2d.reshape(-1)
+                gt_flat = gt_9.reshape(-1).clamp(0, 9)
 
-            # 2) tok_id -> digit 통계 매핑 (batch 전체)
-            vocab = int(tok_ids_2d.max().item()) + 1
-            tid_flat = tok_ids_2d.reshape(-1)
-            gt_flat = gt_9.reshape(-1).clamp(0, 9)
+                idx = (tid_flat * 10 + gt_flat).to(torch.long)
+                counts = torch.bincount(idx, minlength=vocab * 10).view(vocab, 10)
 
-            idx = (tid_flat * 10 + gt_flat).to(torch.long)
-            counts = torch.bincount(idx, minlength=vocab * 10).view(vocab, 10)
+                tok2digit = counts.argmax(dim=1)
+                tok_conf = counts.max(dim=1).values.float() / (counts.sum(dim=1).float() + 1e-9)
 
-            tok2digit = counts.argmax(dim=1)
-            tok_conf = counts.max(dim=1).values.float() / (counts.sum(dim=1).float() + 1e-9)
+                pred_from_tok = tok2digit[tok_ids_2d]  # (B, 9, 9)
 
-            # 3) tok_id grid -> digit grid
-            pred_from_tok = tok2digit[tok_ids_2d]  # (B, 9, 9)
+                # Accuracy metrics
+                wrong_tok_vs_gt = (pred_from_tok != gt_9)
+                acc_tok_vs_gt = (~wrong_tok_vs_gt).float().mean().item()
+                wrong_tok_vs_pred = (pred_from_tok != pred_9)
+                acc_tok_vs_pred = (~wrong_tok_vs_pred).float().mean().item()
 
-            # 4) Accuracy metrics
-            wrong_tok_vs_gt = (pred_from_tok != gt_9)
-            acc_tok_vs_gt = (~wrong_tok_vs_gt).float().mean().item()
-            wrong_tok_vs_pred = (pred_from_tok != pred_9)
-            acc_tok_vs_pred = (~wrong_tok_vs_pred).float().mean().item()
+                accelerator.print(
+                    f"[Eval][Tok2Digit] vocab={vocab} "
+                    f"acc(tok->digit vs GT)={acc_tok_vs_gt:.4f} "
+                    f"acc(tok->digit vs PRED)={acc_tok_vs_pred:.4f}"
+                )
 
-            accelerator.print(
-                f"[Eval][Tok2Digit] vocab={vocab} "
-                f"acc(tok->digit vs GT)={acc_tok_vs_gt:.4f} "
-                f"acc(tok->digit vs PRED)={acc_tok_vs_pred:.4f}"
-            )
+                log_dict[f"{prefix}/tok2digit_acc_vs_gt"] = acc_tok_vs_gt
+                log_dict[f"{prefix}/tok2digit_acc_vs_pred"] = acc_tok_vs_pred
 
-            log_dict[f"{prefix}/tok2digit_acc_vs_gt"] = acc_tok_vs_gt
-            log_dict[f"{prefix}/tok2digit_acc_vs_pred"] = acc_tok_vs_pred
+        # --- Confusion matrix (always: GT vs PRED; optionally: GT vs TOK2DIG) ---
+        def confusion_10x10(gt_grid, pr_grid):
+            g = gt_grid.reshape(-1).clamp(0, 9).to(torch.long)
+            p = pr_grid.reshape(-1).clamp(0, 9).to(torch.long)
+            return torch.bincount(g * 10 + p, minlength=100).view(10, 10)
 
-            # 5) Confusion matrix (GT vs PRED, GT vs TOK2DIG)
-            def confusion_10x10(gt_grid, pr_grid):
-                g = gt_grid.reshape(-1).clamp(0, 9).to(torch.long)
-                p = pr_grid.reshape(-1).clamp(0, 9).to(torch.long)
-                return torch.bincount(g * 10 + p, minlength=100).view(10, 10)
+        def print_full_confusion(cm, name):
+            accelerator.print(f"[Eval][ConfusionFull] {name} (rows=GT, cols=Pred)")
+            for gt_d in range(10):
+                row = cm[gt_d]
+                total = int(row.sum().item())
+                if total == 0:
+                    continue
+                parts = [f"{pr_d}:{int(row[pr_d].item())}"
+                         for pr_d in range(10) if int(row[pr_d].item()) > 0]
+                accelerator.print(f"  GT {gt_d} (n={total}) -> " + ", ".join(parts))
 
-            cm_pred = confusion_10x10(gt_9, pred_9)
+        cm_pred = confusion_10x10(gt_9, pred_9)
+        print_full_confusion(cm_pred, "GT->PRED")
+
+        if pred_from_tok is not None:
             cm_tok = confusion_10x10(gt_9, pred_from_tok)
-
-            def print_full_confusion(cm, name):
-                accelerator.print(f"[Eval][ConfusionFull] {name} (rows=GT, cols=Pred)")
-                for gt_d in range(10):
-                    row = cm[gt_d]
-                    total = int(row.sum().item())
-                    if total == 0:
-                        continue
-                    parts = [f"{pr_d}:{int(row[pr_d].item())}"
-                             for pr_d in range(10) if int(row[pr_d].item()) > 0]
-                    accelerator.print(f"  GT {gt_d} (n={total}) -> " + ", ".join(parts))
-
-            print_full_confusion(cm_pred, "GT->PRED")
             print_full_confusion(cm_tok, "GT->TOK2DIG")
 
-            # 6) Digit grid rendering (PIL) — GT / TOK2DIG / PRED
-            wrong_mask_tok = (pred_from_tok != gt_9)
-            gt_imgs, tok_imgs, pred_imgs = [], [], []
+        # --- Digit grid rendering (PIL) — GT / PRED (+ TOK2DIG if available) ---
+        wrong_mask_tok = (pred_from_tok != gt_9) if pred_from_tok is not None else wrong_mask_pred
+        gt_imgs, pred_imgs = [], []
+        tok_imgs = [] if pred_from_tok is not None else None
 
-            n_viz = min(B, 16)
-            for i in range(n_viz):
-                wm_red = wrong_mask_pred[i]
-                wm_pink = wrong_mask_tok[i]
+        n_viz = min(B, 16)
+        for i in range(n_viz):
+            wm_red = wrong_mask_pred[i]
+            wm_pink = wrong_mask_tok[i]
 
-                gt_imgs.append(render_digit_grid(
-                    gt_9[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
+            gt_imgs.append(render_digit_grid(
+                gt_9[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
+            pred_imgs.append(render_digit_grid(
+                pred_9[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
+            if tok_imgs is not None:
                 tok_imgs.append(render_digit_grid(
                     pred_from_tok[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
-                pred_imgs.append(render_digit_grid(
-                    pred_9[i], wrong_mask_9x9=wm_red, bg_mask_9x9=wm_pink))
 
-            nrow = min(n_viz, 9)
-            gt_canvas = tile_images(gt_imgs, nrow=nrow)
+        nrow = min(n_viz, 9)
+        gt_canvas = tile_images(gt_imgs, nrow=nrow)
+        pr_canvas = tile_images(pred_imgs, nrow=nrow)
+
+        viz_dir = os.path.join(save_dir, "grid_digits")
+        os.makedirs(viz_dir, exist_ok=True)
+
+        gt_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_GT.png"))
+        pr_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_PRED.png"))
+
+        if tok_imgs is not None:
             tok_canvas = tile_images(tok_imgs, nrow=nrow)
-            pr_canvas = tile_images(pred_imgs, nrow=nrow)
-
-            viz_dir = os.path.join(save_dir, "grid_digits")
-            os.makedirs(viz_dir, exist_ok=True)
-
-            gt_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_GT.png"))
             tok_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_TOK2DIG.png"))
-            pr_canvas.save(os.path.join(viz_dir, f"step_{global_step:07d}{tag_suffix}_PRED.png"))
 
-            accelerator.print(
-                f"[Eval] Saved digit grids to {viz_dir}/step_{global_step:07d}_*.png")
+        accelerator.print(
+            f"[Eval] Saved digit grids to {viz_dir}/step_{global_step:07d}_*.png")
 
     accelerator.log(log_dict, step=global_step)
 

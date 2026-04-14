@@ -79,7 +79,7 @@ accelerate launch \
     --guidance_scale 3.0 \
     --log_every 100 \
     --save_every 10000 \
-    --eval_every 5000 \
+    --eval_every 1500 \
     --eval_num_steps 50 \
     --eval_num_samples 81 \
     --num_workers 4 \

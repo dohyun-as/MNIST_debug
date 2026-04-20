@@ -268,6 +268,28 @@ SUDOKU_COND_VOCAB_SIZE = 11   # 0-8 + [MASK]=9 + [PAD]=10
 SUDOKU_PAD_ID = 10
 
 
+class SudokuDigitCellEncoder(nn.Module):
+    """Per-cell digit condition for AdaLN-style injection.
+
+    (B, 81) digit ids in {0..8 = digits 1..9, 9=UNKNOWN, 10=PAD}
+    → (B, 81, hidden_size) residual embedding added to token features.
+    """
+
+    def __init__(self, hidden_size: int, grid_len: int = SUDOKU_GRID_LEN):
+        super().__init__()
+        # 11-way embedding: digits 0..8, UNKNOWN=9, PAD=10
+        self.digit_emb = nn.Embedding(SUDOKU_COND_VOCAB_SIZE, hidden_size)
+        nn.init.trunc_normal_(self.digit_emb.weight, std=0.02)
+        self.pos_emb = nn.Parameter(torch.zeros(1, grid_len, hidden_size))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+        self.grid_len = grid_len
+
+    def forward(self, digit_ids: torch.Tensor) -> torch.Tensor:
+        B, L = digit_ids.shape
+        h = self.digit_emb(digit_ids) + self.pos_emb[:, :L, :]
+        return h
+
+
 class SudokuConditionEncoder(nn.Module):
     """Embeds a (possibly masked) 9×9 digit grid → prefix context vectors.
 
@@ -734,7 +756,18 @@ def cache_all_continuous_tokens(encoder, dataset, device,
                                 batch_size=64, cache_path=None,
                                 accelerator=None):
     """Extract and cache continuous feature vectors for an entire dataset."""
-    if cache_path is not None and os.path.isfile(cache_path):
+    # Synchronize the "cache exists" decision across all ranks.
+    # (Filesystem visibility can differ between ranks on NFS, causing
+    # some to load and others to enter the distributed caching path → NCCL hang.)
+    has_cache_local = cache_path is not None and os.path.isfile(cache_path)
+    if accelerator is not None and accelerator.num_processes > 1:
+        import torch.distributed as dist
+        has_t = torch.tensor(int(has_cache_local), device=device)
+        dist.broadcast(has_t, src=0)
+        has_cache = bool(has_t.item())
+    else:
+        has_cache = has_cache_local
+    if has_cache:
         feats = torch.load(cache_path, map_location="cpu", weights_only=True)
         if accelerator:
             accelerator.print(f"[cache] Loaded from {cache_path}, shape={feats.shape}")
@@ -816,7 +849,15 @@ def cache_all_tokens(encoder, discretizer, dataset, device,
     Each rank processes a shard of the dataset in parallel, then rank 0
     gathers and saves the full cache.  All ranks return the complete tensor.
     """
-    if cache_path is not None and os.path.isfile(cache_path):
+    has_cache_local = cache_path is not None and os.path.isfile(cache_path)
+    if accelerator is not None and accelerator.num_processes > 1:
+        import torch.distributed as dist
+        has_t = torch.tensor(int(has_cache_local), device=device)
+        dist.broadcast(has_t, src=0)
+        has_cache = bool(has_t.item())
+    else:
+        has_cache = has_cache_local
+    if has_cache:
         tok_ids = torch.load(cache_path, map_location="cpu", weights_only=True)
         if accelerator:
             accelerator.print(f"[cache] Loaded from {cache_path}, shape={tok_ids.shape}")
@@ -1632,6 +1673,7 @@ def evaluate_and_save(
     clevr_cond_encoder=None, val_dataset=None,
     clevr_detector=None, clevr_classifier=None,
     train_dataset=None,
+    sudoku_cell_cond_encoder=None,
 ):
     """All ranks participate in eval (distributed sampling + decode).
     Only rank 0 does condition eval and saves files."""
@@ -1677,10 +1719,15 @@ def evaluate_and_save(
         cond_enc = clevr_cond_encoder
         if cond_enc is not None and hasattr(cond_enc, 'module'):
             cond_enc = cond_enc.module
+        cc_enc = sudoku_cell_cond_encoder
+        if cc_enc is not None and hasattr(cc_enc, 'module'):
+            cc_enc = cc_enc.module
         _eval_sudoku_image(model, step, args, accelerator, save_dir,
                            pretrained_model, discretizer, level_sizes,
                            val_dataset=val_dataset,
-                           sudoku_cond_encoder=cond_enc)
+                           sudoku_cond_encoder=cond_enc,
+                           train_dataset=train_dataset,
+                           sudoku_cell_cond_encoder=cc_enc)
     elif args.dataset_type == "imagenet":
         if accelerator.is_main_process:
             _eval_imagenet(model, step, args, accelerator, save_dir,
@@ -1810,13 +1857,18 @@ def _find_error_cells(grid, grid_hw=9):
 
 def _render_sudoku_grid_frame(draw, grid, grid_hw, cell_size, font,
                                mask_positions=None, error_cells=None,
-                               hint_cells=None):
+                               hint_cells=None, hint_mismatch_cells=None,
+                               hint_gt_digits=None):
     """Draw a single sudoku grid frame.
 
     Args:
         mask_positions: (L,) bool tensor — True = still masked
         error_cells:    set of (r,c) — cells that violate rules (final frame only)
-        hint_cells:     set of (r,c) — cells given as hints (blue background)
+        hint_cells:     set of (r,c) — cells given as hints (green background)
+        hint_mismatch_cells: set of (r,c) — hints whose model/classifier output
+                             doesn't match the given digit (red-tinted hint)
+        hint_gt_digits: dict {(r,c) -> int given_digit}, for rendering expected
+                        value at mismatch cells.
     """
     for r in range(grid_hw):
         for c in range(grid_hw):
@@ -1829,13 +1881,31 @@ def _render_sudoku_grid_frame(draw, grid, grid_hw, cell_size, font,
                          and mask_positions[cell_idx].item())
             is_error = (error_cells is not None and (r, c) in error_cells)
             is_hint = (hint_cells is not None and (r, c) in hint_cells)
+            is_hint_mismatch = (hint_mismatch_cells is not None
+                                and (r, c) in hint_mismatch_cells)
 
-            if is_masked and is_hint:
-                # Hint cell not yet denoised — light blue
+            if is_hint_mismatch:
+                # Hint given but model/classifier output disagrees — red-tint hint.
                 draw.rectangle([x0, y0, x0 + cell_size, y0 + cell_size],
-                               fill=(200, 220, 255))
-                txt = "\u00b7"
-                txt_color = (0, 0, 150)
+                               fill=(255, 210, 210))
+                txt = str(int(grid[r, c]))
+                txt_color = (200, 0, 0)
+                # Small superscript showing the expected hint digit
+                if hint_gt_digits is not None and (r, c) in hint_gt_digits:
+                    exp_d = int(hint_gt_digits[(r, c)])
+                    try:
+                        sm_font = font.font_variant(size=max(12, cell_size // 4))
+                    except Exception:
+                        sm_font = font
+                    draw.text((x0 + 2, y0 + 2), f"({exp_d})",
+                              fill=(120, 0, 0), font=sm_font)
+            elif is_hint:
+                # Hint cell — green background throughout (always shown,
+                # regardless of mask state, since hints are clean from t=0).
+                draw.rectangle([x0, y0, x0 + cell_size, y0 + cell_size],
+                               fill=(200, 240, 200))
+                txt = str(int(grid[r, c]))
+                txt_color = (0, 110, 0)
             elif is_masked:
                 draw.rectangle([x0, y0, x0 + cell_size, y0 + cell_size],
                                fill=(200, 200, 200))
@@ -1846,12 +1916,6 @@ def _render_sudoku_grid_frame(draw, grid, grid_hw, cell_size, font,
                                fill=(255, 220, 220))
                 txt = str(int(grid[r, c]))
                 txt_color = (200, 0, 0)
-            elif is_hint:
-                # Hint cell denoised — light blue background
-                draw.rectangle([x0, y0, x0 + cell_size, y0 + cell_size],
-                               fill=(220, 235, 255))
-                txt = str(int(grid[r, c]))
-                txt_color = (0, 0, 150)
             else:
                 txt = str(int(grid[r, c]))
                 txt_color = (0, 0, 0)
@@ -1873,6 +1937,7 @@ def _render_sudoku_grid_frame(draw, grid, grid_hw, cell_size, font,
 def _render_sudoku_grid_video(
     history, final_grid, sample_idx=0, save_path="video_grid.mp4",
     max_frames=32, fps=8, grid_hw=9, hint_mask=None, title=None,
+    hint_gt_digits=None,
 ):
     """Render video of 9x9 digit grid being filled during denoising.
 
@@ -1910,12 +1975,26 @@ def _render_sudoku_grid_video(
 
     # Build hint_cells set for this sample
     hint_cells = None
+    hint_mismatch_cells = None
+    hint_gt_map = None
     if hint_mask is not None:
         hm = hint_mask[sample_idx].cpu()  # (81,)
         hint_cells = set()
         for ci in range(min(hm.numel(), grid_hw * grid_hw)):
             if hm[ci].item():
                 hint_cells.add((ci // grid_hw, ci % grid_hw))
+
+        # Compare given hint digits with classified final_grid → mismatches
+        if hint_gt_digits is not None:
+            gt = hint_gt_digits[sample_idx].cpu()  # (81,) long in [1..9]
+            hint_mismatch_cells = set()
+            hint_gt_map = {}
+            for (r, c) in hint_cells:
+                ci = r * grid_hw + c
+                exp_d = int(gt[ci].item())
+                hint_gt_map[(r, c)] = exp_d
+                if int(grid[r, c]) != exp_d:
+                    hint_mismatch_cells.add((r, c))
 
     cell_size = 48
     img_w = grid_hw * cell_size
@@ -1961,7 +2040,9 @@ def _render_sudoku_grid_video(
             grid_draw, grid, grid_hw, cell_size, font,
             mask_positions=mask_positions,
             error_cells=error_cells if is_final else None,
-            hint_cells=hint_cells)
+            hint_cells=hint_cells,
+            hint_mismatch_cells=hint_mismatch_cells,
+            hint_gt_digits=hint_gt_map)
 
         frame.paste(grid_frame, (0, title_h))
 
@@ -2013,7 +2094,9 @@ def _render_sudoku_grid_video(
 
 def _eval_sudoku_image(model, step, args, accelerator, save_dir,
                        pretrained_model, discretizer, level_sizes,
-                       val_dataset=None, sudoku_cond_encoder=None):
+                       val_dataset=None, sudoku_cond_encoder=None,
+                       train_dataset=None,
+                       sudoku_cell_cond_encoder=None):
     """Sudoku image eval with digit-grid conditioning (like CLEVR prefix).
 
     1) Unconditional generation (all-MASK condition) with 3 samplers
@@ -2179,10 +2262,35 @@ def _eval_sudoku_image(model, step, args, accelerator, save_dir,
                            or hasattr(val_dataset, 'features')
                            or hasattr(val_dataset, 'tok_ids')))
     if has_val_tokens and args.model_type != "ar":
+        accelerator.print(
+            f"\n========== [eval_cond] split=VAL  step={step}  "
+            f"save_dir={save_dir} ==========")
         _eval_sudoku_image_difficulty(
             model, step, args, accelerator, save_dir,
             pretrained_model, discretizer, level_sizes,
-            val_dataset, evaluator, sudoku_cond_encoder)
+            val_dataset, evaluator, sudoku_cond_encoder,
+            log_prefix="eval_cond", split_tag="val",
+            sudoku_cell_cond_encoder=sudoku_cell_cond_encoder)
+
+    has_train_tokens = (train_dataset is not None
+                        and hasattr(train_dataset, 'sudoku_grids')
+                        and (has_prefix
+                             or hasattr(train_dataset, 'features')
+                             or hasattr(train_dataset, 'tok_ids')))
+    if has_train_tokens and args.model_type != "ar":
+        train_save_dir = os.path.join(
+            os.path.dirname(save_dir), "eval_train_samples")
+        if accelerator.is_main_process:
+            os.makedirs(train_save_dir, exist_ok=True)
+        accelerator.print(
+            f"\n========== [eval_cond_train] split=TRAIN  step={step}  "
+            f"save_dir={train_save_dir} ==========")
+        _eval_sudoku_image_difficulty(
+            model, step, args, accelerator, train_save_dir,
+            pretrained_model, discretizer, level_sizes,
+            train_dataset, evaluator, sudoku_cond_encoder,
+            log_prefix="eval_cond_train", split_tag="train",
+            sudoku_cell_cond_encoder=sudoku_cell_cond_encoder)
 
 
 # Difficulty levels matching train_AR_cond.sh
@@ -2197,6 +2305,8 @@ def _eval_sudoku_image_difficulty(
     model, step, args, accelerator, save_dir,
     pretrained_model, discretizer, level_sizes,
     val_dataset, evaluator, sudoku_cond_encoder,
+    log_prefix="eval_cond", split_tag="val",
+    sudoku_cell_cond_encoder=None,
 ):
     """Conditioned generation eval with easy/medium/hard difficulty.
 
@@ -2221,6 +2331,8 @@ def _eval_sudoku_image_difficulty(
     n_eval = min(len(val_dataset), args.eval_num_samples, 64)
 
     use_prefix_cond = (sudoku_cond_encoder is not None)
+    use_cell_cond = (getattr(args, 'use_sudoku_cell_cond', False)
+                     and sudoku_cell_cond_encoder is not None)
 
     # Gather GT digit grids from val set
     grids = val_dataset.sudoku_grids[:n_eval]  # (n_eval, 9, 9)
@@ -2228,10 +2340,11 @@ def _eval_sudoku_image_difficulty(
         grids = torch.tensor(grids)
     x_gt = grids.reshape(n_eval, -1).long().to(device) - 1  # (n_eval, 81) in [0, 8]
 
-    # Gather val image tokens (continuous feats or discrete ids) for inpainting
+    # Gather val image tokens (continuous feats or discrete ids) for inpainting.
+    # When using cell_cond, we do NOT inpaint — all cells start masked.
     val_cont_tokens = None
     val_tok_ids = None
-    if not use_prefix_cond:
+    if (not use_prefix_cond) and (not use_cell_cond):
         if hasattr(val_dataset, 'features') and val_dataset.features is not None:
             val_cont_tokens = val_dataset.features[:n_eval].to(device).float()
         elif hasattr(val_dataset, 'tok_ids') and val_dataset.tok_ids is not None:
@@ -2265,11 +2378,18 @@ def _eval_sudoku_image_difficulty(
                                  SUDOKU_MASK_ID, dtype=torch.long, device=device)
         cond_digits[known_mask] = x_gt[known_mask]
 
-        # Build conditioning tensors for the two modes
+        # Build conditioning tensors for the modes
         cond_tokens = None
+        cell_cond = None
         known_cont_tokens = None
         known_discrete_tokens = None
-        if use_prefix_cond:
+        if use_cell_cond:
+            # Per-cell AdaLN-like: hint digits as cell cond, fully-masked start
+            cc_enc = sudoku_cell_cond_encoder
+            if hasattr(cc_enc, 'module'):
+                cc_enc = cc_enc.module
+            cell_cond = cc_enc(cond_digits)  # (n_eval, 81, H)
+        elif use_prefix_cond:
             # Legacy: encode masked grid → prefix
             cond_tokens = sudoku_cond_encoder(cond_digits)
         else:
@@ -2306,6 +2426,7 @@ def _eval_sudoku_image_difficulty(
                     cfg=getattr(args, 'diff_head_cfg', 1.0),
                     known_mask=known_mask if known_cont_tokens is not None else None,
                     known_tokens=known_cont_tokens,
+                    cell_cond=cell_cond,
                 )
                 if need_video:
                     sample_kwargs["return_history"] = True
@@ -2349,15 +2470,17 @@ def _eval_sudoku_image_difficulty(
                                 sample_idx=vi, save_path=grid_vid_path,
                                 max_frames=args.eval_num_steps, fps=8,
                                 grid_hw=args.grid_hw, hint_mask=known_mask,
-                                title=f"{level_name} / {sc_tag}")
+                                title=f"[{split_tag}] {level_name} / {sc_tag}",
+                                hint_gt_digits=(x_gt + 1))
                         accelerator.print(
-                            f"[eval_cond/sudoku_image] step={step} "
+                            f"[{log_prefix}/sudoku_image] step={step} split={split_tag} "
                             f"[{level_name}/{sc_tag}] saved {n_vid} grid videos → {vid_dir}/")
 
                     _log_sudoku_image_metrics(
                         images, evaluator, f"{level_name}_{sc_tag}",
                         step, n_eval, task_dir, accelerator, args,
-                        prefix="eval_cond")
+                        prefix=log_prefix,
+                        gt_digits=x_gt, hint_mask=known_mask)
             continue  # skip the shared save/eval block below
         else:
             need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
@@ -2414,22 +2537,32 @@ def _eval_sudoku_image_difficulty(
                         sample_idx=vi, save_path=grid_vid_path,
                         max_frames=args.eval_num_steps, fps=8,
                         grid_hw=args.grid_hw, hint_mask=known_mask,
-                        title=level_name)
+                        title=f"[{split_tag}] {level_name}",
+                        hint_gt_digits=(x_gt + 1))
                 accelerator.print(
-                    f"[eval_cond/sudoku_image] step={step} [{level_name}] "
-                    f"saved {n_vid} grid videos → {vid_dir}/")
+                    f"[{log_prefix}/sudoku_image] step={step} split={split_tag} "
+                    f"[{level_name}] saved {n_vid} grid videos → {vid_dir}/")
 
             # MNIST classify → grid → rule check
             _log_sudoku_image_metrics(
                 images, evaluator, level_name, step, n_eval,
-                task_dir, accelerator, args, prefix="eval_cond")
+                task_dir, accelerator, args, prefix=log_prefix,
+                gt_digits=x_gt, hint_mask=known_mask)
 
 
 def _log_sudoku_image_metrics(
     images, evaluator, tag, step, n_samples,
     save_dir, accelerator, args, prefix="eval",
+    gt_digits=None, hint_mask=None,
 ):
-    """Shared helper: MNIST classify → rule check → log."""
+    """Shared helper: MNIST classify → rule check → log.
+
+    Optional diagnostics (when gt_digits + hint_mask provided):
+      * hint_acc:    fraction of hint cells correctly read back by classifier
+                     (isolates encoder→decoder→MNIST roundtrip error)
+      * gen_acc:     fraction of NON-hint (model-generated) cells matching GT
+      * hint_err_frac: 1 - hint_acc, the "wrong-rendering rate" requested
+    """
     device = images.device if images.is_cuda else accelerator.device
     if images.shape[1] == 3:
         eval_images = images.mean(dim=1, keepdim=True)
@@ -2440,19 +2573,48 @@ def _log_sudoku_image_metrics(
     rule_acc = eval_result["accuracy"].item()
     n_valid = eval_result["labels"].sum().item()
 
+    extra_txt = ""
+    extra_log = {}
+    if gt_digits is not None and hint_mask is not None:
+        # eval_result["discrete"]: (B, 9, 9) classified digits in [1..9]
+        pred = eval_result["discrete"].to(device).long().view(n_samples, -1)
+        gt = gt_digits.to(device).long().view(n_samples, -1)
+        # gt_digits stored as [0..8]; classifier returns [1..9]. Normalize.
+        if gt.min().item() == 0:
+            gt = gt + 1
+        hm = hint_mask.to(device).bool().view(n_samples, -1)
+
+        match = (pred == gt)  # (B, 81)
+        n_hint = hm.sum().clamp(min=1).item()
+        n_gen = (~hm).sum().clamp(min=1).item()
+        hint_acc = (match & hm).sum().item() / n_hint
+        gen_acc = (match & (~hm)).sum().item() / n_gen
+        hint_err = 1.0 - hint_acc
+
+        extra_txt = (f" hint_acc={hint_acc:.4f} "
+                     f"hint_err={hint_err:.4f} "
+                     f"gen_acc={gen_acc:.4f} "
+                     f"(hints={int(n_hint)}, gen={int(n_gen)})")
+        extra_log = {
+            f"{prefix}/{tag}/hint_acc": hint_acc,
+            f"{prefix}/{tag}/hint_err_frac": hint_err,
+            f"{prefix}/{tag}/gen_acc": gen_acc,
+        }
+
     accelerator.print(
         f"[{prefix}/sudoku_image] step={step} [{tag}] "
-        f"rule_acc={rule_acc:.4f} ({int(n_valid)}/{n_samples})")
+        f"rule_acc={rule_acc:.4f} ({int(n_valid)}/{n_samples}){extra_txt}")
 
     txt_path = os.path.join(save_dir, f"step_{step:07d}_sudoku_{tag}.txt")
     with open(txt_path, "w") as f:
-        f.write(f"step={step} tag={tag} rule_acc={rule_acc:.6f}\n")
+        f.write(f"step={step} tag={tag} rule_acc={rule_acc:.6f}{extra_txt}\n")
         for i in range(min(8, n_samples)):
             f.write(f"sample {i}: {eval_result['discrete'][i].tolist()}\n")
 
     if args.log_with:
         accelerator.log({
             f"{prefix}/{tag}/rule_acc": rule_acc,
+            **extra_log,
         }, step=step)
 
 
@@ -3062,6 +3224,11 @@ def parse_args():
                    help="Use digit-grid prefix (SudokuConditionEncoder). "
                         "Default: no prefix. Condition is injected at "
                         "inference by fixing known cells' image tokens.")
+    p.add_argument("--use_sudoku_cell_cond", action="store_true", default=False,
+                   help="Per-cell digit conditioning via additive residual "
+                        "(AdaLN-like). Start from fully-masked at inference; "
+                        "hint digits only influence generation via "
+                        "SudokuDigitCellEncoder. Independent from inpainting.")
     p.add_argument("--time_conditioning", action="store_true", default=False,
                    help="Feed sigma/t into AdaLN (MDLM flag). Default False "
                         "(MDLM paper: absorbing diffusion doesn't need it).")
@@ -3138,6 +3305,8 @@ def parse_args():
 
     # ── resume ──
     p.add_argument("--resume_dir", type=str, default=None)
+    p.add_argument("--eval_only", action="store_true",
+                   help="Load checkpoint, run one evaluate_and_save, and exit.")
 
     # ── accelerate ──
     p.add_argument("--mixed_precision", type=str, default="no",
@@ -3226,6 +3395,7 @@ def main():
     #  Dataset
     # ─────────────────────────────────────────────────────────
     clevr_cond_encoder = None
+    sudoku_cell_cond_encoder = None
     clevr_detector = None
     clevr_classifier = None
     train_dataset = None
@@ -3452,6 +3622,16 @@ def main():
                     "Training = standard MDLM on 81 image tokens. "
                     "Inference conditioning via fixed known image tokens.")
 
+            # Per-cell digit condition encoder (AdaLN-like residual)
+            sudoku_cell_cond_encoder = None
+            if args.use_sudoku_cell_cond:
+                sudoku_cell_cond_encoder = SudokuDigitCellEncoder(
+                    args.hidden_size, grid_len=SUDOKU_GRID_LEN)
+                accelerator.print(
+                    f"[sudoku] Per-cell digit condition: enabled. "
+                    f"mask_ratio=[{args.mask_ratio_min}, {args.mask_ratio_max}]. "
+                    f"Inference: fully-masked start + hint digits as cell cond.")
+
     accelerator.print(f"[data] Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     # Move pretrained model to CPU to free GPU for training
@@ -3610,6 +3790,10 @@ def main():
         all_params += list(clevr_cond_encoder.parameters())
         ce_total, ce_train = count_params(clevr_cond_encoder)
         accelerator.print(f"[model] CLEVR cond encoder: {format_n(ce_total)} params")
+    if sudoku_cell_cond_encoder is not None:
+        all_params += list(sudoku_cell_cond_encoder.parameters())
+        cc_total, _ = count_params(sudoku_cell_cond_encoder)
+        accelerator.print(f"[model] Sudoku cell cond encoder: {format_n(cc_total)} params")
 
     optimizer = torch.optim.AdamW(
         all_params, lr=args.lr, betas=(0.9, 0.999),
@@ -3621,14 +3805,22 @@ def main():
 
     # Prepare
     prepare_list = [diffusion, optimizer, train_loader, lr_scheduler]
+    insert_idx = 1
     if clevr_cond_encoder is not None:
-        prepare_list.insert(1, clevr_cond_encoder)
+        prepare_list.insert(insert_idx, clevr_cond_encoder)
+        insert_idx += 1
+    if sudoku_cell_cond_encoder is not None:
+        prepare_list.insert(insert_idx, sudoku_cell_cond_encoder)
     prepared = accelerator.prepare(*prepare_list)
 
+    # Unpack in the same order we inserted
+    prepared = list(prepared)
+    diffusion = prepared.pop(0)
     if clevr_cond_encoder is not None:
-        diffusion, clevr_cond_encoder, optimizer, train_loader, lr_scheduler = prepared
-    else:
-        diffusion, optimizer, train_loader, lr_scheduler = prepared
+        clevr_cond_encoder = prepared.pop(0)
+    if sudoku_cell_cond_encoder is not None:
+        sudoku_cell_cond_encoder = prepared.pop(0)
+    optimizer, train_loader, lr_scheduler = prepared
 
     # EMA
     ema = None
@@ -3661,6 +3853,23 @@ def main():
             accelerator.print(f"[resume] EMA restored from {ema_path}")
         accelerator.print(f"[resume] {resume_dir}  →  step={global_step}")
 
+    if args.eval_only:
+        accelerator.print(f"[eval_only] running one evaluate_and_save at step={global_step}")
+        evaluate_and_save(
+            diffusion, global_step, args, accelerator, ema,
+            pretrained_model=pretrained_model,
+            discretizer=discretizer,
+            level_sizes=level_sizes,
+            clevr_cond_encoder=clevr_cond_encoder,
+            val_dataset=val_dataset,
+            clevr_detector=clevr_detector,
+            clevr_classifier=clevr_classifier,
+            train_dataset=train_dataset,
+            sudoku_cell_cond_encoder=sudoku_cell_cond_encoder,
+        )
+        accelerator.print("[eval_only] done")
+        return
+
     # ════════════════════════════════════════════════════════
     #  Training loop
     # ════════════════════════════════════════════════════════
@@ -3675,6 +3884,8 @@ def main():
     diffusion.train()
     if clevr_cond_encoder is not None:
         clevr_cond_encoder.train()
+    if sudoku_cell_cond_encoder is not None:
+        sudoku_cell_cond_encoder.train()
     running_loss = 0.0
 
     _epoch = 0
@@ -3706,6 +3917,7 @@ def main():
             # ── Prepare batch ──
             class_labels = None
             cond_tokens = None
+            cell_cond = None  # per-cell digit residual (AdaLN-style)
             cont_tokens = None  # for diffusion head mode
 
             if args.use_diffusion_head:
@@ -3752,7 +3964,34 @@ def main():
                                             device=accelerator.device) < args.uncond_drop_prob)
                     cond_tokens = cond_tokens * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
 
-            elif args.dataset_type == "clevr":
+            # Independent path: per-cell sudoku digit conditioning.
+            # Can combine with any of the above (prefix / grid_only / etc).
+            if (args.dataset_type == "sudoku" and not args.grid_only
+                    and args.use_sudoku_cell_cond
+                    and sudoku_cell_cond_encoder is not None
+                    and "cond_token_ids" in batch):
+                digit_ids = batch["cond_token_ids"].to(accelerator.device).long()  # (B, 81) in [0..8]
+                B_cc = digit_ids.shape[0]
+                mr = torch.empty(B_cc, 1, device=accelerator.device).uniform_(
+                    args.mask_ratio_min, args.mask_ratio_max)
+                rand = torch.rand(B_cc, SUDOKU_GRID_LEN, device=accelerator.device)
+                mask_cc = rand < mr
+                digit_ids = digit_ids.clone()
+                digit_ids[mask_cc] = SUDOKU_MASK_ID  # UNKNOWN
+
+                cc_enc = sudoku_cell_cond_encoder
+                if hasattr(cc_enc, 'module'):
+                    cc_enc = cc_enc.module
+                cell_cond = cc_enc(digit_ids)  # (B, 81, H)
+
+                # CFG dropout: zero out cell cond for a fraction of batch
+                if args.uncond_drop_prob > 0 and diffusion.training:
+                    B_for_drop = cont_tokens.shape[0] if cont_tokens is not None else tokens.shape[0]
+                    drop_mask = (torch.rand(B_for_drop,
+                                            device=accelerator.device) < args.uncond_drop_prob)
+                    cell_cond = cell_cond * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
+
+            if args.dataset_type == "clevr":
                 # Encode CLEVR conditions: token IDs → embeddings
                 cond_ids = batch["cond_token_ids"].to(accelerator.device)
 
@@ -3772,7 +4011,8 @@ def main():
             with accelerator.accumulate(diffusion):
                 if args.use_diffusion_head:
                     loss_out = accelerator.unwrap_model(diffusion).compute_loss_continuous(
-                        cont_tokens, cond_tokens=cond_tokens, class_labels=class_labels)
+                        cont_tokens, cond_tokens=cond_tokens,
+                        class_labels=class_labels, cell_cond=cell_cond)
                 else:
                     loss_out = accelerator.unwrap_model(diffusion).compute_loss(
                         tokens, cond_tokens=cond_tokens, class_labels=class_labels)
@@ -3830,10 +4070,13 @@ def main():
                     clevr_detector=clevr_detector,
                     clevr_classifier=clevr_classifier,
                     train_dataset=train_dataset,
+                    sudoku_cell_cond_encoder=sudoku_cell_cond_encoder,
                 )
                 diffusion.train()
                 if clevr_cond_encoder is not None:
                     clevr_cond_encoder.train()
+                if sudoku_cell_cond_encoder is not None:
+                    sudoku_cell_cond_encoder.train()
 
             # ── Save ──
             if global_step % args.save_every == 0:
@@ -3879,6 +4122,7 @@ def main():
         clevr_detector=clevr_detector,
         clevr_classifier=clevr_classifier,
         train_dataset=train_dataset,
+        sudoku_cell_cond_encoder=sudoku_cell_cond_encoder,
     )
     accelerator.print("Done!")
 

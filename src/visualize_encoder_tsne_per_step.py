@@ -162,6 +162,10 @@ def main():
     parser.add_argument("--no_ema", dest="use_ema", action="store_false")
     parser.add_argument("--ncols", type=int, default=5,
                         help="Number of columns in grid plot")
+    parser.add_argument("--skip_grid", action="store_true",
+                        help="Skip combined grid plot (useful for sharded runs)")
+    parser.add_argument("--out_subdir", type=str, default="tsne_per_step",
+                        help="Subdirectory (under run_dir) to save plots into")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -212,7 +216,7 @@ def main():
     )
 
     # Output directory
-    out_dir = run_dir / "tsne_per_step"
+    out_dir = run_dir / args.out_subdir
     out_dir.mkdir(exist_ok=True)
 
     # ── Extract features & run t-SNE for each checkpoint ──
@@ -268,6 +272,10 @@ def main():
         # Free memory
         del encoder, ckpt, state
         torch.cuda.empty_cache() if args.device == "cuda" else None
+
+    if args.skip_grid:
+        print(f"  Skipping grid plot (--skip_grid)")
+        return
 
     # ── Combined grid plot ──
     n = len(all_embeddings)

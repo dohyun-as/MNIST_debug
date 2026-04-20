@@ -666,6 +666,8 @@ class DIT(nn.Module):
                 # ── continuous mode inputs ──
                 cont_tokens: Optional[torch.Tensor] = None,
                 mask: Optional[torch.Tensor] = None,
+                # ── per-cell additive conditioning (e.g. sudoku digit hint) ──
+                cell_cond: Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
         """Args:
             indices:      (B, L) int64 token indices  [discrete mode]
@@ -715,6 +717,15 @@ class DIT(nn.Module):
                    self.mr_row_emb(self.mr_row_idx) +
                    self.mr_col_emb(self.mr_col_idx))
             x = x + pos[None, :, :]
+
+        # per-cell additive conditioning (broadcast / align with data L)
+        if cell_cond is not None:
+            Lc = cell_cond.shape[1]
+            if Lc == x.shape[1]:
+                x = x + cell_cond
+            else:
+                # Pad/truncate to match x's length (prefix added later handles cond separately)
+                x = x + cell_cond[:, :x.shape[1], :]
 
         c = F.silu(self.sigma_map(sigma))  # (B, cond_dim)
 

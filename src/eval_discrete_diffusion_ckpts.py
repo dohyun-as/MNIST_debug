@@ -41,6 +41,9 @@ from train_discrete_diffusion_v2 import (
     CLEVRImageDataset,
     CachedTokenDataset,
     CLEVRConditionEncoder,
+    CLEVRTextConditionEncoder,
+    clevr_text_to_token_ids,
+    clevr_json_to_token_ids,
     DIT,
     DiscreteDiffusion,
     EMA,
@@ -92,6 +95,10 @@ def parse_args():
     p.add_argument("--cond_dim", type=int, default=256)
     p.add_argument("--mlp_ratio", type=int, default=4)
     p.add_argument("--model_dropout", type=float, default=0.1)
+    p.add_argument("--pos_emb_type", type=str, default="multires",
+                   choices=["multires", "1d"])
+    p.add_argument("--cond_type", type=str, default="json",
+                   choices=["json", "text"])
     p.add_argument("--noise_type", type=str, default="loglinear")
     p.add_argument("--noise_eps", type=float, default=1e-3)
     p.add_argument("--sampling_eps", type=float, default=1e-3)
@@ -115,7 +122,7 @@ def build_model(args, data_vocab_size, seq_len, level_sizes, device):
         mlp_ratio=args.mlp_ratio,
         dropout=args.model_dropout,
         causal=False,
-        pos_emb_type="multires",
+        pos_emb_type=args.pos_emb_type,
         level_sizes=level_sizes,
     )
     backbone = DIT(**dit_kwargs)
@@ -260,8 +267,17 @@ def main():
     train_conditions = [train_img_ds.get_condition(i) for i in range(len(train_img_ds))]
     val_conditions = [val_img_ds.get_condition(i) for i in range(len(val_img_ds))]
 
-    train_dataset = CachedTokenDataset(train_tok, clevr_conditions=train_conditions)
-    val_dataset = CachedTokenDataset(val_tok, clevr_conditions=val_conditions)
+    if args.cond_type == "text":
+        cond_tokenizer_fn = clevr_text_to_token_ids
+    else:
+        cond_tokenizer_fn = clevr_json_to_token_ids
+
+    train_dataset = CachedTokenDataset(
+        train_tok, clevr_conditions=train_conditions,
+        cond_tokenizer_fn=cond_tokenizer_fn)
+    val_dataset = CachedTokenDataset(
+        val_tok, clevr_conditions=val_conditions,
+        cond_tokenizer_fn=cond_tokenizer_fn)
 
     accelerator.print(f"[data] Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
@@ -306,7 +322,10 @@ def main():
             # Build fresh model
             diffusion = build_model(args, data_vocab_size, seq_len,
                                     level_sizes, accelerator.device)
-            clevr_cond_encoder = CLEVRConditionEncoder(args.hidden_size)
+            if args.cond_type == "text":
+                clevr_cond_encoder = CLEVRTextConditionEncoder(args.hidden_size)
+        else:
+                clevr_cond_encoder = CLEVRConditionEncoder(args.hidden_size)
 
             # Load weights
             diffusion, clevr_cond_encoder = load_checkpoint_weights(

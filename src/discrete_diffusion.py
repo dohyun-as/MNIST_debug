@@ -474,6 +474,7 @@ class DiscreteDiffusion(nn.Module):
         attention_mask: Optional[Tensor] = None,
         cond_tokens: Optional[Tensor] = None,
         class_labels: Optional[Tensor] = None,
+        cell_cond: Optional[Tensor] = None,
     ) -> LossOutput:
         """Loss for continuous mode with diffusion head.
 
@@ -514,6 +515,7 @@ class DiscreteDiffusion(nn.Module):
             cond_tokens=cond_tokens, class_labels=class_labels,
             prefix_mode=use_prefix,
             cont_tokens=x0, mask=mask,
+            cell_cond=cell_cond,
         )  # (B, L, hidden_size)
 
         # Extract masked positions for diffusion head
@@ -585,6 +587,7 @@ class DiscreteDiffusion(nn.Module):
         tokens_per_step: int = 0,
         known_mask: Optional[Tensor] = None,
         known_tokens: Optional[Tensor] = None,
+        cell_cond: Optional[Tensor] = None,
     ) -> Tensor:
         """Generate continuous tokens via MaskGIT-style iterative unmasking.
 
@@ -635,12 +638,16 @@ class DiscreteDiffusion(nn.Module):
 
         # DDPM-style: random unmask based on noise schedule probability
         if sampler in ("ddpm", "ddpm_cache"):
-            dt = 1.0 / num_steps
+            # Per-sample initial t from current mask ratio (inpainting-aware)
+            t_init = is_masked.float().sum(dim=1) / seq_len  # (B,)
+            t_init = t_init.clamp(min=1e-5)
             for step in range(num_steps):
                 if not is_masked.any():
                     break
-                t_cur = torch.full((batch_size,), 1.0 - step * dt, device=device)
-                t_nxt = (t_cur - dt).clamp(min=1e-5)
+                frac_cur = 1.0 - step / num_steps
+                frac_nxt = 1.0 - (step + 1) / num_steps
+                t_cur = (t_init * frac_cur).clamp(min=1e-5)
+                t_nxt = (t_init * frac_nxt).clamp(min=1e-5)
                 sigma_t = self.noise(t_cur)[0]
                 sigma_s = self.noise(t_nxt)[0]
                 if sigma_t.ndim > 1:
@@ -657,6 +664,7 @@ class DiscreteDiffusion(nn.Module):
                     cond_tokens=cond_tokens, class_labels=class_labels,
                     prefix_mode=use_prefix,
                     cont_tokens=x, mask=is_masked,
+                    cell_cond=cell_cond,
                 )  # (B, L, H)
 
                 rand = torch.rand(batch_size, seq_len, device=device)
@@ -685,6 +693,7 @@ class DiscreteDiffusion(nn.Module):
                     cond_tokens=cond_tokens, class_labels=class_labels,
                     prefix_mode=use_prefix,
                     cont_tokens=x, mask=is_masked,
+                    cell_cond=cell_cond,
                 )
                 masked_hidden = hidden[is_masked]
                 sampled_tokens = self.diff_head.sample(
@@ -717,6 +726,7 @@ class DiscreteDiffusion(nn.Module):
                 cond_tokens=cond_tokens, class_labels=class_labels,
                 prefix_mode=use_prefix,
                 cont_tokens=x, mask=is_masked,
+                cell_cond=cell_cond,
             )  # (B, L, H)
 
             masked_indices = is_masked.nonzero(as_tuple=False)  # (N_masked, 2)
@@ -792,6 +802,7 @@ class DiscreteDiffusion(nn.Module):
                 cond_tokens=cond_tokens, class_labels=class_labels,
                 prefix_mode=use_prefix,
                 cont_tokens=x, mask=is_masked,
+                cell_cond=cell_cond,
             )
             masked_hidden = hidden[is_masked]
             sampled_tokens = self.diff_head.sample(

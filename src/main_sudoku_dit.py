@@ -136,6 +136,19 @@ def parse_args():
     p.add_argument("--dit_bottleneck_dim", type=int, default=128)
     p.add_argument("--dit_in_context_len", type=int, default=0)
     p.add_argument("--dit_in_context_start", type=int, default=4)
+    p.add_argument("--cond_noise_std", type=float, default=0.0,
+                   help="Gaussian noise std added to encoder features before "
+                        "DiT conditioning (train only). 0 disables.")
+    p.add_argument("--cond_noise_relative", action="store_true", default=False,
+                   help="If set, noise std is scaled by per-sample feature std "
+                        "(relative perturbation). Otherwise absolute std.")
+    p.add_argument("--cond_token_drop_prob", type=float, default=0.0,
+                   help="Max per-token drop ratio on encoder cond tokens "
+                        "(train only). Each sample gets p_b ~ U(0, this), then "
+                        "Bernoulli(p_b) per position. Dropped positions use "
+                        "the learned null embedding. Independent from "
+                        "uncond_drop_prob. Inference is auto-disabled "
+                        "(training=False) → matches p=0 end of the spectrum.")
 
     # --- level drop ---
     p.add_argument("--level_drop", action="store_true", default=False)
@@ -189,6 +202,14 @@ def parse_args():
     p.add_argument("--sudoku_eval_grid_size", type=int, default=9)
     p.add_argument("--num_workers", type=int, default=4)
 
+    # --- eval t-SNE ---
+    p.add_argument("--eval_tsne", action="store_true", default=True,
+                   help="Run t-SNE on encoder tokens during eval")
+    p.add_argument("--no_eval_tsne", dest="eval_tsne", action="store_false")
+    p.add_argument("--eval_tsne_max_samples", type=int, default=2000,
+                   help="Max tokens used for t-SNE during eval")
+    p.add_argument("--eval_tsne_perplexity", type=float, default=30.0)
+
     return p.parse_args()
 
 
@@ -240,6 +261,9 @@ def build_model(args):
         vq_codebook_size=args.vq_codebook_size,
         vq_beta=args.vq_beta,
         level_sizes=args.level_sizes,
+        cond_noise_std=args.cond_noise_std,
+        cond_noise_relative=args.cond_noise_relative,
+        cond_token_drop_prob=args.cond_token_drop_prob,
     )
 
 
@@ -431,6 +455,86 @@ def tile_images(img_list, nrow, pad_px=6, bg=(255, 255, 255)):
 # ──────────────────────────────────────────────────────────────────
 #  Sudoku evaluation
 # ──────────────────────────────────────────────────────────────────
+
+_DIGIT_COLORS = {
+    1: '#ff7f0e', 2: '#2ca02c', 3: '#d62728', 4: '#9467bd',
+    5: '#8c564b', 6: '#e377c2', 7: '#7f7f7f', 8: '#bcbd22', 9: '#17becf',
+}
+
+
+@torch.no_grad()
+def run_encoder_tsne_eval(eval_model, ref_images, ref_grids, args,
+                          accelerator, global_step, tag=""):
+    """Extract 9x9 encoder tokens (continuous pre-discretizer) and save a
+    t-SNE PNG colored by GT digit class.  Main-process only."""
+    if not accelerator.is_main_process:
+        return
+    if ref_grids is None:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+    except Exception as e:
+        accelerator.print(f"[Eval][tSNE] skipped (import error): {e}")
+        return
+
+    device = accelerator.device
+    level_features = eval_model.encoder.forward_injection(ref_images)
+    feat_2d = None
+    for s, f2d in level_features.items():
+        if s == 9:
+            feat_2d = f2d
+            break
+    if feat_2d is None:
+        return
+
+    B, D, H, W = feat_2d.shape  # expect H=W=9
+    tokens = feat_2d.flatten(2).transpose(1, 2).reshape(-1, D)  # (B*81, D)
+    digits = ref_grids.to(device).long().reshape(-1)            # (B*81,)
+
+    mask = (digits >= 1) & (digits <= 9)
+    tokens = tokens[mask].float().cpu().numpy()
+    digits = digits[mask].cpu().numpy()
+
+    if len(tokens) > args.eval_tsne_max_samples:
+        rng = torch.Generator().manual_seed(args.seed)
+        perm = torch.randperm(len(tokens), generator=rng)[:args.eval_tsne_max_samples].numpy()
+        tokens = tokens[perm]
+        digits = digits[perm]
+
+    if len(tokens) < 10:
+        accelerator.print(f"[Eval][tSNE] too few tokens ({len(tokens)}), skipping")
+        return
+
+    perp = min(args.eval_tsne_perplexity, max(5.0, (len(tokens) - 1) / 3.0))
+    emb = TSNE(n_components=2, perplexity=perp,
+               random_state=args.seed, max_iter=1000).fit_transform(tokens)
+
+    out_dir = os.path.join(args.output_dir, "eval_tsne")
+    os.makedirs(out_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    for d in sorted(_DIGIT_COLORS.keys()):
+        m = digits == d
+        if m.sum() == 0:
+            continue
+        ax.scatter(emb[m, 0], emb[m, 1], c=_DIGIT_COLORS[d],
+                   s=8, alpha=0.5, label=f"{d} ({m.sum()})", rasterized=True)
+    ax.set_xlabel("t-SNE 1"); ax.set_ylabel("t-SNE 2")
+    ax.legend(fontsize=8, ncol=2, title="Digit", markerscale=2, loc='upper right')
+    tag_label = f"[{tag}] " if tag else ""
+    fig.suptitle(f"{tag_label}encoder tokens — step {global_step} "
+                 f"(9x9, {D}D, n={len(tokens)})",
+                 fontsize=12, fontweight='bold')
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    tag_suffix = f"_{tag}" if tag else ""
+    out_path = os.path.join(out_dir, f"step_{global_step:07d}{tag_suffix}.png")
+    fig.savefig(out_path, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+    accelerator.print(f"[Eval][tSNE] Saved {out_path}")
+
 
 @torch.no_grad()
 def run_sudoku_eval(model, eval_dataset, noise_scheduler, args, accelerator,
@@ -662,6 +766,13 @@ def run_sudoku_eval(model, eval_dataset, noise_scheduler, args, accelerator,
             f"[Eval] Saved digit grids to {viz_dir}/step_{global_step:07d}_*.png")
 
     accelerator.log(log_dict, step=global_step)
+
+    # ── Encoder token t-SNE ──
+    if getattr(args, "eval_tsne", False):
+        run_encoder_tsne_eval(
+            eval_model, ref_images, ref_grids, args,
+            accelerator, global_step, tag=tag,
+        )
 
     model.train()
 

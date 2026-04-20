@@ -34,7 +34,13 @@ NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 BATCH_PER_GPU=256
 GRAD_ACCUM=1
 
+# ── Token drop ratio (override with TOK_DROP=... env var) ──
+# level_drop 후 각 sample 의 finest kept level 에만 per-token Bernoulli drop.
+# p_b ~ U(0, TOK_DROP) 이라 p=0 (inference 분포)도 자연히 커버.
+TOK_DROP="${TOK_DROP:-1.0}"
+
 echo "GPUs: $CUDA_VISIBLE_DEVICES ($NUM_GPUS), batch/gpu=$BATCH_PER_GPU, accum=$GRAD_ACCUM, effective=$((BATCH_PER_GPU * NUM_GPUS * GRAD_ACCUM))"
+echo "cond_token_drop_prob=$TOK_DROP (finest kept level only)"
 
 # ── Data ──
 CLEVR_DIR="../clevr_output/clevr_256_varied/images"
@@ -83,6 +89,7 @@ accelerate launch \
     --mixed_precision bf16 \
     --ema_decay 0 \
     --uncond_drop_prob 0.1 \
+    --cond_token_drop_prob $TOK_DROP \
     --level_drop \
     --min_keep_levels 1 \
     --level_drop_after_steps 10000 \

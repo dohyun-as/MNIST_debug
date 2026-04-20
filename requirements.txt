@@ -19,5 +19,6 @@ jaxtyping
 pandas
 pynvml
 pytorch_lightning
+matplotlib
 
 #pip install -e . #(in src/ldm)

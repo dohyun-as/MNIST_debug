@@ -271,6 +271,10 @@ def parse_args():
     p.add_argument("--mixed_precision", type=str, default="bf16",
                    choices=["no", "fp16", "bf16"])
     p.add_argument("--uncond_drop_prob", type=float, default=0.1)
+    p.add_argument("--cond_token_drop_prob", type=float, default=0.0,
+                   help="Per-token random drop max ratio (train-only). "
+                        "Applied only to the finest kept level per sample "
+                        "after level_drop.")
     p.add_argument("--ema_decay", type=float, default=0.999,
                    help="EMA decay rate (0=disabled)")
     p.add_argument("--cond_use_latent", action="store_true", default=False,
@@ -584,6 +588,7 @@ def build_model(args):
             vq_codebook_size=args.vq_codebook_size,
             vq_beta=args.vq_beta,
             level_sizes=args.level_sizes,
+            cond_token_drop_prob=args.cond_token_drop_prob,
         )
 
     # ── UNet backbone (original) ──

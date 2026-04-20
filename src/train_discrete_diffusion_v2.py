@@ -418,19 +418,131 @@ class CLEVRTextConditionEncoder(nn.Module):
         return h
 
 
+class PretrainedTextConditionEncoder(nn.Module):
+    """Wraps a pretrained HF text encoder (CLIP / T5) — mirrors the naive
+    ``model_text_conditioned.PretrainedLMEncoder`` recipe:
+      * per-batch dynamic padding (``padding=True``)
+      * tokenizer's real ``attention_mask`` (correct for CLIP eos==pad)
+      * learnable ``null_embed`` for CFG uncond (not the backbone's)
+
+    Call pattern:
+        tokens = enc.tokenize(list_of_texts, device)      # dict with ids+mask
+        cond, attn = enc(tokens)                          # (B, L, D), (B, L) bool
+        null = enc.get_null_cond(B, L, device)            # (B, L, D)
+    """
+
+    def __init__(self, model_name: str, hidden_size: int,
+                 max_length: int = 77, freeze: bool = False):
+        super().__init__()
+        name_lower = model_name.lower()
+        if "clip" in name_lower:
+            from transformers import CLIPTextModel, AutoTokenizer
+            self._kind = "clip"
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.encoder = CLIPTextModel.from_pretrained(model_name)
+            enc_dim = self.encoder.config.hidden_size
+        elif "t5" in name_lower:
+            from transformers import T5EncoderModel, AutoTokenizer
+            self._kind = "t5"
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.encoder = T5EncoderModel.from_pretrained(model_name)
+            enc_dim = self.encoder.config.d_model
+        else:
+            raise ValueError(
+                f"Unsupported pretrained text encoder: {model_name} "
+                "(expected CLIP or T5 variant)")
+
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model_name = model_name
+        self.max_length = max_length
+        self.freeze = freeze
+        self.hidden_size = hidden_size
+        self.proj = nn.Linear(enc_dim, hidden_size)
+
+        # Learnable null-cond embedding (naive-style CFG uncond).
+        self.null_embed = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        nn.init.normal_(self.null_embed, std=0.02)
+
+        if freeze:
+            self.encoder.eval()
+            self.encoder.requires_grad_(False)
+
+    def tokenize(self, texts, device):
+        """Tokenize a list of captions with per-batch dynamic padding."""
+        if isinstance(texts, str):
+            texts = [texts]
+        norm = [(t.get("text", "") if isinstance(t, dict) else t)
+                for t in texts]
+        return self.tokenizer(
+            norm, return_tensors="pt", padding=True,
+            truncation=True, max_length=self.max_length,
+        ).to(device)
+
+    def forward(self, text_tokens):
+        """
+        Args:
+            text_tokens: dict with ``input_ids`` and ``attention_mask``
+                ((B, L) each, produced by :meth:`tokenize`).
+        Returns:
+            cond_tokens: (B, L, hidden_size)
+            cond_mask:   (B, L) bool (True = valid token)
+        """
+        input_ids = text_tokens["input_ids"]
+        attn_mask = text_tokens["attention_mask"]
+
+        if self.freeze:
+            with torch.no_grad():
+                out = self.encoder(input_ids=input_ids,
+                                   attention_mask=attn_mask)
+                hidden = out.last_hidden_state
+        else:
+            out = self.encoder(input_ids=input_ids,
+                               attention_mask=attn_mask)
+            hidden = out.last_hidden_state
+
+        cond = self.proj(hidden.float())
+        # Zero padding positions (downstream backbone doesn't take a mask).
+        cond = cond * attn_mask.unsqueeze(-1).float()
+        return cond, attn_mask.bool()
+
+    def get_null_cond(self, batch_size: int, seq_len: int,
+                      device: torch.device):
+        """Return broadcasted null-cond tokens (B, L, D) for CFG."""
+        return self.null_embed.to(device).expand(batch_size, seq_len, -1)
+
+
 # ────────────────────────────────────────────────────────────
 #  Dataset classes
 # ────────────────────────────────────────────────────────────
 
+def _extract_raw_text(cond):
+    """Extract raw caption string from a CLEVR text condition entry."""
+    if isinstance(cond, dict):
+        return cond.get("text", "")
+    return cond
+
+
 class CachedTokenDataset(Dataset):
-    """Returns cached tok_ids + optional labels/conditions."""
+    """Returns cached tok_ids + optional labels/conditions.
+
+    If ``return_raw_text=True``, yields raw caption strings under
+    ``"cond_text"`` instead of pre-tokenized ``"cond_token_ids"``; used for
+    the pretrained (CLIP/T5) text-encoder path which tokenizes per-batch.
+    """
     def __init__(self, tok_ids, labels=None, clevr_conditions=None,
-                 cond_tokenizer_fn=None, sudoku_digit_grids=None):
+                 cond_tokenizer_fn=None, sudoku_digit_grids=None,
+                 return_raw_text=False, source_image_ds=None):
         self.tok_ids = tok_ids  # (N, seq_len) long
         self.labels = labels    # (N,) long or None
         self.clevr_conditions = clevr_conditions  # list of dicts or None
         self.cond_tokenizer_fn = cond_tokenizer_fn or clevr_json_to_token_ids
         self.sudoku_digit_grids = sudoku_digit_grids  # (N, 9, 9) or None
+        self.return_raw_text = return_raw_text
+        # Reference to the source image dataset (same indexing order) so
+        # eval can fetch the GT image for a given index without reloading.
+        self.source_image_ds = source_image_ds
 
     def __len__(self):
         return len(self.tok_ids)
@@ -441,7 +553,10 @@ class CachedTokenDataset(Dataset):
             item["class_label"] = self.labels[idx]
         if self.clevr_conditions is not None:
             cond = self.clevr_conditions[idx]
-            item["cond_token_ids"] = self.cond_tokenizer_fn(cond)
+            if self.return_raw_text:
+                item["cond_text"] = _extract_raw_text(cond)
+            else:
+                item["cond_token_ids"] = self.cond_tokenizer_fn(cond)
         if self.sudoku_digit_grids is not None:
             # (9, 9) → (81,) int64, values 1-9 → 0-8
             grid = self.sudoku_digit_grids[idx]  # (9, 9)
@@ -459,12 +574,15 @@ class CachedTokenDataset(Dataset):
 class CachedContinuousTokenDataset(Dataset):
     """Returns cached continuous feature vectors + optional conditions."""
     def __init__(self, features, labels=None, clevr_conditions=None,
-                 cond_tokenizer_fn=None, sudoku_digit_grids=None):
+                 cond_tokenizer_fn=None, sudoku_digit_grids=None,
+                 return_raw_text=False, source_image_ds=None):
         self.features = features  # (N, seq_len, feat_dim) float
         self.labels = labels
         self.clevr_conditions = clevr_conditions
         self.cond_tokenizer_fn = cond_tokenizer_fn or clevr_json_to_token_ids
         self.sudoku_digit_grids = sudoku_digit_grids
+        self.return_raw_text = return_raw_text
+        self.source_image_ds = source_image_ds
 
     def __len__(self):
         return len(self.features)
@@ -475,12 +593,21 @@ class CachedContinuousTokenDataset(Dataset):
             item["class_label"] = self.labels[idx]
         if self.clevr_conditions is not None:
             cond = self.clevr_conditions[idx]
-            item["cond_token_ids"] = self.cond_tokenizer_fn(cond)
+            if self.return_raw_text:
+                item["cond_text"] = _extract_raw_text(cond)
+            else:
+                item["cond_token_ids"] = self.cond_tokenizer_fn(cond)
         if self.sudoku_digit_grids is not None:
             grid = self.sudoku_digit_grids[idx]
             digits = grid.reshape(-1).long() - 1  # (81,) in [0, 8]
             item["cond_token_ids"] = digits
         return item
+
+    def get_condition(self, idx):
+        """Return raw condition dict (for eval logging)."""
+        if self.clevr_conditions is not None:
+            return self.clevr_conditions[idx]
+        return {}
 
 
 class GridOnlyDataset(Dataset):
@@ -2089,6 +2216,10 @@ def _eval_sudoku_image(model, step, args, accelerator, save_dir,
                 cond_tokens=uncond_cond_tokens,
                 temperature=getattr(args, 'diff_head_temperature', 1.0),
                 cfg=getattr(args, 'diff_head_cfg', 1.0),
+                cfg_schedule=getattr(args, 'cfg_schedule', 'constant'),
+                cfg_mode=getattr(args, 'cfg_mode', 'head'),
+                null_class_index=getattr(args, 'num_classes', None)
+                    if args.dataset_type == "imagenet" else None,
             )
             need_video = (eval_video_samples > 0 and eval_save_format in ("mp4", "gif"))
             if need_video:
@@ -2304,8 +2435,12 @@ def _eval_sudoku_image_difficulty(
                     cond_tokens=cond_tokens,
                     temperature=getattr(args, 'diff_head_temperature', 1.0),
                     cfg=getattr(args, 'diff_head_cfg', 1.0),
+                    cfg_schedule=getattr(args, 'cfg_schedule', 'constant'),
                     known_mask=known_mask if known_cont_tokens is not None else None,
                     known_tokens=known_cont_tokens,
+                    cfg_mode=getattr(args, 'cfg_mode', 'head'),
+                    null_class_index=getattr(args, 'num_classes', None)
+                        if args.dataset_type == "imagenet" else None,
                 )
                 if need_video:
                     sample_kwargs["return_history"] = True
@@ -2607,18 +2742,32 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
             val_dataset, n_per_split)
         n_samples = len(selected_indices)
 
-        cond_id_list = []
-        for idx in selected_indices:
-            sample = val_dataset[idx]
-            cond_id_list.append(sample["cond_token_ids"])
-            cond_jsons.append(val_dataset.get_condition(idx))
-
-        cond_ids = torch.stack(cond_id_list).to(device)
-
         cond_encoder = clevr_cond_encoder
         if hasattr(cond_encoder, 'module'):
             cond_encoder = cond_encoder.module
-        cond_tokens = cond_encoder(cond_ids)
+
+        is_pretrained_te = isinstance(
+            cond_encoder, PretrainedTextConditionEncoder)
+
+        if is_pretrained_te:
+            texts = []
+            for idx in selected_indices:
+                sample = val_dataset[idx]
+                # Dataset yields "cond_text" when return_raw_text=True.
+                texts.append(sample.get(
+                    "cond_text",
+                    _extract_raw_text(val_dataset.get_condition(idx))))
+                cond_jsons.append(val_dataset.get_condition(idx))
+            text_tokens = cond_encoder.tokenize(texts, device)
+            cond_tokens, _cond_mask = cond_encoder(text_tokens)
+        else:
+            cond_id_list = []
+            for idx in selected_indices:
+                sample = val_dataset[idx]
+                cond_id_list.append(sample["cond_token_ids"])
+                cond_jsons.append(val_dataset.get_condition(idx))
+            cond_ids = torch.stack(cond_id_list).to(device)
+            cond_tokens = cond_encoder(cond_ids)
 
     # Save condition meta (rank 0 only)
     if is_main:
@@ -2637,14 +2786,21 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
     max_n = (n_samples + world_size - 1) // world_size  # for padding in gather
 
     my_cond_tokens = None
+    my_uncond_cond_tokens = None  # pretrained-TE path: encoder.null_embed-based
     if cond_tokens is not None and my_n > 0:
         my_cond_tokens = cond_tokens[my_indices]
+        if (clevr_cond_encoder is not None
+                and isinstance(cond_encoder, PretrainedTextConditionEncoder)):
+            my_uncond_cond_tokens = cond_encoder.get_null_cond(
+                my_cond_tokens.shape[0], my_cond_tokens.shape[1],
+                my_cond_tokens.device).to(my_cond_tokens.dtype)
 
     # Per-shard condition jsons and split labels
     my_cond_jsons = [cond_jsons[i] for i in my_indices] if cond_jsons else []
     my_splits = [sample_splits[i] for i in my_indices] if sample_splits else []
 
     # ── Define sampler configs ──
+    use_diffusion_head = getattr(args, 'use_diffusion_head', False)
     if args.model_type == "ar":
         sampler_configs = [{"name": "ar", "sampler": "ar"}]
     elif getattr(args, "factorized_head", False):
@@ -2664,8 +2820,18 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
              "tokens_per_step": 0},
         ]
 
-    can_decode = (pretrained_model is not None and discretizer is not None
-                  and level_sizes is not None)
+    # Continuous mode: discretizer not needed (tokens are continuous vectors)
+    if use_diffusion_head:
+        can_decode = (pretrained_model is not None and level_sizes is not None)
+    else:
+        can_decode = (pretrained_model is not None and discretizer is not None
+                      and level_sizes is not None)
+    # Resolve feature dim for continuous sampling
+    _dh_feat_dim = 16
+    if use_diffusion_head:
+        _inner = accelerator.unwrap_model(model)
+        if getattr(_inner, 'diff_head', None) is not None:
+            _dh_feat_dim = _inner.diff_head.in_channels
     img_size = args.image_size
     has_eval_models = (clevr_detector is not None
                        and clevr_classifier is not None
@@ -2702,20 +2868,42 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                 chunk_bs = chunk_end - chunk_start
                 chunk_cond = (my_cond_tokens[chunk_start:chunk_end]
                               if my_cond_tokens is not None else None)
-                sample_kwargs = dict(
-                    batch_size=chunk_bs, seq_len=seq_len,
-                    num_steps=args.eval_num_steps, device=device,
-                    sampler=sc["sampler"], noise_removal=True,
-                    cond_tokens=chunk_cond,
-                    tokens_per_step=sc.get("tokens_per_step", 0),
-                )
-                if args.model_type == "ar":
-                    sample_kwargs.update(temperature=args.ar_temperature,
-                                         top_k=args.ar_top_k, top_p=args.ar_top_p)
-                token_chunks.append(model.sample(**sample_kwargs))
+                chunk_uncond = (my_uncond_cond_tokens[chunk_start:chunk_end]
+                                if my_uncond_cond_tokens is not None else None)
+                if use_diffusion_head:
+                    sample_kwargs = dict(
+                        batch_size=chunk_bs, seq_len=seq_len,
+                        feat_dim=_dh_feat_dim,
+                        num_steps=args.eval_num_steps, device=device,
+                        sampler=sc["sampler"],
+                        tokens_per_step=sc.get("tokens_per_step", 0),
+                        cond_tokens=chunk_cond,
+                        uncond_cond_tokens=chunk_uncond,
+                        temperature=getattr(args, 'diff_head_temperature', 1.0),
+                        cfg=getattr(args, 'diff_head_cfg', 1.0),
+                        cfg_schedule=getattr(args, 'cfg_schedule', 'constant'),
+                        cfg_mode=getattr(args, 'cfg_mode', 'head'),
+                        null_class_index=None,  # CLEVR has no class labels
+                    )
+                    token_chunks.append(model.sample_continuous(**sample_kwargs))
+                else:
+                    sample_kwargs = dict(
+                        batch_size=chunk_bs, seq_len=seq_len,
+                        num_steps=args.eval_num_steps, device=device,
+                        sampler=sc["sampler"], noise_removal=True,
+                        cond_tokens=chunk_cond,
+                        tokens_per_step=sc.get("tokens_per_step", 0),
+                    )
+                    if args.model_type == "ar":
+                        sample_kwargs.update(temperature=args.ar_temperature,
+                                             top_k=args.ar_top_k, top_p=args.ar_top_p)
+                    token_chunks.append(model.sample(**sample_kwargs))
             my_tokens = torch.cat(token_chunks, dim=0)
         else:
-            my_tokens = torch.zeros(0, seq_len, dtype=torch.long, device=device)
+            if use_diffusion_head:
+                my_tokens = torch.zeros(0, seq_len, _dh_feat_dim, device=device)
+            else:
+                my_tokens = torch.zeros(0, seq_len, dtype=torch.long, device=device)
 
         torch.cuda.synchronize()
         _t1 = _time.time()
@@ -2729,12 +2917,19 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                   f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB / "
                   f"{torch.cuda.max_memory_allocated(device)/1e9:.2f}GB peak)", flush=True)
             try:
-                my_images = decode_tokens_to_images(
-                    my_tokens, level_sizes, pretrained_model,
-                    discretizer, device,
-                    num_steps=args.decode_num_steps,
-                    batch_size=min(4, my_n),
-                )  # (my_n, 3, H, W) in [0, 1]
+                if use_diffusion_head:
+                    my_images = decode_continuous_tokens_to_images(
+                        my_tokens, level_sizes, pretrained_model, device,
+                        num_steps=args.decode_num_steps,
+                        batch_size=min(4, my_n),
+                    )
+                else:
+                    my_images = decode_tokens_to_images(
+                        my_tokens, level_sizes, pretrained_model,
+                        discretizer, device,
+                        num_steps=args.decode_num_steps,
+                        batch_size=min(4, my_n),
+                    )  # (my_n, 3, H, W) in [0, 1]
             except Exception as e:
                 import traceback
                 print(f"[eval/debug] rank={rank} [{tag}] decode FAILED: {e}\n"
@@ -2848,10 +3043,22 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                 for local_i, global_i in enumerate(r_indices):
                     all_images[global_i] = r_imgs[local_i]
 
-            # Save image grid
+            # Save image grid — interleave (GT, gen) pairs when the source
+            # image dataset is available; otherwise fall back to gen-only.
             img_path = os.path.join(
                 save_dir, f"step_{step:07d}_clevr_{tag}.png")
-            save_sample_grid(all_images, img_path, nrow=8)
+            src_ds = getattr(val_dataset, "source_image_ds", None)
+            if src_ds is not None:
+                gt_imgs = torch.stack([
+                    src_ds[selected_indices[i]]["image"]
+                    for i in range(n_samples)
+                ])  # (N, 3, H, W) in [-1, 1]
+                # (gt, gen) pairs → (2N, 3, H, W); rows alternate gt/gen.
+                paired = torch.stack([gt_imgs, all_images], dim=1).view(
+                    -1, 3, img_size, img_size)
+                save_sample_grid(paired, img_path, nrow=8)
+            else:
+                save_sample_grid(all_images, img_path, nrow=8)
             accelerator.print(
                 f"[{log_prefix}/clevr] step={step} [{tag}] saved → {img_path}")
 
@@ -2997,6 +3204,32 @@ def parse_args():
                    choices=["json", "text"],
                    help="Condition format: 'json' (structured) or 'text' (captions).")
 
+    # ── Pretrained text encoder (CLIP / T5), only for cond_type=text ──
+    p.add_argument("--use_pretrained_text_encoder", action="store_true",
+                   default=False,
+                   help="Replace the word-level CLEVR text encoder with a "
+                        "pretrained HF encoder (CLIP / T5). Only used when "
+                        "--clevr_cond_type=text.")
+    p.add_argument("--pretrained_text_model_name", type=str,
+                   default="openai/clip-vit-base-patch32",
+                   help="HF model name for the pretrained text encoder "
+                        "(e.g. 'openai/clip-vit-base-patch32', "
+                        "'google-t5/t5-base').")
+    p.add_argument("--pretrained_text_max_length", type=int, default=77,
+                   help="Tokenizer max_length for the pretrained text encoder "
+                        "(CLIP hard-caps at 77).")
+    p.add_argument("--freeze_text_encoder", action="store_true",
+                   dest="freeze_text_encoder", default=True,
+                   help="Freeze the pretrained text encoder weights "
+                        "(only the projection is trained). Default: frozen.")
+    p.add_argument("--unfreeze_text_encoder", action="store_false",
+                   dest="freeze_text_encoder",
+                   help="Fine-tune the pretrained text encoder (separate LR "
+                        "via --text_encoder_lr).")
+    p.add_argument("--text_encoder_lr", type=float, default=None,
+                   help="LR for the unfrozen pretrained text encoder "
+                        "(default: 0.1 * --lr).")
+
     # ── Sudoku ──
     p.add_argument("--sudoku_config", type=str, default=None)
     p.add_argument("--grid_only", action="store_true", default=False)
@@ -3091,6 +3324,19 @@ def parse_args():
     # ── conditioning ──
     p.add_argument("--uncond_drop_prob", type=float, default=0.1,
                    help="Probability of dropping condition (CFG training).")
+    p.add_argument("--cfg_mode", type=str, default="head",
+                   choices=["head", "backbone"],
+                   help="'head' (default, sudoku): drop z at diffusion head input "
+                        "(diff_head_cond_drop_prob). 'backbone' (MAR/semanticist "
+                        "style, clevr/imagenet): swap backbone-input condition with "
+                        "learned null_cond, backbone forwards twice for CFG. "
+                        "When 'backbone', diff_head_cond_drop_prob is forced to 0.")
+    p.add_argument("--cfg_schedule", type=str, default="constant",
+                   choices=["constant", "linear"],
+                   help="Per-step CFG schedule during sampling (semanticist): "
+                        "'constant' applies --diff_head_cfg at every step; "
+                        "'linear' ramps from 1.0 at step 0 to --diff_head_cfg "
+                        "at the final step.")
 
     # ── training ──
     p.add_argument("--max_train_steps", type=int, default=200_000)
@@ -3299,16 +3545,26 @@ def main():
             f"from {len(val_img_only)} unique images")
 
         cache_dir = args.token_cache_dir or os.path.join(args.output_dir, "token_cache")
-        train_cache_path = os.path.join(cache_dir, "clevr_train_tok.pt")
-        val_cache_path = os.path.join(cache_dir, "clevr_val_tok.pt")
 
-        # Cache tokens for unique images only
-        train_tok_unique = cache_all_tokens(
-            encoder, discretizer, train_img_only, accelerator.device,
-            batch_size=64, cache_path=train_cache_path, accelerator=accelerator)
-        val_tok_unique = cache_all_tokens(
-            encoder, discretizer, val_img_only, accelerator.device,
-            batch_size=64, cache_path=val_cache_path, accelerator=accelerator)
+        if args.use_diffusion_head:
+            # ── Continuous mode: extract feature vectors (no discretizer) ──
+            train_cache_path = os.path.join(cache_dir, "clevr_train_cont.pt")
+            val_cache_path = os.path.join(cache_dir, "clevr_val_cont.pt")
+            train_feats_unique = cache_all_continuous_tokens(
+                encoder, train_img_only, accelerator.device,
+                batch_size=64, cache_path=train_cache_path, accelerator=accelerator)
+            val_feats_unique = cache_all_continuous_tokens(
+                encoder, val_img_only, accelerator.device,
+                batch_size=64, cache_path=val_cache_path, accelerator=accelerator)
+        else:
+            train_cache_path = os.path.join(cache_dir, "clevr_train_tok.pt")
+            val_cache_path = os.path.join(cache_dir, "clevr_val_tok.pt")
+            train_tok_unique = cache_all_tokens(
+                encoder, discretizer, train_img_only, accelerator.device,
+                batch_size=64, cache_path=train_cache_path, accelerator=accelerator)
+            val_tok_unique = cache_all_tokens(
+                encoder, discretizer, val_img_only, accelerator.device,
+                batch_size=64, cache_path=val_cache_path, accelerator=accelerator)
         accelerator.wait_for_everyone()
 
         # Build path → token index mapping for unique images
@@ -3319,8 +3575,12 @@ def main():
         train_tok_indices = [train_path_to_idx[p] for p in train_img_ds.image_paths]
         val_tok_indices = [val_path_to_idx[p] for p in val_img_ds.image_paths]
 
-        train_tok = train_tok_unique[train_tok_indices]
-        val_tok = val_tok_unique[val_tok_indices]
+        if args.use_diffusion_head:
+            train_feats = train_feats_unique[train_tok_indices]
+            val_feats = val_feats_unique[val_tok_indices]
+        else:
+            train_tok = train_tok_unique[train_tok_indices]
+            val_tok = val_tok_unique[val_tok_indices]
 
         # Collect CLEVR conditions
         train_conditions = [train_img_ds.get_condition(i) for i in range(len(train_img_ds))]
@@ -3328,21 +3588,64 @@ def main():
 
         # Select tokenizer and encoder based on condition type
         if cond_type == "text":
-            cond_tokenizer_fn = clevr_text_to_token_ids
-            clevr_cond_encoder = CLEVRTextConditionEncoder(args.hidden_size)
-            accelerator.print(f"[clevr] TEXT condition encoder built, "
-                              f"vocab_size={CLEVR_TEXT_VOCAB_SIZE}, hidden_size={args.hidden_size}")
+            if args.use_pretrained_text_encoder:
+                clevr_cond_encoder = PretrainedTextConditionEncoder(
+                    model_name=args.pretrained_text_model_name,
+                    hidden_size=args.hidden_size,
+                    max_length=args.pretrained_text_max_length,
+                    freeze=args.freeze_text_encoder,
+                )
+                cond_tokenizer_fn = None  # pretrained path tokenizes per-batch
+                accelerator.print(
+                    f"[clevr] TEXT condition encoder: PRETRAINED "
+                    f"({clevr_cond_encoder._kind}, "
+                    f"{args.pretrained_text_model_name}, "
+                    f"max_len={args.pretrained_text_max_length}, "
+                    f"freeze={args.freeze_text_encoder}) → "
+                    f"hidden_size={args.hidden_size}")
+            else:
+                cond_tokenizer_fn = clevr_text_to_token_ids
+                clevr_cond_encoder = CLEVRTextConditionEncoder(args.hidden_size)
+                accelerator.print(
+                    f"[clevr] TEXT condition encoder: word-vocab, "
+                    f"vocab_size={CLEVR_TEXT_VOCAB_SIZE}, "
+                    f"hidden_size={args.hidden_size}")
         else:
             cond_tokenizer_fn = clevr_json_to_token_ids
             clevr_cond_encoder = CLEVRConditionEncoder(args.hidden_size)
             accelerator.print(f"[clevr] JSON condition encoder built, hidden_size={args.hidden_size}")
 
-        train_dataset = CachedTokenDataset(
-            train_tok, clevr_conditions=train_conditions,
-            cond_tokenizer_fn=cond_tokenizer_fn)
-        val_dataset = CachedTokenDataset(
-            val_tok, clevr_conditions=val_conditions,
-            cond_tokenizer_fn=cond_tokenizer_fn)
+        if args.use_diffusion_head:
+            cont_feat_dim = train_feats.shape[-1]
+            seq_len = train_feats.shape[1]
+            accelerator.print(
+                f"[clevr-diffhead] Continuous tokens: seq_len={seq_len}, "
+                f"feat_dim={cont_feat_dim}, shape={train_feats.shape}")
+            train_dataset = CachedContinuousTokenDataset(
+                train_feats, clevr_conditions=train_conditions,
+                cond_tokenizer_fn=cond_tokenizer_fn,
+                return_raw_text=args.use_pretrained_text_encoder
+                                and cond_type == "text",
+                source_image_ds=train_img_ds)
+            val_dataset = CachedContinuousTokenDataset(
+                val_feats, clevr_conditions=val_conditions,
+                cond_tokenizer_fn=cond_tokenizer_fn,
+                return_raw_text=args.use_pretrained_text_encoder
+                                and cond_type == "text",
+                source_image_ds=val_img_ds)
+        else:
+            train_dataset = CachedTokenDataset(
+                train_tok, clevr_conditions=train_conditions,
+                cond_tokenizer_fn=cond_tokenizer_fn,
+                return_raw_text=args.use_pretrained_text_encoder
+                                and cond_type == "text",
+                source_image_ds=train_img_ds)
+            val_dataset = CachedTokenDataset(
+                val_tok, clevr_conditions=val_conditions,
+                cond_tokenizer_fn=cond_tokenizer_fn,
+                return_raw_text=args.use_pretrained_text_encoder
+                                and cond_type == "text",
+                source_image_ds=val_img_ds)
 
         # Load CLEVR eval models (detector + classifier) on ALL ranks
         # so that condition eval can run distributed (each rank evals its shard).
@@ -3548,13 +3851,19 @@ def main():
     diff_head = None
     if args.use_diffusion_head:
         from diffloss import DiffLoss
+        # In backbone-CFG mode, force head-level drop off (only one level drops).
+        _head_drop = 0.0 if args.cfg_mode == "backbone" else args.diff_head_cond_drop_prob
+        if args.cfg_mode == "backbone" and args.diff_head_cond_drop_prob > 0:
+            accelerator.print(
+                f"[cfg_mode=backbone] overriding diff_head_cond_drop_prob "
+                f"{args.diff_head_cond_drop_prob} → 0.0 (CFG handled at backbone)")
         diff_head = DiffLoss(
             target_channels=cont_feat_dim,
             z_channels=args.hidden_size,
             depth=args.diff_head_depth,
             width=args.diff_head_width,
             num_sampling_steps=args.diff_head_num_sampling_steps,
-            cond_drop_prob=args.diff_head_cond_drop_prob,
+            cond_drop_prob=_head_drop,
         )
         dh_total, dh_train = count_params(diff_head)
         accelerator.print(
@@ -3606,14 +3915,44 @@ def main():
 
     # Optimizer
     all_params = list(diffusion.parameters())
+    te_params = []  # unfrozen pretrained text-encoder params (separate LR)
     if clevr_cond_encoder is not None:
-        all_params += list(clevr_cond_encoder.parameters())
         ce_total, ce_train = count_params(clevr_cond_encoder)
         accelerator.print(f"[model] CLEVR cond encoder: {format_n(ce_total)} params")
 
+        is_pretrained_te = isinstance(
+            clevr_cond_encoder, PretrainedTextConditionEncoder)
+        if is_pretrained_te and not clevr_cond_encoder.freeze:
+            # Separate LR for the pretrained backbone; projection stays at main LR.
+            for name, param in clevr_cond_encoder.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name.startswith("encoder."):
+                    te_params.append(param)
+                else:
+                    all_params.append(param)
+        else:
+            all_params += [p for p in clevr_cond_encoder.parameters()
+                           if p.requires_grad]
+
+    param_groups = [{"params": all_params, "lr": args.lr,
+                     "weight_decay": args.weight_decay}]
+    if te_params:
+        te_lr = (args.text_encoder_lr if args.text_encoder_lr is not None
+                 else args.lr * 0.1)
+        param_groups.append({"params": te_params, "lr": te_lr,
+                             "weight_decay": args.weight_decay})
+        n_te = sum(p.numel() for p in te_params)
+        accelerator.print(
+            f"[model] Pretrained text encoder unfrozen: "
+            f"{format_n(n_te)} params, LR={te_lr:.2e} "
+            f"(main LR={args.lr:.2e})")
+
     optimizer = torch.optim.AdamW(
-        all_params, lr=args.lr, betas=(0.9, 0.999),
+        param_groups, lr=args.lr, betas=(0.9, 0.999),
         eps=1e-8, weight_decay=args.weight_decay)
+    # Preserve behavior of `all_params` for grad clipping below.
+    all_params = all_params + te_params
     lr_scheduler = get_lr_scheduler(
         optimizer, args.warmup_steps, args.max_train_steps,
         schedule=args.lr_schedule, min_lr_ratio=args.min_lr_ratio,
@@ -3753,20 +4092,48 @@ def main():
                     cond_tokens = cond_tokens * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
 
             elif args.dataset_type == "clevr":
-                # Encode CLEVR conditions: token IDs → embeddings
-                cond_ids = batch["cond_token_ids"].to(accelerator.device)
-
                 cond_enc = clevr_cond_encoder
                 if hasattr(cond_enc, 'module'):
                     cond_enc = cond_enc.module
-                cond_tokens = cond_enc(cond_ids)
 
-                # CFG dropout: zero out all cond tokens
+                is_pretrained_te = isinstance(
+                    cond_enc, PretrainedTextConditionEncoder)
+
+                if is_pretrained_te:
+                    # Naive-style: tokenize per-batch with dynamic padding,
+                    # use tokenizer's real attention_mask, and draw uncond
+                    # tokens from encoder.null_embed.
+                    texts = batch["cond_text"]
+                    text_tokens = cond_enc.tokenize(texts, accelerator.device)
+                    cond_tokens, _cond_mask = cond_enc(text_tokens)
+                else:
+                    cond_ids = batch["cond_token_ids"].to(accelerator.device)
+                    cond_tokens = cond_enc(cond_ids)
+
+                # CFG dropout at backbone input
                 B_for_drop = cont_tokens.shape[0] if cont_tokens is not None else tokens.shape[0]
                 if args.uncond_drop_prob > 0 and diffusion.training:
                     drop_mask = (torch.rand(B_for_drop,
                                             device=accelerator.device) < args.uncond_drop_prob)
-                    cond_tokens = cond_tokens * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
+                    if is_pretrained_te:
+                        # Naive recipe: swap with encoder's learnable null_embed.
+                        null_expanded = cond_enc.get_null_cond(
+                            B_for_drop, cond_tokens.shape[1],
+                            accelerator.device).to(cond_tokens.dtype)
+                        cond_tokens = torch.where(
+                            drop_mask[:, None, None], null_expanded, cond_tokens)
+                    elif args.cfg_mode == "backbone":
+                        # MAR/semanticist style: swap with backbone null_cond.
+                        bb = accelerator.unwrap_model(diffusion).backbone
+                        null_tok = bb.null_cond_token.to(cond_tokens.dtype)
+                        null_expanded = null_tok.expand(B_for_drop,
+                                                        cond_tokens.shape[1],
+                                                        -1)
+                        cond_tokens = torch.where(
+                            drop_mask[:, None, None], null_expanded, cond_tokens)
+                    else:
+                        # Legacy head-CFG mode: zero out
+                        cond_tokens = cond_tokens * (~drop_mask).float().unsqueeze(-1).unsqueeze(-1)
 
             # ── Forward + backward ──
             with accelerator.accumulate(diffusion):

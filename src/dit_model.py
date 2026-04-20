@@ -591,6 +591,10 @@ class DIT(nn.Module):
             self.cond_emb = None
             self.cond_pos_emb = None
 
+        # MAR/semanticist-style learnable unconditional token (single vector,
+        # broadcast to L_cond when used). Activated only when --cfg_mode=backbone.
+        self.null_cond_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+
         self.blocks = nn.ModuleList([
             DDiTBlock(hidden_size, n_heads, cond_dim, mlp_ratio, dropout,
                       use_cross_attn=use_cross_attn, causal=causal)

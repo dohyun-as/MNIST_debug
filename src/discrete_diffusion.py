@@ -585,6 +585,10 @@ class DiscreteDiffusion(nn.Module):
         tokens_per_step: int = 0,
         known_mask: Optional[Tensor] = None,
         known_tokens: Optional[Tensor] = None,
+        cfg_mode: str = "head",
+        null_class_index: Optional[int] = None,
+        uncond_cond_tokens: Optional[Tensor] = None,
+        cfg_schedule: str = "constant",
     ) -> Tensor:
         """Generate continuous tokens via MaskGIT-style iterative unmasking.
 
@@ -615,6 +619,62 @@ class DiscreteDiffusion(nn.Module):
         import math as _math
         assert self.diff_head is not None, \
             "diff_head required for continuous sampling"
+
+        def _cfg_at(cur_step: int, total: int) -> float:
+            """Semanticist-style CFG scheduling across unmask steps.
+
+            - constant: returns ``cfg`` every step.
+            - linear:   ramps from ~1.0 (cur=0) to ``cfg`` (cur=total-1).
+            """
+            if cfg_schedule == "constant":
+                return cfg
+            if cfg_schedule == "linear":
+                return 1.0 + (cfg - 1.0) * (cur_step + 1) / max(total, 1)
+            raise NotImplementedError(
+                f"Unknown cfg_schedule: {cfg_schedule}")
+
+        use_backbone_cfg = (cfg_mode == "backbone") and (cfg != 1.0)
+
+        # Precompute null version of cond inputs for backbone-CFG mode.
+        null_cond_tokens_cached = None
+        null_class_labels_cached = None
+        if use_backbone_cfg:
+            if cond_tokens is not None:
+                if uncond_cond_tokens is not None:
+                    # Caller supplied explicit uncond prefix (e.g. naive-style
+                    # encoder.null_embed for a pretrained text encoder). Must
+                    # match cond shape / dtype.
+                    null_cond_tokens_cached = uncond_cond_tokens.to(
+                        cond_tokens.dtype).contiguous()
+                else:
+                    null_tok = self.backbone.null_cond_token.to(cond_tokens.dtype)
+                    null_cond_tokens_cached = null_tok.expand(
+                        cond_tokens.shape[0], cond_tokens.shape[1], -1
+                    ).contiguous()
+            if class_labels is not None:
+                assert null_class_index is not None, \
+                    "cfg_mode=backbone with class_labels requires null_class_index"
+                null_class_labels_cached = torch.full_like(class_labels, null_class_index)
+
+        def _fwd(sigma_in, cur_mask, cur_x):
+            """Run backbone. In backbone-CFG mode, returns (hidden_cond, hidden_uncond),
+            else returns (hidden, None)."""
+            hidden = self.backbone(
+                indices=None, sigma=sigma_in,
+                cond_tokens=cond_tokens, class_labels=class_labels,
+                prefix_mode=(cond_tokens is not None),
+                cont_tokens=cur_x, mask=cur_mask,
+            )
+            hidden_un = None
+            if use_backbone_cfg:
+                hidden_un = self.backbone(
+                    indices=None, sigma=sigma_in,
+                    cond_tokens=null_cond_tokens_cached,
+                    class_labels=null_class_labels_cached,
+                    prefix_mode=(null_cond_tokens_cached is not None),
+                    cont_tokens=cur_x, mask=cur_mask,
+                )
+            return hidden, hidden_un
 
         x = torch.zeros(batch_size, seq_len, feat_dim, device=device)
         is_masked = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
@@ -651,20 +711,17 @@ class DiscreteDiffusion(nn.Module):
                 move_s = (1 - torch.exp(-sigma_s))
                 unmask_prob = (1 - move_s / move_t).clamp(0, 1)  # (B,)
 
-                use_prefix = (cond_tokens is not None)
-                hidden = self.backbone(
-                    indices=None, sigma=self._t(sigma_t),
-                    cond_tokens=cond_tokens, class_labels=class_labels,
-                    prefix_mode=use_prefix,
-                    cont_tokens=x, mask=is_masked,
-                )  # (B, L, H)
+                hidden, hidden_un = _fwd(self._t(sigma_t), is_masked, x)
 
                 rand = torch.rand(batch_size, seq_len, device=device)
                 do_unmask = (rand < unmask_prob[:, None]) & is_masked
                 if do_unmask.any():
                     sel_hidden = hidden[do_unmask]
+                    sel_uncond = hidden_un[do_unmask] if hidden_un is not None else None
+                    cur_cfg = _cfg_at(step, num_steps)
                     sel_tokens = self.diff_head.sample(
-                        sel_hidden, temperature=temperature, cfg=cfg)
+                        sel_hidden, temperature=temperature, cfg=cur_cfg,
+                        z_uncond=sel_uncond)
                     x[do_unmask] = sel_tokens
                     is_masked[do_unmask] = False
 
@@ -672,23 +729,20 @@ class DiscreteDiffusion(nn.Module):
                     history.append(x.clone().cpu())
                     mask_history.append(is_masked.clone().cpu())
 
-            # Final pass: unmask leftovers
+            # Final pass: unmask leftovers — use full-scale cfg (end of schedule).
             if is_masked.any():
                 n_masked_b = is_masked.float().sum(dim=1)
                 masked_ratio = (n_masked_b / seq_len).clamp(1e-5, 1)
                 sigma_t = self.noise(masked_ratio.view(-1, 1))[0]
                 if sigma_t.ndim > 1:
                     sigma_t = sigma_t.squeeze(-1)
-                use_prefix = (cond_tokens is not None)
-                hidden = self.backbone(
-                    indices=None, sigma=self._t(sigma_t),
-                    cond_tokens=cond_tokens, class_labels=class_labels,
-                    prefix_mode=use_prefix,
-                    cont_tokens=x, mask=is_masked,
-                )
+                hidden, hidden_un = _fwd(self._t(sigma_t), is_masked, x)
                 masked_hidden = hidden[is_masked]
+                masked_uncond = hidden_un[is_masked] if hidden_un is not None else None
                 sampled_tokens = self.diff_head.sample(
-                    masked_hidden, temperature=temperature, cfg=cfg)
+                    masked_hidden, temperature=temperature,
+                    cfg=_cfg_at(num_steps - 1, num_steps),
+                    z_uncond=masked_uncond)
                 x[is_masked] = sampled_tokens
                 is_masked.fill_(False)
                 if return_history:
@@ -710,20 +764,15 @@ class DiscreteDiffusion(nn.Module):
             if sigma_t.ndim > 1:
                 sigma_t = sigma_t.squeeze(-1)
 
-            # 1) Backbone forward — 1 pass
-            use_prefix = (cond_tokens is not None)
-            hidden = self.backbone(
-                indices=None, sigma=self._t(sigma_t),
-                cond_tokens=cond_tokens, class_labels=class_labels,
-                prefix_mode=use_prefix,
-                cont_tokens=x, mask=is_masked,
-            )  # (B, L, H)
+            # 1) Backbone forward — 1 pass (or 2x in backbone-CFG mode)
+            hidden, hidden_un = _fwd(self._t(sigma_t), is_masked, x)
 
             masked_indices = is_masked.nonzero(as_tuple=False)  # (N_masked, 2)
             if masked_indices.shape[0] == 0:
                 break
 
             masked_hidden = hidden[is_masked]  # (N_masked, H)
+            masked_uncond = hidden_un[is_masked] if hidden_un is not None else None
 
             # 2) Cheap confidence — 1 MLP forward, no ODE loop
             confidence = self._cheap_confidence(masked_hidden)  # (N_masked,)
@@ -740,6 +789,7 @@ class DiscreteDiffusion(nn.Module):
 
             # 4) Select top-k per batch, gather, single ODE call
             all_selected_hidden = []
+            all_selected_uncond = []
             all_batch_ids = []
             all_positions = []
 
@@ -759,13 +809,19 @@ class DiscreteDiffusion(nn.Module):
 
                 _, topk = b_conf.topk(n_to_unmask)
                 all_selected_hidden.append(b_hidden[topk])
+                if masked_uncond is not None:
+                    all_selected_uncond.append(masked_uncond[b_selector][topk])
                 all_batch_ids.extend([b] * n_to_unmask)
                 all_positions.append(b_masked_pos[topk])
 
             if all_selected_hidden:
                 cat_hidden = torch.cat(all_selected_hidden, dim=0)  # (K_total, H)
+                cat_uncond = torch.cat(all_selected_uncond, dim=0) \
+                    if all_selected_uncond else None
                 cat_tokens = self.diff_head.sample(
-                    cat_hidden, temperature=temperature, cfg=cfg
+                    cat_hidden, temperature=temperature,
+                    cfg=_cfg_at(step, num_steps),
+                    z_uncond=cat_uncond,
                 )  # (K_total, D)
 
                 # Scatter back (vectorized)
@@ -786,16 +842,13 @@ class DiscreteDiffusion(nn.Module):
             if sigma_t.ndim > 1:
                 sigma_t = sigma_t.squeeze(-1)
 
-            use_prefix = (cond_tokens is not None)
-            hidden = self.backbone(
-                indices=None, sigma=self._t(sigma_t),
-                cond_tokens=cond_tokens, class_labels=class_labels,
-                prefix_mode=use_prefix,
-                cont_tokens=x, mask=is_masked,
-            )
+            hidden, hidden_un = _fwd(self._t(sigma_t), is_masked, x)
             masked_hidden = hidden[is_masked]
+            masked_uncond = hidden_un[is_masked] if hidden_un is not None else None
             sampled_tokens = self.diff_head.sample(
-                masked_hidden, temperature=temperature, cfg=cfg)
+                masked_hidden, temperature=temperature,
+                cfg=_cfg_at(num_steps - 1, num_steps),
+                z_uncond=masked_uncond)
 
             x[is_masked] = sampled_tokens
             is_masked.fill_(False)

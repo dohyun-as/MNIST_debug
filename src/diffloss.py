@@ -292,21 +292,25 @@ class DiffLoss(nn.Module):
         return loss
 
     @torch.no_grad()
-    def sample(self, z, temperature=1.0, cfg=1.0):
+    def sample(self, z, temperature=1.0, cfg=1.0, z_uncond=None):
         """Generate continuous tokens via Euler ODE (no confidence).
 
         Args:
             z: (N, z_channels) conditioning from backbone
             temperature: noise scaling
             cfg: classifier-free guidance scale (1.0 = no guidance)
+            z_uncond: (N, z_channels) optional precomputed unconditional
+                hidden states (MAR/semanticist-style backbone CFG). When
+                provided, overrides the internal null_cond embedding.
         Returns:
             (N, target_channels) sampled continuous tokens
         """
-        tokens, _ = self.sample_with_confidence(z, temperature=temperature, cfg=cfg)
+        tokens, _ = self.sample_with_confidence(
+            z, temperature=temperature, cfg=cfg, z_uncond=z_uncond)
         return tokens
 
     @torch.no_grad()
-    def sample_with_confidence(self, z, temperature=1.0, cfg=1.0):
+    def sample_with_confidence(self, z, temperature=1.0, cfg=1.0, z_uncond=None):
         """Generate continuous tokens + confidence via Euler ODE.
 
         Confidence = negative mean sigma_theta accumulated over the last
@@ -332,7 +336,15 @@ class DiffLoss(nn.Module):
         # For CFG, build a stacked conditioning tensor [cond; uncond]
         # so we can run the net once on 2N inputs per ODE step.
         if use_cfg:
-            null_z = self.null_cond[None, :].to(z.dtype).expand(N, -1)
+            if z_uncond is not None:
+                # Backbone-CFG: caller supplies uncond hidden states from a
+                # separate backbone forward (MAR/semanticist style).
+                assert z_uncond.shape == z.shape, \
+                    f"z_uncond shape {z_uncond.shape} != z {z.shape}"
+                null_z = z_uncond.to(z.dtype)
+            else:
+                # Head-CFG: use this module's learned null_cond embedding.
+                null_z = self.null_cond[None, :].to(z.dtype).expand(N, -1)
             z_cat = torch.cat([z, null_z], dim=0)  # (2N, H)
 
         dt = 1.0 / self.num_sampling_steps

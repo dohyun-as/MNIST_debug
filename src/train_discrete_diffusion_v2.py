@@ -4099,10 +4099,6 @@ def main():
     if clevr_cond_encoder is not None:
         ce_total, ce_train = count_params(clevr_cond_encoder)
         accelerator.print(f"[model] CLEVR cond encoder: {format_n(ce_total)} params")
-    if sudoku_cell_cond_encoder is not None:
-        all_params += list(sudoku_cell_cond_encoder.parameters())
-        cc_total, _ = count_params(sudoku_cell_cond_encoder)
-        accelerator.print(f"[model] Sudoku cell cond encoder: {format_n(cc_total)} params")
 
         is_pretrained_te = isinstance(
             clevr_cond_encoder, PretrainedTextConditionEncoder)
@@ -4118,6 +4114,11 @@ def main():
         else:
             all_params += [p for p in clevr_cond_encoder.parameters()
                            if p.requires_grad]
+
+    if sudoku_cell_cond_encoder is not None:
+        all_params += list(sudoku_cell_cond_encoder.parameters())
+        cc_total, _ = count_params(sudoku_cell_cond_encoder)
+        accelerator.print(f"[model] Sudoku cell cond encoder: {format_n(cc_total)} params")
 
     param_groups = [{"params": all_params, "lr": args.lr,
                      "weight_decay": args.weight_decay}]

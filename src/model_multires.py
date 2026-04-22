@@ -151,6 +151,9 @@ class MultiResConditionalUNet(nn.Module):
         swin_num_heads: list[int] | None = None,
         swin_window_size: int = 4,
         swin_mlp_ratio: float = 4.0,
+        # --- CLIP init (vit_global only) ---
+        vit_init_clip: bool = False,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
         # --- Discretization ---
         use_fsq: bool = False,
         fsq_levels: list[int] | None = None,
@@ -215,6 +218,8 @@ class MultiResConditionalUNet(nn.Module):
             swin_window_size=swin_window_size,
             swin_mlp_ratio=swin_mlp_ratio,
             level_sizes=level_sizes,
+            vit_init_clip=vit_init_clip,
+            clip_model_name=clip_model_name,
         )
 
         # ── Discretizer (optional) ──
@@ -373,7 +378,7 @@ class MultiResConditionalUNet(nn.Module):
         lines = [
             f"Image: {self.image_size}×{self.image_size}",
             f"VAE: ×{self.vae_downsample_factor} → latent {self.latent_size}×{self.latent_size}",
-            f"Encoder input: {'VAE latent' if self.cond_use_latent else 'raw image'} ({self.encoder.image_size}×{self.encoder.image_size}×{self.encoder.patch_cnn.net[0].conv1.in_channels if self.encoder.encoder_type == 'cnn' else self.encoder.cell_vit._stem_ch}ch)",
+            f"Encoder input: {'VAE latent' if self.cond_use_latent else 'raw image'} ({self.encoder.image_size}×{self.encoder.image_size}, type={self.encoder.encoder_type})",
             f"Encoder min_patch: {self.encoder.min_patch_size}",
             f"Encoder levels: {self.encoder.level_sizes}",
             f"Upsample factor: ×{self._upsample_factor}",
@@ -995,6 +1000,9 @@ class MultiResConditionalDiT(nn.Module):
         swin_num_heads: list[int] | None = None,
         swin_window_size: int = 4,
         swin_mlp_ratio: float = 4.0,
+        # --- CLIP init (vit_global only) ---
+        vit_init_clip: bool = False,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
         # --- Discretization ---
         use_fsq: bool = False,
         fsq_levels: list[int] | None = None,
@@ -1075,6 +1083,8 @@ class MultiResConditionalDiT(nn.Module):
             swin_window_size=swin_window_size,
             swin_mlp_ratio=swin_mlp_ratio,
             level_sizes=level_sizes,
+            vit_init_clip=vit_init_clip,
+            clip_model_name=clip_model_name,
         )
 
         # ── Discretizer (identical to UNet version) ──

@@ -111,8 +111,11 @@ def parse_args():
 
     # --- ViT encoder ---
     p.add_argument("--encoder_type", type=str, default="cnn",
-                   choices=["cnn", "vit", "swin"],
-                   help="Encoder backend: 'cnn' (PatchCNN+merge), 'vit' (shared CellViT), or 'swin' (Swin Transformer)")
+                   choices=["cnn", "vit", "swin", "vit_global"],
+                   help="Encoder backend: 'cnn' (PatchCNN+merge), "
+                        "'vit' (shared CellViT per cell), "
+                        "'swin' (Swin Transformer), or "
+                        "'vit_global' (single ViT forward → avg pool per level)")
     p.add_argument("--vit_patch_size", type=int, default=4,
                    help="ViT sub-patch size for finest level")
     p.add_argument("--vit_depth", type=int, default=4,
@@ -127,6 +130,15 @@ def parse_args():
                    help="Disable CNN stem")
     p.add_argument("--vit_cnn_stem_reduction", type=int, default=4,
                    help="CNN stem spatial reduction factor")
+
+    # --- CLIP init for vit_global ---
+    p.add_argument("--vit_init_clip", action="store_true", default=False,
+                   help="Initialize vit_global encoder from pretrained CLIP "
+                        "(requires --vit_no_cnn_stem, --feat_channels 768, "
+                        "--vit_patch_size 16, --vit_depth 12, --vit_num_heads 12)")
+    p.add_argument("--clip_model_name", type=str,
+                   default="openai/clip-vit-base-patch16",
+                   help="HuggingFace CLIP model to load weights from")
 
     p.add_argument("--encoder_internal_dim", type=int, default=None,
                    help="Encoder internal dim (ViT hidden dim). If set, encoder runs at this dim "
@@ -297,7 +309,34 @@ def parse_args():
                    help="Number of val samples for CLEVR eval")
     p.add_argument("--num_workers", type=int, default=8)
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # vit_global compatibility checks
+    if args.encoder_type == 'vit_global' and args.mae_mask_ratio > 0:
+        p.error("--encoder_type vit_global does not support --mae_mask_ratio > 0 "
+                "(all spatial tokens are needed for avg pooling)")
+
+    # CLIP init compatibility checks
+    if args.vit_init_clip:
+        if args.encoder_type != 'vit_global':
+            p.error("--vit_init_clip requires --encoder_type vit_global")
+        if args.vit_use_cnn_stem and not args.vit_no_cnn_stem:
+            p.error("--vit_init_clip requires --vit_no_cnn_stem "
+                    "(CLIP has no CNN stem)")
+        # CLIP ViT-B/16 architectural constraints (warn rather than hard-fail
+        # so users can opt into e.g. CLIP ViT-L with matching dims)
+        expected_b16 = (
+            args.feat_channels == 768 and args.vit_depth == 12
+            and args.vit_num_heads == 12 and args.vit_patch_size == 16
+        )
+        if 'base-patch16' in args.clip_model_name and not expected_b16:
+            p.error(
+                f"--clip_model_name {args.clip_model_name} (ViT-B/16) requires "
+                "--feat_channels 768 --vit_depth 12 --vit_num_heads 12 "
+                "--vit_patch_size 16"
+            )
+
+    return args
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -580,6 +619,8 @@ def build_model(args):
             swin_num_heads=args.swin_num_heads,
             swin_window_size=args.swin_window_size,
             swin_mlp_ratio=args.swin_mlp_ratio,
+            vit_init_clip=args.vit_init_clip,
+            clip_model_name=args.clip_model_name,
             use_fsq=args.use_fsq,
             fsq_levels=args.fsq_levels,
             fsq_drop_quant_p=args.fsq_drop_quant_p,
@@ -658,6 +699,8 @@ def build_model(args):
         vit_mlp_ratio=args.vit_mlp_ratio,
         vit_use_cnn_stem=args.vit_use_cnn_stem and not args.vit_no_cnn_stem,
         vit_cnn_stem_reduction=args.vit_cnn_stem_reduction,
+        vit_init_clip=args.vit_init_clip,
+        clip_model_name=args.clip_model_name,
         use_fsq=args.use_fsq,
         fsq_levels=args.fsq_levels,
         fsq_drop_quant_p=args.fsq_drop_quant_p,

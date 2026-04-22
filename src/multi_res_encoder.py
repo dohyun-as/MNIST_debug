@@ -2,7 +2,7 @@
 Hierarchical Multi-Resolution Image Condition Encoder
 =====================================================
 
-Two encoder backends:
+Three encoder backends:
 
 1. **CNN** (default, ``encoder_type='cnn'``):
    Patchify → per-patch CNN (독립, cross-patch 교류 없음) → merge hierarchy.
@@ -21,6 +21,22 @@ Two encoder backends:
      - ``vit_use_cnn_stem``: 큰 patch에 대해 CNN stem 적용 (권장)
      - ``mae_mask_ratio``: training 시 cell 내부 token MAE masking
        (inference 시 masking 없이 전체 token 사용)
+
+3. **ViT-Global (single-forward)** (``encoder_type='vit_global'``):
+   전체 이미지를 **한 번만** ViT로 처리하여 finest grid 크기의 spatial
+   tokens를 생성한 뒤, coarser level은 avg pooling으로 파생.
+     Patchify → ViT forward (한 번) → (B, dim, tps, tps)
+     Level 8×8: tps×tps → avg_pool(tps/8) → (B, dim, 8, 8)
+     Level 4×4: tps×tps → avg_pool(tps/4) → (B, dim, 4, 4)
+     Level 2×2: tps×tps → avg_pool(tps/2) → (B, dim, 2, 2)
+     Level 1×1: tps×tps → avg_pool(tps)   → (B, dim, 1, 1)
+
+   ViT를 한 번만 돌리므로 cell-based 대비 훨씬 저렴 (~23 GFLOPs vs 469).
+   Options:
+     - ``vit_init_clip``: CLIP ViT weights로 patch_embed / pos_emb /
+       transformer 12 layers 초기화 (requires 256×256 image, patch=16,
+       dim=768, depth=12, heads=12, no CNN stem).
+   MAE masking 사용 불가 (avg pool에 모든 token 필요).
 
 Configurable parameters:
   - image_size: 원본 이미지 크기 (e.g. 256)
@@ -647,6 +663,9 @@ class HierarchicalMultiResEncoder(nn.Module):
         swin_mlp_ratio: float = 4.0,
         # ── Custom level sizes (optional) ──
         level_sizes: list[int] | None = None,
+        # ── CLIP initialization for vit_global (optional) ──
+        vit_init_clip: bool = False,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
     ):
         super().__init__()
 
@@ -702,6 +721,16 @@ class HierarchicalMultiResEncoder(nn.Module):
                             swin_depths or [2, 2, 6, 2],
                             swin_num_heads or [3, 6, 12, 24],
                             swin_window_size, swin_mlp_ratio)
+        elif encoder_type == 'vit_global':
+            assert mae_mask_ratio == 0.0, \
+                "vit_global does not support MAE masking (all spatial tokens " \
+                "are needed for avg pooling to derive coarser levels)"
+            self._init_vit_global(in_channels, dim, image_size,
+                                  vit_patch_size, vit_depth, vit_num_heads,
+                                  vit_mlp_ratio, vit_use_cnn_stem,
+                                  vit_cnn_stem_reduction)
+            if vit_init_clip:
+                self.init_from_clip(clip_model_name)
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
@@ -912,6 +941,266 @@ class HierarchicalMultiResEncoder(nn.Module):
         return level_features
 
     # ──────────────────────────────────────────────────────────────
+    #  ViT-Global backend: single-forward shared ViT + avg pool
+    # ──────────────────────────────────────────────────────────────
+
+    def _init_vit_global(self, in_channels, dim, image_size,
+                         vit_patch_size, vit_depth, vit_num_heads,
+                         vit_mlp_ratio, vit_use_cnn_stem,
+                         vit_cnn_stem_reduction):
+        """Initialize global ViT encoder (single forward).
+
+        전체 이미지를 ViT로 **한 번만** 처리한 뒤, level마다 avg pool만
+        다르게 적용.  Compute = 1× ViT forward (cell-based 대비 ~5× 저렴).
+
+        예) image=256, no stem, vit_patch=16 → 16×16 = 256 tokens
+          ViT forward (한 번) → (B, dim, 16, 16)
+          Level 8: avg_pool(2)  → (B, dim, 8, 8)
+          Level 4: avg_pool(4)  → (B, dim, 4, 4)
+          Level 2: avg_pool(8)  → (B, dim, 2, 2)
+          Level 1: avg_pool(16) → (B, dim, 1, 1)
+        """
+        # CNN stem (optional) — CLIP init 시에는 반드시 비활성 (CLIP은 plain
+        # patch_embed Conv만 가지고 있음)
+        if vit_use_cnn_stem:
+            self._global_stem = ConvStem(
+                in_channels, dim, reduction=vit_cnn_stem_reduction)
+            stem_ch = self._global_stem.out_channels
+            stem_r = vit_cnn_stem_reduction
+        else:
+            self._global_stem = None
+            stem_ch = in_channels
+            stem_r = 1
+
+        # Token grid: image_size / stem / vit_patch
+        tokens_per_side = image_size // (stem_r * vit_patch_size)
+        assert tokens_per_side >= self.finest_size, \
+            f"tokens_per_side({tokens_per_side}) must be >= " \
+            f"finest_size({self.finest_size}). Reduce vit_patch_size " \
+            f"or vit_cnn_stem_reduction."
+        for s in self.level_sizes:
+            assert tokens_per_side % s == 0, \
+                f"tokens_per_side({tokens_per_side}) must be divisible " \
+                f"by level_size({s})"
+
+        self._global_tokens_per_side = tokens_per_side
+        self._global_vit_patch_size = vit_patch_size
+        n_tokens = tokens_per_side * tokens_per_side
+
+        # Patch projection: flatten (C, p, p) → dim
+        patch_dim = stem_ch * vit_patch_size * vit_patch_size
+        self._global_patch_proj = nn.Linear(patch_dim, dim)
+
+        # Positional embedding (1D, over all patches)
+        self._global_pos_emb = nn.Parameter(torch.zeros(1, n_tokens, dim))
+        nn.init.trunc_normal_(self._global_pos_emb, std=0.02)
+
+        # Shared transformer (pre-norm, GELU) — single forward for all levels
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=vit_num_heads,
+            dim_feedforward=int(dim * vit_mlp_ratio),
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self._global_transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=vit_depth)
+        self._global_norm = nn.LayerNorm(dim)
+
+        # Per-level 2D grid positional embedding (added AFTER pooling so each
+        # level can differentiate its spatial scale)
+        self.grid_pos_embs = nn.ParameterDict()
+        for s in self.level_sizes:
+            self.grid_pos_embs[str(s)] = nn.Parameter(
+                torch.zeros(1, dim, s, s))
+            nn.init.trunc_normal_(self.grid_pos_embs[str(s)], std=0.02)
+
+    def _patchify_global(self, x: torch.Tensor) -> torch.Tensor:
+        """Stem (optional) + patchify + linear proj + pos_emb → token sequence.
+
+        Returns:
+            (B, N, dim) tokens ready for transformer.
+        """
+        if self._global_stem is not None:
+            x = self._global_stem(x)
+
+        B, C, _, _ = x.shape
+        p = self._global_vit_patch_size
+        tps = self._global_tokens_per_side
+
+        # Flatten patches in (C, p_row, p_col) order to match CLIP Conv2d
+        # weight layout when reshaped to (out, in*p*p).
+        tokens = x.unfold(2, p, p).unfold(3, p, p)          # (B, C, tps, tps, p, p)
+        tokens = tokens.contiguous().view(B, C, tps * tps, p, p)
+        tokens = tokens.permute(0, 2, 1, 3, 4).contiguous()  # (B, N, C, p, p)
+        tokens = tokens.view(B, tps * tps, C * p * p)        # (B, N, patch_dim)
+
+        tokens = self._global_patch_proj(tokens) + self._global_pos_emb
+        return tokens
+
+    def _forward_vit_global(self, x: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Global ViT forward (single pass) + per-level avg pool.
+
+        Compute: 1× ViT-B/16 forward on (B, 256, dim) ≈ 23 GFLOPs.
+
+        Args:
+            x: (B, C, H, W) conditioning image
+
+        Returns:
+            {spatial_size: (B, dim, S, S)} for each level
+        """
+        B = x.shape[0]
+        tps = self._global_tokens_per_side
+
+        # Patchify + single transformer forward
+        tokens = self._patchify_global(x)              # (B, tps², dim)
+        tokens = self._global_transformer(tokens)
+        tokens = self._global_norm(tokens)             # (B, tps², dim)
+
+        # Reshape to 2D grid
+        feat = tokens.transpose(1, 2).view(B, self.dim, tps, tps)
+
+        # Avg pool to each level's target resolution + 2D positional emb
+        level_features = {}
+        for s in self.level_sizes:
+            pool_k = tps // s
+            pooled = F.avg_pool2d(feat, kernel_size=pool_k) if pool_k > 1 else feat
+            level_features[s] = pooled + self.grid_pos_embs[str(s)]
+
+        return level_features
+
+    # ──────────────────────────────────────────────────────────────
+    #  CLIP weight loading (for vit_global)
+    # ──────────────────────────────────────────────────────────────
+
+    def init_from_clip(self, model_name: str = "openai/clip-vit-base-patch16"):
+        """Load CLIP ViT weights into vit_global encoder.
+
+        Maps:
+          CLIP patch_embedding (Conv2d)  → _global_patch_proj (Linear)
+          CLIP position_embedding (197,D) → _global_pos_emb (interpolated
+                                           to tps×tps, CLS dropped)
+          CLIP encoder.layers[i]          → _global_transformer.layers[i]
+            q/k/v_proj, out_proj, layer_norm1/2, mlp.fc1/fc2
+          CLIP post_layernorm             → _global_norm
+
+        Requirements (raises AssertionError otherwise):
+          - encoder_type == 'vit_global'
+          - No CNN stem (CLIP uses plain Conv2d patch embed)
+          - dim == CLIP hidden size (768 for ViT-B)
+          - vit_patch_size == CLIP patch size (16 for ViT-B/16)
+          - depth / heads match CLIP (12 / 12 for ViT-B)
+
+        Note on minor architectural differences:
+          - CLIP has `pre_layrnorm` before the encoder; we don't.
+          - CLIP applies `post_layernorm` only to CLS; we apply `_global_norm`
+            to all patch tokens (init'd from CLIP's post_layernorm).
+          - CLIP uses QuickGELU inside MLP; we use GELU.
+          These shift the initial distribution slightly but the 12 transformer
+          layers carry the vast majority of pretrained knowledge and training
+          adapts the rest.
+        """
+        assert self.encoder_type == 'vit_global', \
+            f"init_from_clip requires encoder_type='vit_global', got {self.encoder_type}"
+        assert self._global_stem is None, \
+            "init_from_clip requires --vit_no_cnn_stem (CLIP has no CNN stem)"
+
+        try:
+            from transformers import CLIPVisionModel
+        except ImportError as e:
+            raise ImportError(
+                "init_from_clip requires the `transformers` package. "
+                "Install with: pip install transformers"
+            ) from e
+
+        clip = CLIPVisionModel.from_pretrained(model_name)
+        vm = clip.vision_model  # CLIPVisionTransformer
+
+        clip_hidden = vm.config.hidden_size
+        clip_depth = vm.config.num_hidden_layers
+        clip_heads = vm.config.num_attention_heads
+        clip_patch = vm.config.patch_size
+
+        assert self.dim == clip_hidden, \
+            f"dim mismatch: model.dim={self.dim}, CLIP hidden={clip_hidden}. " \
+            f"Set --feat_channels {clip_hidden}."
+        assert self._global_vit_patch_size == clip_patch, \
+            f"patch size mismatch: model={self._global_vit_patch_size}, " \
+            f"CLIP={clip_patch}. Set --vit_patch_size {clip_patch}."
+        assert len(self._global_transformer.layers) == clip_depth, \
+            f"depth mismatch: model={len(self._global_transformer.layers)}, " \
+            f"CLIP={clip_depth}. Set --vit_depth {clip_depth}."
+
+        with torch.no_grad():
+            # ── 1) Patch embedding: Conv2d (D, C, p, p) → Linear (D, C*p*p) ──
+            conv_w = vm.embeddings.patch_embedding.weight  # (D, C, p, p)
+            D = conv_w.shape[0]
+            self._global_patch_proj.weight.copy_(conv_w.reshape(D, -1))
+            if self._global_patch_proj.bias is not None:
+                if vm.embeddings.patch_embedding.bias is not None:
+                    self._global_patch_proj.bias.copy_(
+                        vm.embeddings.patch_embedding.bias)
+                else:
+                    self._global_patch_proj.bias.zero_()
+
+            # ── 2) Positional embedding (skip CLS, bicubic interpolate) ──
+            pe = vm.embeddings.position_embedding.weight   # (197, D) for 224px
+            patch_pe = pe[1:]                               # drop CLS → (196, D)
+            src_side = int(math.isqrt(patch_pe.shape[0]))
+            assert src_side * src_side == patch_pe.shape[0], \
+                f"CLIP pos_emb not square-gridded: {patch_pe.shape[0]} tokens"
+            tgt_side = self._global_tokens_per_side
+            patch_pe = patch_pe.view(1, src_side, src_side, D).permute(0, 3, 1, 2)
+            patch_pe = F.interpolate(
+                patch_pe, size=(tgt_side, tgt_side),
+                mode='bicubic', align_corners=False,
+            )
+            patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, tgt_side * tgt_side, D)
+            self._global_pos_emb.data.copy_(patch_pe)
+
+            # ── 3) Transformer layers ──
+            for i, our_layer in enumerate(self._global_transformer.layers):
+                cl = vm.encoder.layers[i]
+
+                # Attention: concat Q/K/V into in_proj; copy out_proj
+                qkv_w = torch.cat([
+                    cl.self_attn.q_proj.weight,
+                    cl.self_attn.k_proj.weight,
+                    cl.self_attn.v_proj.weight,
+                ], dim=0)
+                qkv_b = torch.cat([
+                    cl.self_attn.q_proj.bias,
+                    cl.self_attn.k_proj.bias,
+                    cl.self_attn.v_proj.bias,
+                ], dim=0)
+                our_layer.self_attn.in_proj_weight.copy_(qkv_w)
+                our_layer.self_attn.in_proj_bias.copy_(qkv_b)
+                our_layer.self_attn.out_proj.weight.copy_(cl.self_attn.out_proj.weight)
+                our_layer.self_attn.out_proj.bias.copy_(cl.self_attn.out_proj.bias)
+
+                # MLP (fc1/fc2)
+                our_layer.linear1.weight.copy_(cl.mlp.fc1.weight)
+                our_layer.linear1.bias.copy_(cl.mlp.fc1.bias)
+                our_layer.linear2.weight.copy_(cl.mlp.fc2.weight)
+                our_layer.linear2.bias.copy_(cl.mlp.fc2.bias)
+
+                # LayerNorms (pre-norm: norm1 before attn, norm2 before mlp)
+                our_layer.norm1.weight.copy_(cl.layer_norm1.weight)
+                our_layer.norm1.bias.copy_(cl.layer_norm1.bias)
+                our_layer.norm2.weight.copy_(cl.layer_norm2.weight)
+                our_layer.norm2.bias.copy_(cl.layer_norm2.bias)
+
+            # ── 4) Post-LN (init from CLIP's CLS post_layernorm) ──
+            self._global_norm.weight.copy_(vm.post_layernorm.weight)
+            self._global_norm.bias.copy_(vm.post_layernorm.bias)
+
+        del clip
+        print(f"[vit_global] Initialized from CLIP: {model_name} "
+              f"(patch={clip_patch}, dim={clip_hidden}, depth={clip_depth}, "
+              f"heads={clip_heads}, pos_emb {src_side}×{src_side}→{tgt_side}×{tgt_side})")
+
+    # ──────────────────────────────────────────────────────────────
     #  CNN backend: patchify + hierarchy
     # ──────────────────────────────────────────────────────────────
 
@@ -1041,6 +1330,9 @@ class HierarchicalMultiResEncoder(nn.Module):
         """
         if self.encoder_type == 'swin':
             return self._forward_swin(x)
+
+        if self.encoder_type == 'vit_global':
+            return self._forward_vit_global(x)
 
         if self.encoder_type == 'vit':
             level_features = {}

@@ -669,14 +669,19 @@ def load_pretrained_model(pretrained_output_dir: str, device: str = "cpu"):
     # Determine backbone and rebuild model
     backbone_type = cfg.get("backbone", "dit")
 
-    # Common ViT encoder kwargs
+    # Common ViT encoder kwargs.  main_multires.py resolves the CNN-stem flag
+    # as `vit_use_cnn_stem and not vit_no_cnn_stem`, but both raw flags are
+    # saved to args.json.  Respect both here so vit_global backbones trained
+    # with --vit_no_cnn_stem rebuild with matching architecture.
+    resolved_use_stem = (cfg.get("vit_use_cnn_stem", True)
+                         and not cfg.get("vit_no_cnn_stem", False))
     vit_kwargs = dict(
         encoder_type=cfg.get("encoder_type", "cnn"),
         vit_patch_size=cfg.get("vit_patch_size", 4),
         vit_depth=cfg.get("vit_depth", 4),
         vit_num_heads=cfg.get("vit_num_heads", 4),
         vit_mlp_ratio=cfg.get("vit_mlp_ratio", 4.0),
-        vit_use_cnn_stem=cfg.get("vit_use_cnn_stem", True),
+        vit_use_cnn_stem=resolved_use_stem,
         vit_cnn_stem_reduction=cfg.get("vit_cnn_stem_reduction", 4),
     )
 

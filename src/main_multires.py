@@ -323,16 +323,21 @@ def parse_args():
         if args.vit_use_cnn_stem and not args.vit_no_cnn_stem:
             p.error("--vit_init_clip requires --vit_no_cnn_stem "
                     "(CLIP has no CNN stem)")
-        # CLIP ViT-B/16 architectural constraints (warn rather than hard-fail
-        # so users can opt into e.g. CLIP ViT-L with matching dims)
+        # CLIP init loads into the transformer's INTERNAL dim. When
+        # --encoder_internal_dim is set, that's the ViT hidden; else
+        # --feat_channels. Check against the right one.
+        internal_dim = (args.encoder_internal_dim
+                        if args.encoder_internal_dim is not None
+                        else args.feat_channels)
         expected_b16 = (
-            args.feat_channels == 768 and args.vit_depth == 12
+            internal_dim == 768 and args.vit_depth == 12
             and args.vit_num_heads == 12 and args.vit_patch_size == 16
         )
         if 'base-patch16' in args.clip_model_name and not expected_b16:
             p.error(
                 f"--clip_model_name {args.clip_model_name} (ViT-B/16) requires "
-                "--feat_channels 768 --vit_depth 12 --vit_num_heads 12 "
+                "internal dim 768 (set --encoder_internal_dim 768 or "
+                "--feat_channels 768), --vit_depth 12 --vit_num_heads 12 "
                 "--vit_patch_size 16"
             )
 

@@ -953,18 +953,25 @@ class HierarchicalMultiResEncoder(nn.Module):
         전체 이미지를 ViT로 **한 번만** 처리한 뒤, level마다 avg pool만
         다르게 적용.  Compute = 1× ViT forward (cell-based 대비 ~5× 저렴).
 
-        예) image=256, no stem, vit_patch=16 → 16×16 = 256 tokens
-          ViT forward (한 번) → (B, dim, 16, 16)
-          Level 8: avg_pool(2)  → (B, dim, 8, 8)
-          Level 4: avg_pool(4)  → (B, dim, 4, 4)
-          Level 2: avg_pool(8)  → (B, dim, 2, 2)
-          Level 1: avg_pool(16) → (B, dim, 1, 1)
+        When ``encoder_internal_dim`` is set (self._enc_dim != dim), the ViT
+        runs at _enc_dim internally (e.g. 768 for CLIP) and a per-level 1×1
+        conv projects to `dim` (output feat_channels) as an information
+        bottleneck — matches the ``vit`` mode design.
+
+        예) image=256, no stem, vit_patch=16, enc_d=768, dim=16:
+          ViT forward (한 번) → (B, 768, 16, 16)
+          Level 8: avg_pool(2)  → (B, 768, 8, 8) → Conv2d(768→16) → (B, 16, 8, 8)
+          Level 4: avg_pool(4)  → (B, 768, 4, 4) → Conv2d(768→16) → (B, 16, 4, 4)
+          Level 2: avg_pool(8)  → (B, 768, 2, 2) → Conv2d(768→16) → (B, 16, 2, 2)
+          Level 1: avg_pool(16) → (B, 768, 1, 1) → Conv2d(768→16) → (B, 16, 1, 1)
         """
+        enc_d = self._enc_dim  # transformer internal dim (e.g. 768 for CLIP)
+
         # CNN stem (optional) — CLIP init 시에는 반드시 비활성 (CLIP은 plain
         # patch_embed Conv만 가지고 있음)
         if vit_use_cnn_stem:
             self._global_stem = ConvStem(
-                in_channels, dim, reduction=vit_cnn_stem_reduction)
+                in_channels, enc_d, reduction=vit_cnn_stem_reduction)
             stem_ch = self._global_stem.out_channels
             stem_r = vit_cnn_stem_reduction
         else:
@@ -987,34 +994,43 @@ class HierarchicalMultiResEncoder(nn.Module):
         self._global_vit_patch_size = vit_patch_size
         n_tokens = tokens_per_side * tokens_per_side
 
-        # Patch projection: flatten (C, p, p) → dim
+        # Patch projection: flatten (C, p, p) → enc_d
         patch_dim = stem_ch * vit_patch_size * vit_patch_size
-        self._global_patch_proj = nn.Linear(patch_dim, dim)
+        self._global_patch_proj = nn.Linear(patch_dim, enc_d)
 
-        # Positional embedding (1D, over all patches)
-        self._global_pos_emb = nn.Parameter(torch.zeros(1, n_tokens, dim))
+        # Positional embedding (1D, over all patches) — at internal dim
+        self._global_pos_emb = nn.Parameter(torch.zeros(1, n_tokens, enc_d))
         nn.init.trunc_normal_(self._global_pos_emb, std=0.02)
 
         # Shared transformer (pre-norm, GELU) — single forward for all levels
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim,
+            d_model=enc_d,
             nhead=vit_num_heads,
-            dim_feedforward=int(dim * vit_mlp_ratio),
+            dim_feedforward=int(enc_d * vit_mlp_ratio),
             activation='gelu',
             batch_first=True,
             norm_first=True,
         )
         self._global_transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=vit_depth)
-        self._global_norm = nn.LayerNorm(dim)
+        self._global_norm = nn.LayerNorm(enc_d)
 
-        # Per-level 2D grid positional embedding (added AFTER pooling so each
-        # level can differentiate its spatial scale)
+        # Per-level 2D grid positional embedding — at INTERNAL dim (enc_d),
+        # added BEFORE output projection. Matches the `vit` mode pattern.
         self.grid_pos_embs = nn.ParameterDict()
         for s in self.level_sizes:
             self.grid_pos_embs[str(s)] = nn.Parameter(
-                torch.zeros(1, dim, s, s))
+                torch.zeros(1, enc_d, s, s))
             nn.init.trunc_normal_(self.grid_pos_embs[str(s)], std=0.02)
+
+        # Output projection: enc_d → dim (bottleneck, per-level Conv2d 1×1).
+        # Applied AFTER grid_pos_embs — same order as `vit` mode.
+        if enc_d != dim:
+            self._vit_out_projs = nn.ModuleDict()
+            for s in self.level_sizes:
+                self._vit_out_projs[str(s)] = nn.Conv2d(enc_d, dim, 1)
+        else:
+            self._vit_out_projs = None
 
     def _patchify_global(self, x: torch.Tensor) -> torch.Tensor:
         """Stem (optional) + patchify + linear proj + pos_emb → token sequence.
@@ -1040,33 +1056,39 @@ class HierarchicalMultiResEncoder(nn.Module):
         return tokens
 
     def _forward_vit_global(self, x: torch.Tensor) -> dict[int, torch.Tensor]:
-        """Global ViT forward (single pass) + per-level avg pool.
+        """Global ViT forward (single pass) + per-level avg pool (+ project).
 
-        Compute: 1× ViT-B/16 forward on (B, 256, dim) ≈ 23 GFLOPs.
+        Compute: 1× ViT-B/16 forward on (B, 256, enc_d) ≈ 23 GFLOPs.
 
         Args:
             x: (B, C, H, W) conditioning image
 
         Returns:
-            {spatial_size: (B, dim, S, S)} for each level
+            {spatial_size: (B, dim, S, S)} for each level, where `dim` is the
+            output feat_channels (post-bottleneck when enc_d != dim).
         """
         B = x.shape[0]
         tps = self._global_tokens_per_side
+        enc_d = self._enc_dim
 
-        # Patchify + single transformer forward
-        tokens = self._patchify_global(x)              # (B, tps², dim)
+        # Patchify + single transformer forward (at internal dim)
+        tokens = self._patchify_global(x)              # (B, tps², enc_d)
         tokens = self._global_transformer(tokens)
-        tokens = self._global_norm(tokens)             # (B, tps², dim)
+        tokens = self._global_norm(tokens)             # (B, tps², enc_d)
 
         # Reshape to 2D grid
-        feat = tokens.transpose(1, 2).view(B, self.dim, tps, tps)
+        feat = tokens.transpose(1, 2).view(B, enc_d, tps, tps)
 
-        # Avg pool to each level's target resolution + 2D positional emb
+        # Per-level: avg pool → + 2D pos emb (at enc_d) → (optional) Conv2d bottleneck
+        # Order matches the `vit` mode: pos_emb at internal dim, then project.
         level_features = {}
         for s in self.level_sizes:
             pool_k = tps // s
             pooled = F.avg_pool2d(feat, kernel_size=pool_k) if pool_k > 1 else feat
-            level_features[s] = pooled + self.grid_pos_embs[str(s)]
+            pooled = pooled + self.grid_pos_embs[str(s)]        # at enc_d
+            if self._vit_out_projs is not None:
+                pooled = self._vit_out_projs[str(s)](pooled)    # enc_d → dim
+            level_features[s] = pooled
 
         return level_features
 
@@ -1088,9 +1110,14 @@ class HierarchicalMultiResEncoder(nn.Module):
         Requirements (raises AssertionError otherwise):
           - encoder_type == 'vit_global'
           - No CNN stem (CLIP uses plain Conv2d patch embed)
-          - dim == CLIP hidden size (768 for ViT-B)
+          - internal dim (`encoder_internal_dim` or `feat_channels`) ==
+            CLIP hidden size (768 for ViT-B)
           - vit_patch_size == CLIP patch size (16 for ViT-B/16)
           - depth / heads match CLIP (12 / 12 for ViT-B)
+
+        The per-level output projection `_vit_out_projs` (if present, i.e.
+        when enc_d != dim) is left at random init — it is the bottleneck
+        head that maps CLIP features → feat_channels.
 
         Note on minor architectural differences:
           - CLIP has `pre_layrnorm` before the encoder; we don't.
@@ -1122,9 +1149,10 @@ class HierarchicalMultiResEncoder(nn.Module):
         clip_heads = vm.config.num_attention_heads
         clip_patch = vm.config.patch_size
 
-        assert self.dim == clip_hidden, \
-            f"dim mismatch: model.dim={self.dim}, CLIP hidden={clip_hidden}. " \
-            f"Set --feat_channels {clip_hidden}."
+        assert self._enc_dim == clip_hidden, \
+            f"internal dim mismatch: model._enc_dim={self._enc_dim}, " \
+            f"CLIP hidden={clip_hidden}. Set --encoder_internal_dim " \
+            f"{clip_hidden} (or --feat_channels {clip_hidden} if no bottleneck)."
         assert self._global_vit_patch_size == clip_patch, \
             f"patch size mismatch: model={self._global_vit_patch_size}, " \
             f"CLIP={clip_patch}. Set --vit_patch_size {clip_patch}."

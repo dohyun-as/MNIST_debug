@@ -3,15 +3,18 @@
 #  CLEVR 256×256 — Multi-Res DiT + ViT-Global encoder (CLIP init)
 # ──────────────────────────────────────────────────────────────────
 #
-#  Encoder: vit_global (single-forward, option B)
+#  Encoder: vit_global (single-forward, option B) with bottleneck
 #    image 256×256 → patch 16 → 16×16=256 tokens → ViT-B/16 forward (한 번)
 #    → reshape (B, 768, 16, 16)
 #    → avg_pool per level:  kernel=2/4/8/16 → 8×8 / 4×4 / 2×2 / 1×1
-#    → per-level grid_pos_emb 더해서 완성
+#    → per-level Conv2d(768→16) bottleneck
+#    → + grid_pos_emb 더해서 완성
 #
+#    Output: 85 tokens × 16 dim = 1,360 floats/sample (not 65K)
 #    Compute: ~23 GFLOPs (1× ViT-B/16) — cell-based 대비 ~20× 저렴
 #    CLIP init: openai/clip-vit-base-patch16의 patch_embed / pos_emb /
-#               12 transformer layers / post_layernorm 로드.
+#               12 transformer layers / post_layernorm → internal 768 dim.
+#               Per-level Conv2d(768→16)는 random init (bottleneck head).
 #               pos_emb는 14×14 → 16×16 bicubic interpolate.
 #
 #  DiT backbone: JiT-B/16 (동일)
@@ -41,7 +44,7 @@ accelerate launch \
     --multi_gpu \
     src/main_multires.py \
     --backbone dit \
-    --output_dir runs/clevr/backbone/vit_global_clip_out768 \
+    --output_dir runs/clevr/backbone/vit_global_clip_out16 \
     --train_dir "$CLEVR_DIR" \
     --val_dir "$CLEVR_VAL" \
     --dataset_root "$CLEVR_DIR" \
@@ -49,7 +52,8 @@ accelerate launch \
     --in_channels 3 \
     --vae_downsample_factor 1 \
     --min_patch_size 32 \
-    --feat_channels 768 \
+    --feat_channels 16 \
+    --encoder_internal_dim 768 \
     --encoder_type vit_global \
     --vit_patch_size 16 \
     --vit_depth 12 \

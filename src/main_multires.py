@@ -208,9 +208,20 @@ def parse_args():
     p.add_argument("--dit_bottleneck_dim", type=int, default=128,
                    help="BottleneckPatchEmbed bottleneck dim (JiT-B/L=128, H=256)")
     p.add_argument("--dit_in_context_len", type=int, default=0,
-                   help="Number of in-context learnable tokens (JiT=32, 0=disabled)")
+                   help="Number of in-context learnable tokens (JiT=32, 0=disabled). "
+                        "Forced to 0 when --dit_attn_mode=cross (cross-attn DiT "
+                        "blocks have no in-context path).")
     p.add_argument("--dit_in_context_start", type=int, default=4,
                    help="Layer index to prepend in-context tokens (JiT-B=4, L=8, H=10)")
+    p.add_argument("--dit_attn_mode", type=str, default="self_concat",
+                   choices=["self_concat", "cross"],
+                   help="Slot conditioning attention mode for baseline_1d. "
+                        "'self_concat' = Semanticist-style (cond concatenated, "
+                        "per-slot pos embed, in-context tokens). "
+                        "'cross' = SlotDiffusion/DINOSAUR-style (image cross-"
+                        "attends to slots, no per-slot pos embed, no in-context "
+                        "tokens). Use 'cross' for permutation-equivariant Slot "
+                        "Attention to avoid position-binding collapse.")
 
     # --- baseline_1d (Semanticist-style, only used when --backbone baseline_1d) ---
     p.add_argument("--num_slots", type=int, default=256,
@@ -706,6 +717,7 @@ def build_model(args):
             dit_bottleneck_dim=args.dit_bottleneck_dim,
             dit_in_context_len=args.dit_in_context_len,
             dit_in_context_start=args.dit_in_context_start,
+            dit_attn_mode=args.dit_attn_mode,
             uncond_drop_prob=args.uncond_drop_prob,
             use_fsq=args.use_fsq,
             fsq_levels=args.fsq_levels,

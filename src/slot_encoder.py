@@ -820,6 +820,7 @@ def visualize_dit_cross_attention(
     K_ic = int(getattr(model, "in_context_len", 0))
     in_context_start = int(getattr(model, "in_context_start", 0))
     n_dit_blocks = len(model.blocks)
+    attn_mode = getattr(model, "dit_attn_mode", "self_concat")
     palette = _color_palette(K)
     img_01 = (images.cpu().float() * 0.5 + 0.5).clamp(0, 1)
 
@@ -847,14 +848,16 @@ def visualize_dit_cross_attention(
                 "[dit-attn-viz] no attention captured — does the DiT use "
                 "F.scaled_dot_product_attention?")
 
-        # Encoder transformer (vit_b16 / dinov1) ALSO calls SDPA inside
-        # model.forward; the encoder runs FIRST so the last n_dit_blocks
-        # captures are the DiT decoder blocks — keep only those.
-        if len(cap.attn_list) < n_dit_blocks:
+        # cross mode emits 2 SDPA calls per DiT block (self-attn + cross-attn).
+        # self_concat emits 1. Encoder may emit additional SDPA captures
+        # (e.g. ViT/DINO backbones); we keep only the trailing DiT captures.
+        per_block = 2 if attn_mode == "cross" else 1
+        n_dit_caps = n_dit_blocks * per_block
+        if len(cap.attn_list) < n_dit_caps:
             raise RuntimeError(
-                f"[dit-attn-viz] expected ≥{n_dit_blocks} attn captures, "
+                f"[dit-attn-viz] expected ≥{n_dit_caps} attn captures, "
                 f"got {len(cap.attn_list)}.")
-        dit_attn = cap.attn_list[-n_dit_blocks:]
+        dit_attn = cap.attn_list[-n_dit_caps:]
 
         # Average attention over the trailing blocks.
         n_avg = max(1, min(average_last_n_blocks, n_dit_blocks))
@@ -862,14 +865,20 @@ def visualize_dit_cross_attention(
 
         accum = torch.zeros(B, num_img, K, device=device)
         for bi in block_indices:
-            attn = dit_attn[bi]                                # (B, H, N, N)
-            if bi < in_context_start:
-                slot_range = slice(0, K)
-                img_range = slice(K, K + num_img)
+            if attn_mode == "cross":
+                # bi-th block's cross-attn is at position bi*2 + 1
+                # (self-attn at bi*2, cross-attn at bi*2 + 1).
+                attn = dit_attn[bi * 2 + 1]                    # (B, H, num_img, K)
+                sub = attn                                      # already image→slot
             else:
-                slot_range = slice(0, K)
-                img_range = slice(K + K_ic, K + K_ic + num_img)
-            sub = attn[:, :, img_range, slot_range]            # (B, H, num_img, K)
+                attn = dit_attn[bi]                            # (B, H, N, N)
+                if bi < in_context_start:
+                    slot_range = slice(0, K)
+                    img_range = slice(K, K + num_img)
+                else:
+                    slot_range = slice(0, K)
+                    img_range = slice(K + K_ic, K + K_ic + num_img)
+                sub = attn[:, :, img_range, slot_range]        # (B, H, num_img, K)
             accum = accum + sub.mean(dim=1)                    # heads avg
         accum = accum / float(n_avg)                           # (B, num_img, K)
 

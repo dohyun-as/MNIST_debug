@@ -42,7 +42,7 @@ echo "GPUs: $CUDA_VISIBLE_DEVICES ($NUM_GPUS)  batch/gpu=$BATCH_PER_GPU  accum=$
 CLEVR_DIR="../clevr-dataset-gen/output/clevr_256_varied/images"
 CLEVR_VAL="../clevr-dataset-gen/output/clevr_256_varied_val/images"
 
-OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage1/256_slot16_d192_resnet18s_init_learned"}
+OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage1/256_slot16_d192_resnet18s_crossattn"}
 mkdir -p "${OUTPUT_DIR}"
 
 accelerate launch \
@@ -75,7 +75,10 @@ accelerate launch \
     --enc_num_heads 12 \
     --enc_drop_path_rate 0.1 \
     \
-    `# ── DiT decoder (same as baseline) ── ` \
+    `# ── DiT decoder: cross-attention to slots (no per-slot pos embed). ── ` \
+    `# ── In-context tokens stay in self-attn pool (JiT-style) but do not ── ` \
+    `# ── query slot K/V; slots only "give to" image tokens.            ── ` \
+    --dit_attn_mode cross \
     --dit_patch_size 16 \
     --dit_hidden_size 768 \
     --dit_n_heads 12 \

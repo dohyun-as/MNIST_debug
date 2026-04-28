@@ -324,7 +324,7 @@ def main():
                                     level_sizes, accelerator.device)
             if args.cond_type == "text":
                 clevr_cond_encoder = CLEVRTextConditionEncoder(args.hidden_size)
-        else:
+            else:
                 clevr_cond_encoder = CLEVRConditionEncoder(args.hidden_size)
 
             # Load weights

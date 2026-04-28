@@ -19,12 +19,13 @@ set -e
 GPUS=${GPUS:-"0,1,2,3"}
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
-PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/clevr/backbone/256_dit_vit_flow_cont_out4"}
-CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr_output/clevr_256_varied/images"}
-CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr_output/clevr_256_varied/conditions_text"}
-CLEVR_VAL_IMAGE_ROOT=${CLEVR_VAL_IMAGE_ROOT:-"../clevr_output/clevr_256_varied_val/images"}
-CLEVR_VAL_COND_DIR=${CLEVR_VAL_COND_DIR:-"../clevr_output/clevr_256_varied_val/conditions_text"}
-OUTPUT_DIR="./runs/clevr/masked_diff/ours_text_diffhead_clip_out4"
+PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/clevr/backbone/256_dit_vit_flow_cont_out16_only8x8_tokdrop1.0"}
+CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied/images"}
+CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied/conditions_text"}
+CLEVR_VAL_IMAGE_ROOT=${CLEVR_VAL_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied_val/images"}
+CLEVR_VAL_COND_DIR=${CLEVR_VAL_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied_val/conditions_text"}
+# semi-AR로 돌리려면 COMMON_ARGS에 --semi_autoregressive 추가
+OUTPUT_DIR="./runs/clevr/masked_diff/ours_text_diffhead_clip_dit_vit_flow_cont_out16_only8x8_tokdrop1.0"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -83,7 +84,7 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --lr_schedule cosine \
   ${RESUME_DIR:+--resume_dir $RESUME_DIR} \
 "
-
+# --semi_autoregressive \
 PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
 if [ ${NUM_GPUS} -gt 1 ]; then
   CUDA_VISIBLE_DEVICES=${GPUS} accelerate launch \

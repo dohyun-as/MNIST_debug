@@ -539,10 +539,14 @@ class _VitB16Slot(nn.Module):
 class _DinoFrozen(nn.Module):
     """Frozen DINOv1 ViT-B/16 from HuggingFace.
 
-    Returns last hidden states EXCLUDING the [CLS] token, so the output
-    shape is (B, num_patches, embed_dim). For 256 input + patch_size=16:
-    256 patches, 768 dim. No backward through DINO → near-zero activation
-    cost during training of the slot stack on top.
+    HuggingFace's DINOv1 checkpoint (``facebook/dino-vitb16``) is loaded
+    with config ``image_size=224``. For non-224 input we pass
+    ``interpolate_pos_encoding=True`` so the model bilinearly interpolates
+    its learned 14×14 position table to whatever patch grid we actually
+    have (e.g. 16×16 for 256-px input → 256 patch tokens, 768 dim).
+
+    No backward through DINO → near-zero activation cost during training
+    of the slot stack on top.
     """
 
     def __init__(self, model_name: str = "facebook/dino-vitb16"):
@@ -562,7 +566,8 @@ class _DinoFrozen(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: Tensor) -> Tensor:
-        out = self.encoder(pixel_values=x)
+        out = self.encoder(pixel_values=x,
+                           interpolate_pos_encoding=True)
         # last_hidden_state: (B, 1+N, C) — drop the CLS at index 0
         return out.last_hidden_state[:, 1:, :]            # (B, N, C)
 
@@ -702,3 +707,202 @@ def visualize_slot_segmentation(
         if masks_path == save_path:
             masks_path = save_path + ".slot_masks.png"
         save_image(grid, masks_path)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  DiT cross-attention visualization
+# ──────────────────────────────────────────────────────────────────
+
+class _CaptureSDPA:
+    """Context manager that monkey-patches
+    ``torch.nn.functional.scaled_dot_product_attention`` for the duration
+    of a forward pass to also record per-call attention weights.
+
+    Computes the same output as the original SDPA (same softmax, same
+    matmul) but additionally appends ``attn`` of shape ``(B, H, N, N)``
+    to ``self.attn_list`` after each call. The model code is untouched —
+    we just swap the function pointer in ``torch.nn.functional`` for
+    the lifetime of the ``with`` block.
+    """
+
+    def __init__(self):
+        self.attn_list: list[Tensor] = []
+
+    def __enter__(self):
+        self._orig = F.scaled_dot_product_attention
+        capture = self.attn_list
+
+        def _patched(query, key, value, attn_mask=None, dropout_p=0.0,
+                     is_causal=False, scale=None, **kwargs):
+            # query / key / value: (..., L, D)  with leading head dims.
+            if scale is None:
+                scale = query.size(-1) ** -0.5
+            scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    scores = scores.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    scores = scores + attn_mask
+            if is_causal:
+                L = scores.size(-1)
+                cmask = torch.triu(
+                    torch.ones(L, L, device=scores.device, dtype=torch.bool),
+                    diagonal=1)
+                scores = scores.masked_fill(cmask, float("-inf"))
+            attn = scores.softmax(dim=-1)
+            capture.append(attn.detach())
+            if dropout_p > 0.0:
+                attn = F.dropout(attn, p=dropout_p)
+            return torch.matmul(attn, value)
+
+        F.scaled_dot_product_attention = _patched
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        F.scaled_dot_product_attention = self._orig
+        return False
+
+
+@torch.no_grad()
+def visualize_dit_cross_attention(
+    model,
+    images: Tensor,
+    save_path: str,
+    t_value=0.5,
+    average_last_n_blocks: int = 4,
+):
+    """Visualise where each slot ends up influencing image generation
+    inside the DiT decoder (Baseline1DConditionalDiT).
+
+    The DiT is prefix-concat self-attention — slots sit at the front of
+    the sequence and image patches attend to them in every block. By
+    capturing the ``image-row × slot-col`` sub-block of the self-attn
+    matrix we recover effectively the cross-attention from image patches
+    to slots: "which slot did this generated patch read from?"
+
+    Outputs:
+        ``<save_path>``                — (image | argmax-seg | overlay)
+                                          triplet per sample, at t_value
+                                          (or last t in the list).
+        ``<save_path>.slot_heat.png``  — per-slot soft-mask heat-map at
+                                          the same t.
+        If ``t_value`` is a list / tuple, additionally writes one file
+        per timestep:
+            ``<save_path>.t{int(100*t):03d}.png`` and ``.slot_heat.png``.
+
+    Args:
+        model:                 Baseline1DConditionalDiT (slot-encoder swapped).
+        images:                (B, 3, H, W) val images in [-1, 1].
+        save_path:             PNG path for the main triplet grid.
+        t_value:               Flow-matching time(s) at which to evaluate.
+                               Convention: t=0 is pure noise, t=1 is clean
+                               image (JiT/SiT-style; opposite of DDPM).
+                               Useful range ≈ 0.25..0.9. Pass a list to
+                               render multiple timesteps in one call.
+        average_last_n_blocks: Average attention over this many trailing
+                               DiT blocks. Last layers carry the most
+                               semantics; averaging stabilises.
+    """
+    # Normalise t_value into a list; render one set of files per t.
+    if isinstance(t_value, (int, float)):
+        t_list = [float(t_value)]
+    else:
+        t_list = [float(t) for t in t_value]
+
+    model.eval()
+    device = next(model.parameters()).device
+    images = images.to(device)
+    B, _, H_img, W_img = images.shape
+
+    K = int(model.num_slots)
+    grid = int(model.grid_size)
+    num_img = grid * grid
+    K_ic = int(getattr(model, "in_context_len", 0))
+    in_context_start = int(getattr(model, "in_context_start", 0))
+    n_dit_blocks = len(model.blocks)
+    palette = _color_palette(K)
+    img_01 = (images.cpu().float() * 0.5 + 0.5).clamp(0, 1)
+
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    def _suffix_path(t_val):
+        # If multiple t values, append .tNNN to the filename so they don't
+        # overwrite. With a single t value, keep the path verbatim.
+        if len(t_list) == 1:
+            return save_path
+        tag = f".t{int(round(t_val * 100)):03d}"
+        return save_path.replace(".png", f"{tag}.png")
+
+    for t_val in t_list:
+        # Build a noisy sample at t=t_val (flow matching: noise=0, clean=1).
+        t = torch.full((B,), t_val, device=device)
+        e = torch.randn_like(images)
+        noisy = t.view(-1, 1, 1, 1) * images \
+            + (1 - t.view(-1, 1, 1, 1)) * e
+
+        with _CaptureSDPA() as cap:
+            _ = model(noisy, t, cond_image=images)
+        if not cap.attn_list:
+            raise RuntimeError(
+                "[dit-attn-viz] no attention captured — does the DiT use "
+                "F.scaled_dot_product_attention?")
+
+        # Encoder transformer (vit_b16 / dinov1) ALSO calls SDPA inside
+        # model.forward; the encoder runs FIRST so the last n_dit_blocks
+        # captures are the DiT decoder blocks — keep only those.
+        if len(cap.attn_list) < n_dit_blocks:
+            raise RuntimeError(
+                f"[dit-attn-viz] expected ≥{n_dit_blocks} attn captures, "
+                f"got {len(cap.attn_list)}.")
+        dit_attn = cap.attn_list[-n_dit_blocks:]
+
+        # Average attention over the trailing blocks.
+        n_avg = max(1, min(average_last_n_blocks, n_dit_blocks))
+        block_indices = list(range(n_dit_blocks - n_avg, n_dit_blocks))
+
+        accum = torch.zeros(B, num_img, K, device=device)
+        for bi in block_indices:
+            attn = dit_attn[bi]                                # (B, H, N, N)
+            if bi < in_context_start:
+                slot_range = slice(0, K)
+                img_range = slice(K, K + num_img)
+            else:
+                slot_range = slice(0, K)
+                img_range = slice(K + K_ic, K + K_ic + num_img)
+            sub = attn[:, :, img_range, slot_range]            # (B, H, num_img, K)
+            accum = accum + sub.mean(dim=1)                    # heads avg
+        accum = accum / float(n_avg)                           # (B, num_img, K)
+
+        # Per-slot soft influence map: (B, K, grid, grid)
+        per_slot = accum.permute(0, 2, 1).reshape(B, K, grid, grid)
+        # Argmax seg: which slot dominates each image patch.
+        seg = accum.argmax(dim=-1).view(B, grid, grid)
+
+        # Upsample to image resolution
+        seg_up = F.interpolate(
+            seg.float().unsqueeze(1), size=(H_img, W_img), mode="nearest",
+        ).squeeze(1).long().cpu()
+        seg_rgb = palette[seg_up].permute(0, 3, 1, 2).contiguous()
+        overlay = (0.55 * img_01 + 0.45 * seg_rgb).clamp(0, 1)
+        triplet = torch.cat([img_01, seg_rgb, overlay], dim=-1)   # (B, 3, H, 3W)
+
+        out_main = _suffix_path(t_val)
+        save_image(make_grid(triplet, nrow=1, padding=2), out_main)
+
+        # Per-slot heatmap
+        per_slot_up = F.interpolate(
+            per_slot, size=(H_img, W_img), mode="bilinear",
+            align_corners=False,
+        ).cpu().float()
+        pmin = per_slot_up.amin(dim=(-1, -2), keepdim=True)
+        pmax = per_slot_up.amax(dim=(-1, -2), keepdim=True)
+        per_slot_n = (per_slot_up - pmin) / (pmax - pmin + 1e-6)
+        rgb = per_slot_n.unsqueeze(2).expand(-1, -1, 3, -1, -1)
+        col = palette.view(1, K, 3, 1, 1)
+        rgb = rgb * col + (1 - rgb) * 1.0                          # white where low
+
+        flat = rgb.reshape(B * K, 3, H_img, W_img)
+        heat_path = out_main.replace(".png", ".slot_heat.png")
+        if heat_path == out_main:
+            heat_path = out_main + ".slot_heat.png"
+        save_image(make_grid(flat, nrow=K, padding=2), heat_path)

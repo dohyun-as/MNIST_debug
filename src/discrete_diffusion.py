@@ -130,6 +130,26 @@ class DiscreteDiffusion(nn.Module):
         self.change_of_variables = change_of_variables
         self.sampling_eps = sampling_eps
 
+        # Semi-autoregressive (coarse-to-fine) mode. Register as a
+        # non-persistent buffer (initially None); set via set_semi_ar().
+        self.register_buffer("semi_ar_level_idx", None, persistent=False)
+        self.semi_ar_n_levels: Optional[int] = None
+
+    def set_semi_ar(self, level_idx: Tensor, n_levels: int) -> None:
+        """Enable coarse-to-fine semi-autoregressive training & sampling.
+
+        Args:
+            level_idx: (L,) int tensor. 0 = finest, n_levels-1 = coarsest.
+                Must match the order in which tokens are laid out along L
+                (finest-first, as produced by ``extract_tokens``).
+            n_levels:  number of resolution levels.
+        """
+        assert level_idx.ndim == 1
+        assert level_idx.max().item() < n_levels
+        # Reassign the registered buffer (buffer slot already exists).
+        self.semi_ar_level_idx = level_idx.long()
+        self.semi_ar_n_levels = n_levels
+
     # ─────────────── time-conditioning helper ──────────────
 
     def _t(self, sigma: Tensor) -> Tensor:
@@ -378,9 +398,62 @@ class DiscreteDiffusion(nn.Module):
             return total_log_p * torch.log1p(-torch.exp(-self.noise.sigma_min))
         return -total_log_p * (dsigma / torch.expm1(sigma))[:, None]
 
+    def _build_semi_ar_move_chance(
+        self, move_chance_t: Tensor, semi_ar_level_idx: Tensor,
+        semi_ar_n_levels: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build per-position move_chance for semi-autoregressive training.
+
+        Coarse-to-fine: for each batch item sample a target level k ∈
+        [0, n_levels-1] (0=finest, n-1=coarsest), **weighted by the number
+        of positions at each level** (level k sampled with prob n_k / L).
+        This matches the natural capacity allocation of the "global t +
+        finest→coarsest mask order" alternative: the joint distribution
+        P(partial_level=k, within_level_ratio=r) = (n_k/L, Uniform(0,1])
+        becomes identical (up to MDLM ELBO weighting).
+
+        Per-position move_chance:
+          - coarser than target (pos_lvl > k): fully revealed (move_chance=0).
+          - target level   (pos_lvl == k):    diffused with move_chance_t.
+          - finer  than target (pos_lvl < k): fully masked  (move_chance=1).
+
+        Args:
+            move_chance_t:     (B, 1) move_chance from the noise schedule.
+            semi_ar_level_idx: (L,) int. 0 = finest, n_levels-1 = coarsest.
+            semi_ar_n_levels:  number of levels.
+        Returns:
+            move_chance: (B, L) per-position move_chance.
+            loss_mask:   (B, L) bool — target-level positions (where loss counts).
+            target_level: (B,) sampled target level per batch item.
+        """
+        B = move_chance_t.shape[0]
+        L = semi_ar_level_idx.shape[0]
+        device = move_chance_t.device
+        # Level weights = number of positions at each level, normalized.
+        level_counts = torch.bincount(
+            semi_ar_level_idx.to(device),
+            minlength=semi_ar_n_levels,
+        ).float()
+        level_weights = level_counts / level_counts.sum()
+        target_level = torch.multinomial(
+            level_weights, num_samples=B, replacement=True)       # (B,)
+        pos_lvl = semi_ar_level_idx.to(device)[None, :].expand(B, L)  # (B, L)
+        tgt_lvl = target_level[:, None].expand(B, L)             # (B, L)
+        mc_t = move_chance_t.expand(B, L)
+        ones = torch.ones_like(mc_t)
+        zeros = torch.zeros_like(mc_t)
+        move_chance = torch.where(
+            pos_lvl > tgt_lvl, zeros,
+            torch.where(pos_lvl == tgt_lvl, mc_t, ones),
+        )
+        loss_mask = (pos_lvl == tgt_lvl)
+        return move_chance, loss_mask, target_level
+
     def _forward_pass_diffusion(self, x0: Tensor,
                                  cond_tokens: Optional[Tensor] = None,
-                                 class_labels: Optional[Tensor] = None) -> Tensor:
+                                 class_labels: Optional[Tensor] = None,
+                                 semi_ar_level_idx: Optional[Tensor] = None,
+                                 semi_ar_n_levels: Optional[int] = None) -> Tensor:
         """Compute per-token diffusion loss for a batch of clean tokens.
 
         Exactly matches MDLM's continuous-time subs loss:
@@ -390,6 +463,8 @@ class DiscreteDiffusion(nn.Module):
             x0:           (B, L) int64 clean tokens
             cond_tokens:  optional conditioning for cross-attn
             class_labels: optional (B,) int64 class labels for adaLN cond
+            semi_ar_level_idx: (L,) int tensor (0=finest .. n-1=coarsest).
+                If given, enables semi-autoregressive coarse-to-fine masking.
         Returns:
             loss: (B, L) per-token loss (non-negative)
         """
@@ -406,6 +481,12 @@ class DiscreteDiffusion(nn.Module):
             unet_conditioning = sigma[:, None]
             move_chance = 1 - torch.exp(-sigma[:, None])
 
+        loss_mask = None
+        if semi_ar_level_idx is not None:
+            assert semi_ar_n_levels is not None
+            move_chance, loss_mask, _ = self._build_semi_ar_move_chance(
+                move_chance, semi_ar_level_idx, semi_ar_n_levels)
+
         xt = self.q_xt(x0, move_chance)
         model_output = self.forward(xt, unet_conditioning,
                                     cond_tokens=cond_tokens,
@@ -418,17 +499,24 @@ class DiscreteDiffusion(nn.Module):
 
         if self.change_of_variables or self.importance_sampling:
             # change-of-variables ELBO:  L = log_p * log(1 - exp(-sigma_min))
-            return log_p_theta * torch.log1p(
+            loss = log_p_theta * torch.log1p(
                 -torch.exp(-self.noise.sigma_min)
             )
+        else:
+            # Standard continuous-time ELBO:
+            #   L = -log_p * dsigma / (exp(sigma) - 1)
+            loss = -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
 
-        # Standard continuous-time ELBO:
-        #   L = -log_p * dsigma / (exp(sigma) - 1)
-        return -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
+        if loss_mask is not None:
+            loss = loss * loss_mask.float()
+            return loss, loss_mask
+        return loss, None
 
     def compute_loss(self, x0: Tensor, attention_mask: Optional[Tensor] = None,
                      cond_tokens: Optional[Tensor] = None,
-                     class_labels: Optional[Tensor] = None) -> LossOutput:
+                     class_labels: Optional[Tensor] = None,
+                     semi_ar_level_idx: Optional[Tensor] = None,
+                     semi_ar_n_levels: Optional[int] = None) -> LossOutput:
         """Full loss computation (used in training step).
 
         Args:
@@ -441,16 +529,26 @@ class DiscreteDiffusion(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(x0, dtype=torch.float32)
 
+        loss_mask = None
         if self.factorized_head:
+            if semi_ar_level_idx is not None:
+                raise NotImplementedError(
+                    "semi_autoregressive not supported for factorized_head path")
             loss_per_token = self._forward_pass_diffusion_factorized(
                 x0, cond_tokens=cond_tokens,
                 class_labels=class_labels)
         else:
-            loss_per_token = self._forward_pass_diffusion(
+            loss_per_token, loss_mask = self._forward_pass_diffusion(
                 x0, cond_tokens=cond_tokens,
-                class_labels=class_labels)  # (B, L)
+                class_labels=class_labels,
+                semi_ar_level_idx=semi_ar_level_idx,
+                semi_ar_n_levels=semi_ar_n_levels)  # (B, L)
         nlls = loss_per_token * attention_mask
-        count = attention_mask.sum()
+        if loss_mask is not None:
+            # Semi-AR: normalize only over target-level positions.
+            count = (attention_mask * loss_mask.float()).sum().clamp(min=1.0)
+        else:
+            count = attention_mask.sum()
         token_nll = nlls.sum() / count
 
         return LossOutput(loss=token_nll, nlls=nlls, token_mask=attention_mask)
@@ -475,6 +573,8 @@ class DiscreteDiffusion(nn.Module):
         cond_tokens: Optional[Tensor] = None,
         class_labels: Optional[Tensor] = None,
         cell_cond: Optional[Tensor] = None,
+        semi_ar_level_idx: Optional[Tensor] = None,
+        semi_ar_n_levels: Optional[int] = None,
     ) -> LossOutput:
         """Loss for continuous mode with diffusion head.
 
@@ -483,6 +583,11 @@ class DiscreteDiffusion(nn.Module):
             attention_mask: (B, L) float mask (1 = valid, 0 = padding)
             cond_tokens:    optional prefix conditioning
             class_labels:   optional class labels
+            semi_ar_level_idx: (L,) int tensor (0=finest .. n-1=coarsest).
+                If given, enables coarse-to-fine semi-autoregressive masking:
+                per batch item sample target level k; coarser-than-k revealed,
+                target k diffused, finer-than-k fully masked. Loss computed
+                only on target-level positions.
         Returns:
             LossOutput with scalar loss.
         """
@@ -497,10 +602,17 @@ class DiscreteDiffusion(nn.Module):
         # Sample time t and compute mask probability
         t = self._sample_t(B, device)
         sigma, dsigma = self.noise(t)
-        move_chance = 1 - torch.exp(-sigma[:, None])  # (B, 1)
+        move_chance_t = 1 - torch.exp(-sigma[:, None])  # (B, 1)
 
-        # Mask some positions
-        mask = self.q_xt_continuous(x0, move_chance)  # (B, L) bool
+        loss_mask = None
+        if semi_ar_level_idx is not None:
+            assert semi_ar_n_levels is not None
+            move_chance, loss_mask, _ = self._build_semi_ar_move_chance(
+                move_chance_t, semi_ar_level_idx, semi_ar_n_levels)
+            # Per-position mask via per-position move_chance
+            mask = torch.rand(B, L, device=device) < move_chance
+        else:
+            mask = self.q_xt_continuous(x0, move_chance_t)  # (B, L) bool
 
         # Run backbone → hidden states (B, L, hidden_size)
         if sigma.ndim > 1:
@@ -518,10 +630,11 @@ class DiscreteDiffusion(nn.Module):
             cell_cond=cell_cond,
         )  # (B, L, hidden_size)
 
-        # Extract masked positions for diffusion head
-        # mask: (B, L) bool, hidden: (B, L, H), x0: (B, L, D)
-        masked_hidden = hidden[mask]  # (N_masked, H)
-        masked_target = x0[mask]      # (N_masked, D)
+        # Extract positions to compute loss on. In semi-AR mode only target-
+        # level masked positions contribute; otherwise all masked positions.
+        select = (mask & loss_mask) if loss_mask is not None else mask
+        masked_hidden = hidden[select]  # (N_masked, H)
+        masked_target = x0[select]      # (N_masked, D)
 
         if masked_hidden.shape[0] == 0:
             # Edge case: no masked tokens — return zero loss
@@ -569,6 +682,261 @@ class DiscreteDiffusion(nn.Module):
 
         # Lower sigma → higher confidence
         return -torch.exp(0.5 * log_var).mean(dim=-1)
+
+    @torch.no_grad()
+    def _sample_continuous_semi_ar(
+        self,
+        batch_size: int,
+        seq_len: int,
+        feat_dim: int,
+        num_steps: int,
+        device: torch.device,
+        cond_tokens: Optional[Tensor],
+        class_labels: Optional[Tensor],
+        temperature: float,
+        cfg: float,
+        cfg_schedule: str,
+        cfg_mode: str,
+        null_class_index: Optional[int],
+        uncond_cond_tokens: Optional[Tensor],
+        cell_cond: Optional[Tensor],
+        return_history: bool,
+        sampler: str = "ddpm_cache",
+        tokens_per_step: int = 0,
+    ) -> Tensor:
+        """Coarse-to-fine semi-autoregressive sampling.
+
+        Outer loop over resolution levels from coarsest (n_levels-1) to
+        finest (0); inner loop sweeps t from 1→ε within the current level,
+        identical to training's marginal over t.
+
+        At level k:
+          - Already-sampled coarser positions (pos_lvl > k) are held fixed
+            (revealed to the backbone as data tokens).
+          - Target positions (pos_lvl == k) start fully masked and are
+            iteratively unmasked.
+          - Finer positions (pos_lvl < k) stay fully masked (mask embedding)
+            — matches training's "finer-than-target fully masked" regime.
+
+        The total inner-step budget is split across levels proportionally
+        to the number of positions at each level.
+
+        Args:
+            sampler: "ddpm" / "ddpm_cache" (stochastic MDLM reverse) or
+                "confidence" (MaskGIT-style top-k by diff-head variance).
+            tokens_per_step: for the confidence sampler, unmask exactly
+                this many target-level tokens per inner step (0 = cosine).
+        """
+        import math as _math
+        assert self.semi_ar_level_idx is not None
+        n_levels = self.semi_ar_n_levels
+        level_idx = self.semi_ar_level_idx.to(device)  # (L,)
+        use_confidence = sampler.startswith("confidence")
+
+        use_backbone_cfg = (cfg_mode == "backbone") and (cfg != 1.0)
+
+        # Precompute uncond inputs for backbone-CFG mode.
+        null_cond_tokens_cached = None
+        null_class_labels_cached = None
+        if use_backbone_cfg:
+            if cond_tokens is not None:
+                if uncond_cond_tokens is not None:
+                    null_cond_tokens_cached = uncond_cond_tokens.to(
+                        cond_tokens.dtype).contiguous()
+                else:
+                    null_tok = self.backbone.null_cond_token.to(cond_tokens.dtype)
+                    null_cond_tokens_cached = null_tok.expand(
+                        cond_tokens.shape[0], cond_tokens.shape[1], -1
+                    ).contiguous()
+            if class_labels is not None:
+                assert null_class_index is not None, \
+                    "cfg_mode=backbone with class_labels requires null_class_index"
+                null_class_labels_cached = torch.full_like(class_labels, null_class_index)
+
+        def _fwd(sigma_in, cur_mask, cur_x):
+            hidden = self.backbone(
+                indices=None, sigma=sigma_in,
+                cond_tokens=cond_tokens, class_labels=class_labels,
+                prefix_mode=(cond_tokens is not None),
+                cont_tokens=cur_x, mask=cur_mask,
+                cell_cond=cell_cond,
+            )
+            hidden_un = None
+            if use_backbone_cfg:
+                hidden_un = self.backbone(
+                    indices=None, sigma=sigma_in,
+                    cond_tokens=null_cond_tokens_cached,
+                    class_labels=null_class_labels_cached,
+                    prefix_mode=(null_cond_tokens_cached is not None),
+                    cont_tokens=cur_x, mask=cur_mask,
+                    cell_cond=cell_cond,
+                )
+            return hidden, hidden_un
+
+        # Split num_steps across levels proportionally to positions.
+        level_pos_counts = [
+            int((level_idx == k).sum().item()) for k in range(n_levels)]
+        total_pos = sum(level_pos_counts)
+        steps_per_level = [
+            max(1, int(round(num_steps * n / max(total_pos, 1))))
+            for n in level_pos_counts]
+
+        x = torch.zeros(batch_size, seq_len, feat_dim, device=device)
+        # is_masked_any = target-masked ∪ finer-masked (what backbone sees).
+        # is_masked_target = currently-masked target positions (unmask candidates).
+        known = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+
+        history = [x.clone().cpu()] if return_history else None
+        mask_history = [
+            torch.ones(batch_size, seq_len, dtype=torch.bool).cpu()
+        ] if return_history else None
+
+        # Outer: coarsest → finest
+        for k in range(n_levels - 1, -1, -1):
+            is_target_lvl = (level_idx == k).unsqueeze(0).expand(batch_size, seq_len)
+            is_finer     = (level_idx <  k).unsqueeze(0).expand(batch_size, seq_len)
+            # Initialize: target level fully masked; finer stays masked; known (coarser) revealed.
+            is_masked_target = is_target_lvl.clone()
+            target_count = int((level_idx == k).sum().item())  # positions at level k
+
+            L_inner = steps_per_level[k]
+            for step in range(L_inner):
+                if not is_masked_target.any():
+                    break
+
+                if use_confidence:
+                    # ── Confidence-based unmasking within the level ──
+                    # Compute sigma from remaining target-level mask ratio
+                    # (per batch item). Matches _cheap_confidence's reliance
+                    # on a sigma-conditioned backbone forward.
+                    n_masked_b = is_masked_target.float().sum(dim=1)  # (B,)
+                    masked_ratio = (n_masked_b / max(target_count, 1)).clamp(1e-5, 1)
+                    sigma_t = self.noise(masked_ratio.view(-1, 1))[0]
+                    if sigma_t.ndim > 1:
+                        sigma_t = sigma_t.squeeze(-1)
+
+                    backbone_mask = is_masked_target | is_finer
+                    hidden, hidden_un = _fwd(self._t(sigma_t), backbone_mask, x)
+
+                    # Rank masked target positions by cheap confidence
+                    masked_hidden = hidden[is_masked_target]  # (N_tgt_masked, H)
+                    masked_uncond = (hidden_un[is_masked_target]
+                                     if hidden_un is not None else None)
+                    confidence = self._cheap_confidence(masked_hidden)  # (N,)
+
+                    # Cumulative target for this step (cosine or linear)
+                    if tokens_per_step > 0:
+                        target_unmasked = min(
+                            target_count, (step + 1) * tokens_per_step)
+                    else:
+                        ratio = (step + 1) / L_inner
+                        unmask_frac = _math.cos(_math.pi / 2 * (1 - ratio))
+                        target_unmasked = int(unmask_frac * target_count)
+
+                    # Index bookkeeping: map flat `masked_hidden` rows back to
+                    # (batch, position) so we can scatter sampled tokens.
+                    masked_indices = is_masked_target.nonzero(as_tuple=False)  # (N, 2)
+
+                    all_selected_hidden = []
+                    all_selected_uncond = []
+                    all_batch_ids = []
+                    all_positions = []
+                    for b in range(batch_size):
+                        b_mask = is_masked_target[b]
+                        n_cur = int(b_mask.sum().item())
+                        if n_cur == 0:
+                            continue
+                        n_already = target_count - n_cur
+                        n_to_unmask = max(1, target_unmasked - n_already)
+                        n_to_unmask = min(n_to_unmask, n_cur)
+
+                        b_pos = b_mask.nonzero(as_tuple=False).squeeze(-1)
+                        b_sel = (masked_indices[:, 0] == b)
+                        b_conf = confidence[b_sel]
+                        b_hidden = masked_hidden[b_sel]
+                        _, topk = b_conf.topk(n_to_unmask)
+                        all_selected_hidden.append(b_hidden[topk])
+                        if masked_uncond is not None:
+                            all_selected_uncond.append(masked_uncond[b_sel][topk])
+                        all_batch_ids.extend([b] * n_to_unmask)
+                        all_positions.append(b_pos[topk])
+
+                    if all_selected_hidden:
+                        cat_hidden = torch.cat(all_selected_hidden, dim=0)
+                        cat_uncond = (torch.cat(all_selected_uncond, dim=0)
+                                      if all_selected_uncond else None)
+                        cur_cfg = (cfg if cfg_schedule == "constant"
+                                   else 1.0 + (cfg - 1.0) * (step + 1) / max(L_inner, 1))
+                        cat_tokens = self.diff_head.sample(
+                            cat_hidden, temperature=temperature, cfg=cur_cfg,
+                            z_uncond=cat_uncond)
+                        bid = torch.tensor(all_batch_ids, device=device, dtype=torch.long)
+                        pos = torch.cat(all_positions, dim=0)
+                        x[bid, pos] = cat_tokens
+                        is_masked_target[bid, pos] = False
+
+                else:
+                    # ── DDPM cache (stochastic MDLM reverse) ──
+                    frac_cur = 1.0 - step / L_inner
+                    frac_nxt = 1.0 - (step + 1) / L_inner
+                    t_cur = torch.full((batch_size,), max(frac_cur, 1e-5), device=device)
+                    t_nxt = torch.full((batch_size,), max(frac_nxt, 1e-5), device=device)
+
+                    sigma_t = self.noise(t_cur)[0]
+                    sigma_s = self.noise(t_nxt)[0]
+                    if sigma_t.ndim > 1: sigma_t = sigma_t.squeeze(-1)
+                    if sigma_s.ndim > 1: sigma_s = sigma_s.squeeze(-1)
+
+                    move_t = (1 - torch.exp(-sigma_t)).clamp(min=1e-8)
+                    move_s = (1 - torch.exp(-sigma_s))
+                    unmask_prob = (1 - move_s / move_t).clamp(0, 1)
+
+                    backbone_mask = is_masked_target | is_finer
+                    hidden, hidden_un = _fwd(self._t(sigma_t), backbone_mask, x)
+
+                    rand = torch.rand(batch_size, seq_len, device=device)
+                    do_unmask = (rand < unmask_prob[:, None]) & is_masked_target
+                    if do_unmask.any():
+                        sel_hidden = hidden[do_unmask]
+                        sel_uncond = hidden_un[do_unmask] if hidden_un is not None else None
+                        cur_cfg = (cfg if cfg_schedule == "constant"
+                                   else 1.0 + (cfg - 1.0) * (step + 1) / max(L_inner, 1))
+                        sel_tokens = self.diff_head.sample(
+                            sel_hidden, temperature=temperature, cfg=cur_cfg,
+                            z_uncond=sel_uncond)
+                        x[do_unmask] = sel_tokens
+                        is_masked_target[do_unmask] = False
+
+                if return_history:
+                    history.append(x.clone().cpu())
+                    mask_history.append(
+                        (is_masked_target | is_finer).clone().cpu())
+
+            # Final pass inside level: flush any target positions still masked.
+            if is_masked_target.any():
+                t_final = torch.full((batch_size,), 1e-5, device=device)
+                sigma_t = self.noise(t_final)[0]
+                if sigma_t.ndim > 1: sigma_t = sigma_t.squeeze(-1)
+                backbone_mask = is_masked_target | is_finer
+                hidden, hidden_un = _fwd(self._t(sigma_t), backbone_mask, x)
+                sel_hidden = hidden[is_masked_target]
+                sel_uncond = hidden_un[is_masked_target] if hidden_un is not None else None
+                sampled = self.diff_head.sample(
+                    sel_hidden, temperature=temperature, cfg=cfg,
+                    z_uncond=sel_uncond)
+                x[is_masked_target] = sampled
+                is_masked_target.fill_(False)
+
+                if return_history:
+                    history.append(x.clone().cpu())
+                    mask_history.append(
+                        (is_masked_target | is_finer).clone().cpu())
+
+            known = known | is_target_lvl
+
+        if return_history:
+            return x, mask_history
+        return x
 
     @torch.no_grad()
     def sample_continuous(
@@ -622,6 +990,29 @@ class DiscreteDiffusion(nn.Module):
         import math as _math
         assert self.diff_head is not None, \
             "diff_head required for continuous sampling"
+
+        # Semi-autoregressive dispatch: if the model was configured for
+        # coarse-to-fine training (via set_semi_ar), generate level-by-level
+        # to match the training distribution. Inpainting (known_mask) is
+        # not supported in this path — the semi-AR progression already
+        # defines which positions are "known" at each outer step.
+        if self.semi_ar_level_idx is not None and self.semi_ar_n_levels is not None:
+            assert known_mask is None, (
+                "semi-AR sampling does not accept known_mask (the coarse→fine "
+                "schedule defines the known set itself)")
+            return self._sample_continuous_semi_ar(
+                batch_size=batch_size, seq_len=seq_len, feat_dim=feat_dim,
+                num_steps=num_steps, device=device,
+                cond_tokens=cond_tokens, class_labels=class_labels,
+                temperature=temperature, cfg=cfg,
+                cfg_schedule=cfg_schedule, cfg_mode=cfg_mode,
+                null_class_index=null_class_index,
+                uncond_cond_tokens=uncond_cond_tokens,
+                cell_cond=cell_cond,
+                return_history=return_history,
+                sampler=sampler,
+                tokens_per_step=tokens_per_step,
+            )
 
         def _cfg_at(cur_step: int, total: int) -> float:
             """Semanticist-style CFG scheduling across unmask steps.

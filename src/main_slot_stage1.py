@@ -32,7 +32,9 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import main_multires as mm
-from slot_encoder import SlotAttentionEncoder, visualize_slot_segmentation
+from slot_encoder import (SlotAttentionEncoder,
+                           visualize_slot_segmentation,
+                           visualize_dit_cross_attention)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -62,6 +64,19 @@ def _split_slot_args(argv):
                      help="Save slot-attention segmentation viz every N steps.")
     pre.add_argument("--slot_viz_n_samples", type=int, default=8,
                      help="How many val images to visualise per slot-viz step.")
+    pre.add_argument("--dit_attn_viz_t", type=float, nargs="+",
+                     default=[0.0, 0.25, 0.5, 0.75, 0.9],
+                     help="Flow-matching time(s) at which to capture DiT "
+                          "image→slot self-attention. Convention: t=0 is "
+                          "pure noise, t=1 is clean image (JiT/SiT-style, "
+                          "opposite of DDPM). Default spans full trajectory: "
+                          "0.0 (pure noise — slot's prior on layout), 0.25, "
+                          "0.5, 0.75, 0.9 (near-clean refinement). "
+                          "Multiple values render one file per t with "
+                          "suffix .t{NNN} appended to the filename.")
+    pre.add_argument("--dit_attn_viz_blocks", type=int, default=4,
+                     help="Average attention over this many trailing DiT "
+                          "blocks (last layers carry the most semantics).")
     return pre.parse_known_args(argv)
 
 
@@ -104,10 +119,17 @@ def _build_model_with_slot(args):
 
     # Disable nested-sampler progressive slot dropping (semanticist-only
     # trick; not meaningful for permutation-invariant slot attention).
+    # NOTE: Baseline1DConditionalDiT.__init__ pre-computes
+    #       self._nest_enabled = (enable_nest_after_steps == -1) and enable_nest
+    # which is True under the script defaults — forward() reads that flag,
+    # not enable_nest, so we must overwrite _nest_enabled too. set_step()
+    # only flips _nest_enabled ON, never OFF.
     if hasattr(model, "enable_nest_after_steps"):
         model.enable_nest_after_steps = -1
     if hasattr(model, "enable_nest"):
         model.enable_nest = False
+    if hasattr(model, "_nest_enabled"):
+        model._nest_enabled = False
 
     return model
 
@@ -156,6 +178,20 @@ def _generate_samples_with_slot_viz(model, val_dataset, scheduler, args,
         accelerator.print(f"[slot-viz] saved → {save_path}")
     except Exception as exc:
         accelerator.print(f"[slot-viz] skipped: {exc}")
+
+    # ── DiT cross-attention viz: per-slot influence on image generation ──
+    try:
+        dit_save_dir = os.path.join(args.output_dir, "dit_attn")
+        os.makedirs(dit_save_dir, exist_ok=True)
+        dit_save_path = os.path.join(dit_save_dir, f"step_{step:07d}.png")
+        visualize_dit_cross_attention(
+            eval_model, images, dit_save_path,
+            t_value=getattr(args, "dit_attn_viz_t", 0.5),
+            average_last_n_blocks=getattr(args, "dit_attn_viz_blocks", 4),
+        )
+        accelerator.print(f"[dit-attn-viz] saved → {dit_save_path}")
+    except Exception as exc:
+        accelerator.print(f"[dit-attn-viz] skipped: {exc}")
 
     return out
 

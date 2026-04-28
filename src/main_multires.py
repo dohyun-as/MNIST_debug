@@ -23,6 +23,7 @@ import os
 import shutil
 import time
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -88,6 +89,14 @@ def parse_args():
                    help="Pre-encode all images with VAE and cache to disk")
     p.add_argument("--latent_cache_dir", type=str, default=None,
                    help="Directory for cached latents (default: output_dir/latent_cache)")
+
+    # --- Local-SSD image cache (avoid NAS I/O every step) ---
+    p.add_argument("--cache_to_local_disk", action="store_true", default=False,
+                   help="Preprocess all images once (resize+center_crop) into a uint8 "
+                        "memmap file on local SSD. All ranks mmap-share via OS page cache.")
+    p.add_argument("--local_cache_dir", type=str, default=None,
+                   help="Base dir for local memmap cache (default: /workspace/cache). "
+                        "Per-dataset subdir is auto-named from the source path + image_size.")
 
     # --- image / model ---
     p.add_argument("--image_size", type=int, default=256)
@@ -374,6 +383,132 @@ def build_datasets(args):
     train_ds = datasets.ImageFolder(train_dir, transform=build_train_transform(args.image_size))
     val_ds = datasets.ImageFolder(train_dir, transform=build_val_transform(args.image_size))
     return train_ds, val_ds
+
+
+def _resolve_local_cache_subdir(args, root_dir):
+    base = args.local_cache_dir or "/workspace/cache"
+    # Name subdir after the leaf of root_dir + image_size (so train/val don't collide).
+    tag = os.path.basename(os.path.normpath(root_dir)) or "root"
+    return os.path.join(base, f"{tag}_{args.image_size}")
+
+
+def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name):
+    """Build (on main proc) or reuse a uint8 memmap cache of an ImageFolder.
+
+    Layout:
+      {cache_dir}/{name}.bin        — (N, 3, H, H) uint8 raw bytes
+      {cache_dir}/{name}.meta.json  — num_images, image_size, labels, classes, samples
+    Other ranks wait on accelerator.wait_for_everyone() until main finishes.
+    Returns a dict with the meta fields + bin_path.
+    """
+    from PIL import Image
+
+    os.makedirs(cache_dir, exist_ok=True)
+    bin_path = os.path.join(cache_dir, f"{name}.bin")
+    meta_path = os.path.join(cache_dir, f"{name}.meta.json")
+
+    if accelerator.is_main_process:
+        need_build = True
+        if os.path.isfile(bin_path) and os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                expected_bytes = meta["num_images"] * 3 * image_size * image_size
+                if (meta.get("image_size") == image_size
+                        and os.path.getsize(bin_path) == expected_bytes
+                        and meta.get("root_dir") == os.path.abspath(root_dir)):
+                    need_build = False
+                    accelerator.print(f"[memmap-cache] Reuse {name}: {bin_path} "
+                                      f"({meta['num_images']} imgs)")
+            except Exception:
+                need_build = True
+
+        if need_build:
+            accelerator.print(f"[memmap-cache] Building {name}: {bin_path}")
+            base = datasets.ImageFolder(root_dir)
+            num_images = len(base.samples)
+            arr = np.memmap(bin_path, dtype=np.uint8, mode='w+',
+                            shape=(num_images, 3, image_size, image_size))
+            resize = transforms.Resize(
+                image_size,
+                interpolation=transforms.InterpolationMode.BICUBIC)
+            crop = transforms.CenterCrop(image_size)
+            labels, samples = [], []
+            for i, (path, label) in enumerate(
+                    tqdm(base.samples, desc=f"Preload {name}")):
+                img = Image.open(path).convert("RGB")
+                img = crop(resize(img))
+                hwc = np.asarray(img, dtype=np.uint8)
+                arr[i] = np.transpose(hwc, (2, 0, 1))
+                labels.append(int(label))
+                samples.append([path, int(label)])
+                if (i + 1) % 5000 == 0:
+                    arr.flush()
+            arr.flush()
+            del arr
+
+            meta = {
+                "num_images": num_images,
+                "image_size": image_size,
+                "channels": 3,
+                "labels": labels,
+                "classes": list(base.classes),
+                "samples": samples,
+                "root_dir": os.path.abspath(root_dir),
+            }
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+            accelerator.print(
+                f"[memmap-cache] Built {name}: {num_images} imgs, "
+                f"{os.path.getsize(bin_path) / (1 << 30):.2f} GiB")
+
+    accelerator.wait_for_everyone()
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+    meta["bin_path"] = bin_path
+    return meta
+
+
+class MemmapImageDataset(torch.utils.data.Dataset):
+    """Serves images from a uint8 memmap file built by build_memmap_image_cache.
+
+    __getitem__ returns (image, label) with image normalized to [-1, 1] float CHW
+    — same contract as ImageFolder + build_{train,val}_transform. When train=True,
+    a 50% horizontal flip is applied (matching RandomHorizontalFlip).
+    Exposes .samples / .classes / .targets for ImageFolder-compatible downstream code.
+    """
+    def __init__(self, meta, train=True):
+        self.bin_path = meta["bin_path"]
+        self.num_images = int(meta["num_images"])
+        self.image_size = int(meta["image_size"])
+        self.channels = int(meta["channels"])
+        self.labels = [int(x) for x in meta["labels"]]
+        self.classes = list(meta["classes"])
+        self.samples = [(p, int(l)) for p, l in meta["samples"]]
+        self.targets = list(self.labels)
+        self.train = train
+        self._arr = None
+
+    def _get_arr(self):
+        if self._arr is None:
+            self._arr = np.memmap(
+                self.bin_path, dtype=np.uint8, mode='r',
+                shape=(self.num_images, self.channels,
+                       self.image_size, self.image_size),
+            )
+        return self._arr
+
+    def __len__(self):
+        return self.num_images
+
+    def __getitem__(self, idx):
+        arr = self._get_arr()
+        img = torch.from_numpy(np.array(arr[idx], dtype=np.uint8))
+        if self.train and torch.rand(1).item() < 0.5:
+            img = torch.flip(img, dims=[2])
+        img = img.to(torch.float32).div_(255.0).sub_(0.5).mul_(2.0)
+        return img, self.labels[idx]
 
 
 def consolidate_cache(cache_dir, latent_only=False):
@@ -1499,7 +1634,14 @@ def train(args):
         )
         accelerator.print(f"Train (cached): {len(train_ds)} per rank")
     else:
-        train_ds, _ = build_datasets(args)
+        train_img_dir = args.train_dir or os.path.join(args.dataset_root, "train")
+        if args.cache_to_local_disk:
+            cache_sub = _resolve_local_cache_subdir(args, train_img_dir)
+            meta = build_memmap_image_cache(
+                train_img_dir, cache_sub, args.image_size, accelerator, "train")
+            train_ds = MemmapImageDataset(meta, train=True)
+        else:
+            train_ds, _ = build_datasets(args)
         accelerator.print(f"Train: {len(train_ds)}")
 
     # Val dataset (always raw images for FID/sampling)
@@ -1515,17 +1657,30 @@ def train(args):
             val_dir = train_img_dir
     if val_dir != train_img_dir:
         accelerator.print(f"Val (separate): {val_dir}")
-    val_ds = datasets.ImageFolder(
-        val_dir,
-        transform=build_val_transform(args.image_size),
-    )
+    if args.cache_to_local_disk:
+        val_cache_sub = _resolve_local_cache_subdir(args, val_dir)
+        val_meta = build_memmap_image_cache(
+            val_dir, val_cache_sub, args.image_size, accelerator, "val")
+        val_ds = MemmapImageDataset(val_meta, train=False)
+    else:
+        val_ds = datasets.ImageFolder(
+            val_dir,
+            transform=build_val_transform(args.image_size),
+        )
     # Train dataset with val transform for sampling grid (no augmentation)
     sample_train_ds = None
     if val_dir != train_img_dir:
-        sample_train_ds = datasets.ImageFolder(
-            train_img_dir,
-            transform=build_val_transform(args.image_size),
-        )
+        if args.cache_to_local_disk:
+            # Reuse train cache built above (or build here if train path took cache branch)
+            sample_cache_sub = _resolve_local_cache_subdir(args, train_img_dir)
+            sample_meta = build_memmap_image_cache(
+                train_img_dir, sample_cache_sub, args.image_size, accelerator, "train")
+            sample_train_ds = MemmapImageDataset(sample_meta, train=False)
+        else:
+            sample_train_ds = datasets.ImageFolder(
+                train_img_dir,
+                transform=build_val_transform(args.image_size),
+            )
 
     if preload_sharded:
         # Data already split per rank → no DistributedSampler, just shuffle

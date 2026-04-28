@@ -3467,6 +3467,12 @@ def parse_args():
                         "(AdaLN-like). Start from fully-masked at inference; "
                         "hint digits only influence generation via "
                         "SudokuDigitCellEncoder. Independent from inpainting.")
+    p.add_argument("--semi_autoregressive", action="store_true", default=False,
+        help="Enable coarse-to-fine semi-autoregressive masked diffusion. "
+             "Per batch item, sample a target resolution level k: coarser "
+             "levels (1x1,...) are fully revealed as conditioning, target "
+             "level is diffused with the MDLM schedule, finer levels are "
+             "fully masked. Loss is computed only on target-level positions.")
     p.add_argument("--time_conditioning", action="store_true", default=False,
                    help="Feed sigma/t into AdaLN (MDLM flag). Default False "
                         "(MDLM paper: absorbing diffusion doesn't need it).")
@@ -3641,6 +3647,30 @@ def main():
 
         # After caching is done below, we move pretrained model to CPU
         # to free GPU memory; it's loaded back to GPU only during eval
+
+    # ─────────────────────────────────────────────────────────
+    #  Semi-autoregressive position→level map
+    # ─────────────────────────────────────────────────────────
+    semi_ar_level_idx = None
+    semi_ar_n_levels = None
+    if args.semi_autoregressive:
+        assert level_sizes is not None and not is_baseline_1d, (
+            "--semi_autoregressive requires multi-resolution spatial tokens "
+            "(level_sizes from a hierarchical encoder, not baseline_1d).")
+        # Token order in x0 follows extract_tokens: finest spatial size first.
+        # level_sizes is already sorted finest→coarsest by the encoder
+        # (see multi_res_encoder.HierarchicalMultiResEncoder). So level 0 =
+        # finest, n_levels-1 = coarsest (e.g. 1x1).
+        sorted_sizes = sorted(level_sizes, reverse=True)
+        idx = []
+        for li, s in enumerate(sorted_sizes):
+            idx.extend([li] * (s * s))
+        semi_ar_level_idx = torch.tensor(
+            idx, dtype=torch.long, device=accelerator.device)
+        semi_ar_n_levels = len(sorted_sizes)
+        accelerator.print(
+            f"[semi_ar] enabled — n_levels={semi_ar_n_levels}, "
+            f"level_sizes(finest→coarsest)={sorted_sizes}")
 
     # ─────────────────────────────────────────────────────────
     #  Dataset
@@ -4082,6 +4112,13 @@ def main():
             diffusion_batch_mul=args.diff_head_batch_mul,
             time_conditioning=args.time_conditioning,
         )
+        if args.semi_autoregressive:
+            # Activates coarse-to-fine training loss + coarse-to-fine
+            # sampling inside sample_continuous.
+            diffusion.set_semi_ar(semi_ar_level_idx, semi_ar_n_levels)
+            accelerator.print(
+                f"[model] semi-AR enabled on diffusion "
+                f"(n_levels={semi_ar_n_levels})")
         if args.use_diffusion_head:
             accelerator.print(
                 f"[model] Diffusion + DiffHead (continuous): "
@@ -4385,10 +4422,14 @@ def main():
                 if args.use_diffusion_head:
                     loss_out = accelerator.unwrap_model(diffusion).compute_loss_continuous(
                         cont_tokens, cond_tokens=cond_tokens,
-                        class_labels=class_labels, cell_cond=cell_cond)
+                        class_labels=class_labels, cell_cond=cell_cond,
+                        semi_ar_level_idx=semi_ar_level_idx,
+                        semi_ar_n_levels=semi_ar_n_levels)
                 else:
                     loss_out = accelerator.unwrap_model(diffusion).compute_loss(
-                        tokens, cond_tokens=cond_tokens, class_labels=class_labels)
+                        tokens, cond_tokens=cond_tokens, class_labels=class_labels,
+                        semi_ar_level_idx=semi_ar_level_idx,
+                        semi_ar_n_levels=semi_ar_n_levels)
                 loss = loss_out.loss
 
                 accelerator.backward(loss)

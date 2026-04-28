@@ -3,9 +3,12 @@
 #  CLEVR 256×256 — STAGE 1: Slot Attention encoder + Baseline-1D DiT
 #
 #  Encoder: SlotAttentionEncoder (SlotDiffusion-port)
-#    - ResNet18 (small_inputs=True, GroupNorm)
+#    - ResNet18 (small_inputs=True, GroupNorm, stem_stride=2 for 256-px)
 #    - SoftPositionEmbed → MLP → SlotAttention (3 iterations)
 #    - K=16 slots × 192 dim   (matches SlotDiffusion CLEVRTex config)
+#    - 256 input → /8 → 32×32 = 1024 spatial tokens (vs 16×16 in paper).
+#    - stem_stride=2 keeps stem activations at 128×128 (~4× less memory
+#      than plain resnet18 at 256-px).
 #  DiT decoder: same JiT-B/16 backbone as the existing baseline script
 #    (cross-attends image patches → slots, flow matching loss)
 #
@@ -30,16 +33,16 @@ set -e
 export CUDA_VISIBLE_DEVICES="${GPUS:-0,1,2,3}"
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
-BATCH_PER_GPU=${BATCH_PER_GPU:-256}
+BATCH_PER_GPU=${BATCH_PER_GPU:-32}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 
 echo "GPUs: $CUDA_VISIBLE_DEVICES ($NUM_GPUS)  batch/gpu=$BATCH_PER_GPU  accum=$GRAD_ACCUM  effective=$((BATCH_PER_GPU * NUM_GPUS * GRAD_ACCUM))"
 
 # ── Data ──
-CLEVR_DIR=${CLEVR_DIR:-"../clevr_output/clevr_256_varied/images"}
-CLEVR_VAL=${CLEVR_VAL:-"../clevr_output/clevr_256_varied_val/images"}
+CLEVR_DIR="../clevr-dataset-gen/output/clevr_256_varied/images"
+CLEVR_VAL="../clevr-dataset-gen/output/clevr_256_varied_val/images"
 
-OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage1/256_slot16_d192"}
+OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage1/256_slot16_d192_resnet18s_init_learned"}
 mkdir -p "${OUTPUT_DIR}"
 
 accelerate launch \
@@ -60,10 +63,11 @@ accelerate launch \
     --slot_dim 192 \
     --slot_iters 3 \
     --slot_mlp_size 384 \
-    --slot_enc_backbone vit_b16 \
+    --slot_enc_backbone resnet18_strided \
     --slot_init learned \
     --slot_viz_every 5000 \
     --slot_viz_n_samples 8 \
+    --no_nest \
     \
     `# ── unused (Baseline1DConditionalDiT defaults; encoder is replaced) ── ` \
     --enc_embed_dim 768 \
@@ -90,18 +94,19 @@ accelerate launch \
     --flow_noise_scale 1.0 \
     --flow_sampling_method euler \
     \
-    `# ── training ── ` \
+    `# ── training (SlotDiffusion-style: lr=1e-4 peak, cosine, EMA) ── ` \
     --max_train_steps 200000 \
     --batch_size $BATCH_PER_GPU \
-    --blr 1e-4 \
+    --blr 2e-4 \
+    --lr_schedule cosine \
     --weight_decay 0.0 \
-    --warmup_steps 5000 \
+    --warmup_steps 10000 \
     --max_grad_norm 1.0 \
     --grad_accum_steps $GRAD_ACCUM \
     --mixed_precision bf16 \
-    --ema_decay 0 \
-    --uncond_drop_prob 0.1 \
-    --guidance_scale 3.0 \
+    --ema_decay 0.9999 \
+    --uncond_drop_prob 0.0 \
+    --guidance_scale 1.0 \
     \
     `# ── logging / eval ── ` \
     --log_every 100 \
@@ -113,4 +118,6 @@ accelerate launch \
     --seed 42 \
     --mae_mask_ratio 0.0 \
     --clevr_eval_every 5000 \
-    --clevr_eval_samples 50
+    --clevr_eval_samples 50 \
+    --cache_to_local_disk \
+    --local_cache_dir /workspace/cache

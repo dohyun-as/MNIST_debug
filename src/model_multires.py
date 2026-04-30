@@ -1020,6 +1020,7 @@ class MultiResConditionalDiT(nn.Module):
         cond_noise_relative: bool = False,
         # --- Per-token random drop (train-only regularizer) ---
         cond_token_drop_prob: float = 0.0,
+        cond_token_drop_all_levels: bool = False,
     ):
         super().__init__()
 
@@ -1031,6 +1032,7 @@ class MultiResConditionalDiT(nn.Module):
         self.cond_noise_std = cond_noise_std
         self.cond_noise_relative = cond_noise_relative
         self.cond_token_drop_prob = cond_token_drop_prob
+        self.cond_token_drop_all_levels = cond_token_drop_all_levels
         self.level_drop = level_drop
         self.min_keep_levels = min_keep_levels
         self.level_drop_after_steps = level_drop_after_steps
@@ -1463,10 +1465,12 @@ class MultiResConditionalDiT(nn.Module):
                     + null_tokens * (1 - mask))
 
             # ── Per-token random drop (train-only) ──
-            # level_drop 이후 각 sample 의 "가장 finest 한 kept level" 에만
-            # per-position Bernoulli(p_b) drop 적용. Coarse level 은 항상 intact
-            # → hierarchical 가정(coarse = global context)을 깨지 않음.
-            # keep_levels[b]=0 (fully uncond) 인 샘플은 finest kept level 자체가
+            # 기본: 각 sample 의 "가장 finest 한 kept level" 에만
+            # per-position Bernoulli(p_b) drop 적용 (hierarchical 가정 유지).
+            # cond_token_drop_all_levels=True: kept 인 모든 level 에 동일 적용
+            # (coarse level 도 random drop). dropped(null로 치환된) level 은
+            # 어차피 null 이라 영향 없음.
+            # keep_levels[b]=0 (fully uncond) 인 샘플은 kept level 자체가
             # 없으므로 drop 대상 없음 → 자동 skip.
             if self.training and self.cond_token_drop_prob > 0.0:
                 p_sample = (torch.rand(B, 1, device=device)
@@ -1474,12 +1478,16 @@ class MultiResConditionalDiT(nn.Module):
                 finest_kept_cf_idx = keep_levels - 1           # (B,)
                 for i, s in enumerate(self.encoder.level_sizes):
                     cf_idx = self._size_to_cf_idx[s]
-                    is_finest = (finest_kept_cf_idx == cf_idx).view(B, 1)
+                    if self.cond_token_drop_all_levels:
+                        # apply to every kept level for this sample
+                        active_lvl = (cf_idx < keep_levels).view(B, 1)
+                    else:
+                        active_lvl = (finest_kept_cf_idx == cf_idx).view(B, 1)
                     tokens = cond_tokens_list[i]               # (B, s*s, D)
                     null_tokens = self.null_cond[str(s)].expand(
                         B, -1, -1).to(dtype)
                     drop = ((torch.rand(B, s * s, device=device) < p_sample)
-                            & is_finest)                       # (B, s*s)
+                            & active_lvl)                      # (B, s*s)
                     keep = (~drop).to(tokens.dtype).unsqueeze(-1)
                     cond_tokens_list[i] = (
                         tokens * keep + null_tokens * (1.0 - keep))

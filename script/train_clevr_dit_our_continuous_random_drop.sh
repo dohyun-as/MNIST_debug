@@ -1,13 +1,15 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
 #  CLEVR 256×256 — Multi-Resolution DiT + ViT encoder
-#  (continuous features, no FSQ) — random level drop only (no nested)
+#  (continuous features, no FSQ) — random per-token drop on ALL levels
 # ──────────────────────────────────────────────────────────────────
 #
-#  Multi-resolution을 쓰되 nested(progressive) token dropping을 끄고,
-#  random level drop만 사용하는 variant.
-#    - --no_nest          : nested(progressive) drop 비활성
-#    - --level_drop       : random level drop 활성 (default true이지만 명시)
+#  Multi-resolution feature (1×1, 2×2, 4×4, 8×8) 모두 추출하되,
+#  nested level drop은 끄고, 모든 level의 토큰을 sample 마다
+#  p~Uniform(0, cond_token_drop_prob) 확률로 random drop.
+#    - --no_level_drop                : nested level drop 비활성
+#    - --cond_token_drop_prob X       : per-sample drop ratio 상한
+#    - --cond_token_drop_all_levels   : 1×1 ~ 8×8 모든 level 에 적용
 #
 #  Usage:
 #    bash script/train_clevr_dit_our_continuous_random_drop.sh
@@ -33,7 +35,7 @@ accelerate launch \
     --multi_gpu \
     src/main_multires.py \
     --backbone dit \
-    --output_dir runs/clevr/backbone/256_dit_vit_flow_cont_out16_randomdrop \
+    --output_dir runs/clevr/backbone/out16_randomdrop_alllvl_multi_res \
     --train_dir "$CLEVR_DIR" \
     --val_dir "$CLEVR_VAL" \
     --dataset_root "$CLEVR_DIR" \
@@ -71,10 +73,9 @@ accelerate launch \
     --mixed_precision bf16 \
     --ema_decay 0 \
     --uncond_drop_prob 0.1 \
-    --no_nest \
-    --level_drop \
-    --min_keep_levels 1 \
-    --level_drop_after_steps 10000 \
+    --no_level_drop \
+    --cond_token_drop_prob 1.0 \
+    --cond_token_drop_all_levels \
     --guidance_scale 3.0 \
     --log_every 100 \
     --save_every 10000 \

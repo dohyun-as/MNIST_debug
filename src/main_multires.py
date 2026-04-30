@@ -307,6 +307,12 @@ def parse_args():
                    help="Per-token random drop max ratio (train-only). "
                         "Applied only to the finest kept level per sample "
                         "after level_drop.")
+    p.add_argument("--cond_token_drop_all_levels", action="store_true",
+                   default=False,
+                   help="If set, cond_token_drop_prob is applied to every "
+                        "kept level (not just the finest). Useful when "
+                        "level_drop is disabled and you want random drop "
+                        "across all multi-res levels.")
     p.add_argument("--ema_decay", type=float, default=0.999,
                    help="EMA decay rate (0=disabled)")
     p.add_argument("--cond_use_latent", action="store_true", default=False,
@@ -782,6 +788,7 @@ def build_model(args):
             vq_beta=args.vq_beta,
             level_sizes=args.level_sizes,
             cond_token_drop_prob=args.cond_token_drop_prob,
+            cond_token_drop_all_levels=args.cond_token_drop_all_levels,
         )
 
     # ── UNet backbone (original) ──

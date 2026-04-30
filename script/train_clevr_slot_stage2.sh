@@ -25,12 +25,12 @@ set -e
 GPUS=${GPUS:-"0,1,2,3"}
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
-PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/clevr/slot_stage1/256_slot16_d192"}
-CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr_output/clevr_256_varied/images"}
-CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr_output/clevr_256_varied/conditions_text"}
-CLEVR_VAL_IMAGE_ROOT=${CLEVR_VAL_IMAGE_ROOT:-"../clevr_output/clevr_256_varied_val/images"}
-CLEVR_VAL_COND_DIR=${CLEVR_VAL_COND_DIR:-"../clevr_output/clevr_256_varied_val/conditions_text"}
-OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage2/256_slot16_d192_clip"}
+PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/clevr/slot_stage1/256_slot16_d64_resnet18s_crossattn"}
+CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied/images"}
+CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied/conditions_text"}
+CLEVR_VAL_IMAGE_ROOT=${CLEVR_VAL_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied_val/images"}
+CLEVR_VAL_COND_DIR=${CLEVR_VAL_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied_val/conditions_text"}
+OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage2/256_slot16_d64_resnet18s_crossattn_clip"}
 
 mkdir -p "${OUTPUT_DIR}"
 

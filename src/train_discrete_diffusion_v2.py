@@ -710,6 +710,7 @@ def load_pretrained_model(pretrained_output_dir: str, device: str = "cpu"):
             dit_bottleneck_dim=cfg.get("dit_bottleneck_dim", 128),
             dit_in_context_len=cfg.get("dit_in_context_len", 0),
             dit_in_context_start=cfg.get("dit_in_context_start", 4),
+            dit_attn_mode=cfg.get("dit_attn_mode", "self_concat"),
             uncond_drop_prob=0.0,
             use_fsq=cfg.get("use_fsq", False),
             fsq_levels=cfg.get("fsq_levels", None),
@@ -1311,6 +1312,9 @@ def _forward_from_slots(pretrained_model, z, t_batch, slot_features, return_unco
     """Forward pass for baseline_1d model using pre-decoded slot features.
 
     Bypasses the encoder: directly injects decoded slot tokens as conditioning.
+    Mirrors ``Baseline1DConditionalDiT.forward`` and supports BOTH attention
+    modes: ``self_concat`` (legacy Semanticist-style) and ``cross``
+    (SlotDiffusion-style image→slot cross-attn).
 
     Args:
         pretrained_model: Baseline1DConditionalDiT
@@ -1324,19 +1328,20 @@ def _forward_from_slots(pretrained_model, z, t_batch, slot_features, return_unco
     from model_multires import _sinusoidal_timestep_embedding
 
     B = z.shape[0]
-    device = z.device
     dtype = z.dtype
     model = pretrained_model
     K = model.in_context_len
+    attn_mode = getattr(model, "dit_attn_mode", "self_concat")
 
     if return_uncond:
         slots = model.null_cond.expand(B, -1, -1).to(dtype)
     else:
         slots = slot_features.to(dtype)
 
-    # Project cond tokens + positional embedding
+    # Project cond tokens (+ pos embed only in self_concat)
     cond_tokens = model.cond_proj(slots)
-    cond_tokens = cond_tokens + model.cond_pos_embed
+    if getattr(model, "cond_pos_embed", None) is not None:
+        cond_tokens = cond_tokens + model.cond_pos_embed
 
     # Patchify image tokens
     img_tokens = model.patch_embed(z)
@@ -1347,24 +1352,43 @@ def _forward_from_slots(pretrained_model, z, t_batch, slot_features, return_unco
     t_freq = t_freq.to(dtype=dtype)
     c = model.time_embed(t_freq)
 
-    # Build sequence
-    tokens = torch.cat([cond_tokens, img_tokens], dim=1)
-    num_prefix = model.num_slots
+    if attn_mode == "cross":
+        # ── Cross-attn: image tokens cross-attend to slots each block;
+        #    in-context tokens (if any) join self-attn pool but stay out
+        #    of the cross-attn step.
+        tokens = img_tokens
+        num_in_ctx = 0
+        for i, block in enumerate(model.blocks):
+            if K > 0 and i == model.in_context_start:
+                ic_tokens = c.unsqueeze(1).expand(-1, K, -1)
+                ic_tokens = ic_tokens + model.in_context_posemb
+                tokens = torch.cat([ic_tokens, tokens], dim=1)
+                num_in_ctx = K
+            rope_cos, rope_sin = model._build_rope_for_seq(num_in_ctx)
+            tokens = block(tokens, cond_tokens, c,
+                           num_in_ctx=num_in_ctx,
+                           rope_cos=rope_cos, rope_sin=rope_sin)
+        img_out = tokens[:, num_in_ctx:]
+    else:
+        # ── self_concat (Semanticist-style) ──
+        tokens = torch.cat([cond_tokens, img_tokens], dim=1)
+        num_prefix = model.num_slots
 
-    for i, block in enumerate(model.blocks):
-        if K > 0 and i == model.in_context_start:
-            ic_tokens = c.unsqueeze(1).expand(-1, K, -1)
-            ic_tokens = ic_tokens + model.in_context_posemb
-            cond_part = tokens[:, :model.num_slots]
-            img_part = tokens[:, model.num_slots:]
-            tokens = torch.cat([cond_part, ic_tokens, img_part], dim=1)
-            num_prefix = model.num_slots + K
+        for i, block in enumerate(model.blocks):
+            if K > 0 and i == model.in_context_start:
+                ic_tokens = c.unsqueeze(1).expand(-1, K, -1)
+                ic_tokens = ic_tokens + model.in_context_posemb
+                cond_part = tokens[:, :model.num_slots]
+                img_part = tokens[:, model.num_slots:]
+                tokens = torch.cat([cond_part, ic_tokens, img_part], dim=1)
+                num_prefix = model.num_slots + K
 
-        cur_prefix = model.num_slots + (K if (K > 0 and i >= model.in_context_start) else 0)
-        rope_cos, rope_sin = model._build_rope_for_seq(cur_prefix)
-        tokens = block(tokens, c, rope_cos=rope_cos, rope_sin=rope_sin)
+            cur_prefix = model.num_slots + (
+                K if (K > 0 and i >= model.in_context_start) else 0)
+            rope_cos, rope_sin = model._build_rope_for_seq(cur_prefix)
+            tokens = block(tokens, c, rope_cos=rope_cos, rope_sin=rope_sin)
+        img_out = tokens[:, num_prefix:]
 
-    img_out = tokens[:, num_prefix:]
     img_out = model.final_layer(img_out, c)
     pred = model._unpatchify(img_out)
     return pred
@@ -3084,18 +3108,20 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                   f"(GPU mem: {torch.cuda.memory_allocated(device)/1e9:.2f}GB / "
                   f"{torch.cuda.max_memory_allocated(device)/1e9:.2f}GB peak)", flush=True)
             try:
+                _decode_bs = min(
+                    getattr(args, "eval_decode_batch_size", 4), my_n)
                 if use_diffusion_head:
                     my_images = decode_continuous_tokens_to_images(
                         my_tokens, level_sizes, pretrained_model, device,
                         num_steps=args.decode_num_steps,
-                        batch_size=min(4, my_n),
+                        batch_size=_decode_bs,
                     )
                 else:
                     my_images = decode_tokens_to_images(
                         my_tokens, level_sizes, pretrained_model,
                         discretizer, device,
                         num_steps=args.decode_num_steps,
-                        batch_size=min(4, my_n),
+                        batch_size=_decode_bs,
                     )  # (my_n, 3, H, W) in [0, 1]
             except Exception as e:
                 import traceback
@@ -3124,9 +3150,17 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                             return clevr_text_to_condition_json(c["text"])
                         return c
                     eval_cond_jsons = [_to_eval_json(c) for c in my_cond_jsons]
+                # `decode_*_tokens_to_images` returns images in [-1, 1], but
+                # `eval_clevr_conditions` (and the underlying detector +
+                # classifier) expect them in [0, 1]. Rescale before eval —
+                # otherwise the detector input is normalized to roughly
+                # [-3, 1] and presence/relation scores collapse, even though
+                # the saved grid PNG looks fine (the grid-saver does its own
+                # 0.5+0.5 rescale).
+                my_images_eval = (my_images * 0.5 + 0.5).clamp(0, 1)
                 # Run eval on this rank's shard
                 my_eval = eval_clevr_conditions(
-                    my_images, eval_cond_jsons,
+                    my_images_eval, eval_cond_jsons,
                     clevr_detector, clevr_classifier,
                 )
                 # Split results by difficulty
@@ -3539,6 +3573,13 @@ def parse_args():
     p.add_argument("--eval_num_steps", type=int, default=128)
     p.add_argument("--decode_num_steps", type=int, default=50,
                    help="DDIM steps for decoding tokens to images during eval.")
+    p.add_argument("--eval_sample_batch_size", type=int, default=8,
+                   help="Per-rank batch size for token sampling at eval. "
+                        "Bump (e.g. 32-64) when GPU util is low during sweeps.")
+    p.add_argument("--eval_decode_batch_size", type=int, default=4,
+                   help="Per-rank batch size for decoding sampled tokens to "
+                        "images at eval. Currently hardcoded to min(4,my_n) — "
+                        "this CLI lets the sweep bump it (e.g. 16-32).")
     p.add_argument("--sampler", type=str, default="ddpm_cache",
                    choices=["ddpm", "ddpm_cache", "confidence"])
     p.add_argument("--tokens_per_step", type=int, default=0)
@@ -3582,9 +3623,13 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
-        json.dump({"cmd": " ".join(sys.argv), "args": vars(args)},
-                  f, indent=2, sort_keys=True)
+    # In eval-only mode we must NOT clobber the original training
+    # run_config.json — sweepers re-run this script with overrides and we
+    # want the canonical config to stay readable.
+    if not getattr(args, "eval_only", False):
+        with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
+            json.dump({"cmd": " ".join(sys.argv), "args": vars(args)},
+                      f, indent=2, sort_keys=True)
 
     project_config = ProjectConfiguration(
         project_dir=args.output_dir,
@@ -4225,7 +4270,32 @@ def main():
             if ckpt_dirs:
                 resume_dir = os.path.join(ckpt_root, ckpt_dirs[-1])
     if resume_dir and os.path.isdir(resume_dir):
-        accelerator.load_state(resume_dir)
+        try:
+            accelerator.load_state(resume_dir)
+        except (ValueError, RuntimeError) as _e:
+            # Eval-only sweepers may build the model with a slightly
+            # different head/optimizer config than what the ckpt was saved
+            # under (e.g. freeze_text_encoder mismatch). For eval we only
+            # care about the model + EMA weights — fall back to loading
+            # those manually and skip optimizer / scheduler state.
+            if not getattr(args, "eval_only", False):
+                raise
+            accelerator.print(
+                f"[resume] full load_state failed ({_e}); "
+                f"falling back to model+EMA-only load for eval_only.")
+            from safetensors.torch import load_file as _load_safetensors
+            unwrapped = accelerator.unwrap_model(diffusion)
+            for fn in ("model.safetensors", "model_1.safetensors"):
+                p = os.path.join(resume_dir, fn)
+                if os.path.isfile(p):
+                    sd = _load_safetensors(p)
+                    # Keys that match
+                    msd = unwrapped.state_dict()
+                    matched = {k: v for k, v in sd.items() if k in msd}
+                    unwrapped.load_state_dict(matched, strict=False)
+                    accelerator.print(
+                        f"[resume] loaded {len(matched)}/{len(sd)} keys "
+                        f"from {fn}")
         global_step = parse_step_from_dir(resume_dir)
         # Restore EMA shadow weights
         ema_path = os.path.join(resume_dir, "ema.pt")
@@ -4237,6 +4307,8 @@ def main():
 
     if args.eval_only:
         accelerator.print(f"[eval_only] running one evaluate_and_save at step={global_step}")
+        # Skip the train-set eval branch in eval-only mode — sweepers only
+        # care about the val-set scores.
         evaluate_and_save(
             diffusion, global_step, args, accelerator, ema,
             pretrained_model=pretrained_model,
@@ -4246,7 +4318,7 @@ def main():
             val_dataset=val_dataset,
             clevr_detector=clevr_detector,
             clevr_classifier=clevr_classifier,
-            train_dataset=train_dataset,
+            train_dataset=None,
             sudoku_cell_cond_encoder=sudoku_cell_cond_encoder,
         )
         accelerator.print("[eval_only] done")

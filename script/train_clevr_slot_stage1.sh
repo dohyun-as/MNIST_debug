@@ -42,7 +42,7 @@ echo "GPUs: $CUDA_VISIBLE_DEVICES ($NUM_GPUS)  batch/gpu=$BATCH_PER_GPU  accum=$
 CLEVR_DIR="../clevr-dataset-gen/output/clevr_256_varied/images"
 CLEVR_VAL="../clevr-dataset-gen/output/clevr_256_varied_val/images"
 
-OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage1/256_slot16_d192_resnet18s_crossattn"}
+OUTPUT_DIR=${OUTPUT_DIR:-"./runs/clevr/slot_stage1/256_slot16_d64_resnet18s_crossattn"}
 mkdir -p "${OUTPUT_DIR}"
 
 accelerate launch \
@@ -60,7 +60,7 @@ accelerate launch \
     \
     `# ── slot encoder hyperparams (match SlotDiffusion CLEVRTex) ── ` \
     --num_slots 16 \
-    --slot_dim 192 \
+    --slot_dim 64 \
     --slot_iters 3 \
     --slot_mlp_size 384 \
     --slot_enc_backbone resnet18_strided \

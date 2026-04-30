@@ -34,7 +34,8 @@ if _HERE not in sys.path:
 import main_multires as mm
 from slot_encoder import (SlotAttentionEncoder,
                            visualize_slot_segmentation,
-                           visualize_dit_cross_attention)
+                           visualize_dit_cross_attention,
+                           visualize_slot_unified)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -156,42 +157,73 @@ def _generate_samples_with_slot_viz(model, val_dataset, scheduler, args,
     if every <= 0 or step % every != 0:
         return out
 
+    eval_model = (ema_model if ema_model is not None
+                  else accelerator.unwrap_model(model))
+    device = accelerator.device
+
+    # Pick a deterministic small subset of val images (re-used across
+    # all three viz calls)
+    n = min(getattr(args, "slot_viz_n_samples", 8), len(val_dataset))
+    rng = torch.Generator().manual_seed(args.seed + 12345)
+    idx = torch.randperm(len(val_dataset), generator=rng)[:n].tolist()
+    images = torch.stack([val_dataset[i][0] for i in idx]).to(device)
+
+    enc = eval_model.encoder
+    enc = enc.module if hasattr(enc, "module") else enc
+
+    # ── (A) Encoder slot segmentation + per-slot encoder masks ──
+    #   <output_dir>/slot_viz/step_*.png             — orig | seg | overlay
+    #   <output_dir>/slot_viz/step_*.slot_masks.png  — per-slot heatmaps
     try:
-        eval_model = (ema_model if ema_model is not None
-                      else accelerator.unwrap_model(model))
-        encoder = eval_model.encoder
-        device = accelerator.device
-
-        # Pick a deterministic small subset of val images
-        n = min(getattr(args, "slot_viz_n_samples", 8), len(val_dataset))
-        rng = torch.Generator().manual_seed(args.seed + 12345)
-        idx = torch.randperm(len(val_dataset), generator=rng)[:n].tolist()
-        images = torch.stack([val_dataset[i][0] for i in idx]).to(device)
-
-        save_dir = os.path.join(args.output_dir, "slot_viz")
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"step_{step:07d}.png")
-
-        # Encoder may be wrapped in DDP; pull underlying module
-        enc = encoder.module if hasattr(encoder, "module") else encoder
-        visualize_slot_segmentation(enc, images, save_path)
-        accelerator.print(f"[slot-viz] saved → {save_path}")
+        sv_dir = os.path.join(args.output_dir, "slot_viz")
+        os.makedirs(sv_dir, exist_ok=True)
+        sv_path = os.path.join(sv_dir, f"step_{step:07d}.png")
+        visualize_slot_segmentation(enc, images, sv_path)
+        accelerator.print(f"[slot-viz] saved → {sv_path}")
     except Exception as exc:
         accelerator.print(f"[slot-viz] skipped: {exc}")
 
-    # ── DiT cross-attention viz: per-slot influence on image generation ──
+    # ── (B) DiT cross-attn (argmax seg + per-slot heatmaps) ──
+    #   <output_dir>/dit_attn/step_*.tNNN.png
+    #   <output_dir>/dit_attn/step_*.tNNN.slot_heat.png
     try:
-        dit_save_dir = os.path.join(args.output_dir, "dit_attn")
-        os.makedirs(dit_save_dir, exist_ok=True)
-        dit_save_path = os.path.join(dit_save_dir, f"step_{step:07d}.png")
+        da_dir = os.path.join(args.output_dir, "dit_attn")
+        os.makedirs(da_dir, exist_ok=True)
+        da_path = os.path.join(da_dir, f"step_{step:07d}.png")
         visualize_dit_cross_attention(
-            eval_model, images, dit_save_path,
+            eval_model, images, da_path,
             t_value=getattr(args, "dit_attn_viz_t", 0.5),
             average_last_n_blocks=getattr(args, "dit_attn_viz_blocks", 4),
         )
-        accelerator.print(f"[dit-attn-viz] saved → {dit_save_path}")
+        accelerator.print(f"[dit-attn-viz] saved → {da_path}")
     except Exception as exc:
         accelerator.print(f"[dit-attn-viz] skipped: {exc}")
+
+    # ── (C) Unified per-sample grid (orig | enc seg | dit seg | recon) ──
+    #   <output_dir>/slot_unified/step_*.tNNN.png
+    try:
+        su_dir = os.path.join(args.output_dir, "slot_unified")
+        os.makedirs(su_dir, exist_ok=True)
+
+        t_attn = getattr(args, "dit_attn_viz_t", 0.5)
+        if isinstance(t_attn, (list, tuple)):
+            t_list = [float(x) for x in t_attn]
+        else:
+            t_list = [float(t_attn)]
+
+        for t_val in t_list:
+            tag = f"t{int(round(t_val * 100)):03d}"
+            su_path = os.path.join(su_dir, f"step_{step:07d}.{tag}.png")
+            visualize_slot_unified(
+                eval_model, images, su_path,
+                num_sampling_steps=getattr(args, "eval_num_steps", 50),
+                dit_attn_t=t_val,
+                average_last_n_blocks=getattr(args, "dit_attn_viz_blocks", 4),
+                flow_t_eps=getattr(args, "flow_t_eps", 0.05),
+            )
+            accelerator.print(f"[slot-unified] saved → {su_path}")
+    except Exception as exc:
+        accelerator.print(f"[slot-unified] skipped: {exc}")
 
     return out
 

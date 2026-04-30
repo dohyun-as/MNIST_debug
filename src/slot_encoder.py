@@ -915,3 +915,140 @@ def visualize_dit_cross_attention(
         if heat_path == out_main:
             heat_path = out_main + ".slot_heat.png"
         save_image(make_grid(flat, nrow=K, padding=2), heat_path)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Unified per-sample visualization
+#    [original | encoder slot seg | DiT cross-attn seg | reconstruction]
+# ──────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def visualize_slot_unified(
+    model,
+    images: Tensor,
+    save_path: str,
+    num_sampling_steps: int = 50,
+    dit_attn_t: float = 0.5,
+    average_last_n_blocks: int = 4,
+    flow_t_eps: float = 0.05,
+):
+    """Unified per-sample diagnostic visualization.
+
+    For each input image, produces one row with 4 panels of equal size:
+        [original | encoder slot seg | DiT cross-attn seg | reconstruction]
+
+    - encoder slot seg:    argmax over the encoder's last-iter slot
+                           attention (B, N_enc, K) — "which slot bound to
+                           each input pixel".
+    - DiT cross-attn seg:  argmax over the DiT's image→slot cross-attn at
+                           t=dit_attn_t, averaged over the last
+                           ``average_last_n_blocks`` blocks — "which slot
+                           does each generated patch read from".
+    - reconstruction:      full Euler flow-matching sample conditioned on
+                           the input's slots (CFG=1).
+
+    Same palette is used for both seg maps so colours are directly
+    comparable between encoder binding and DiT usage.
+
+    Args:
+        model:    Baseline1DConditionalDiT with `model.encoder` swapped to
+                  SlotAttentionEncoder. Must be flow-matching trained.
+        images:   (B, 3, H, W) val images in [-1, 1].
+        save_path: PNG path. Parent dir is created.
+        num_sampling_steps: Euler steps for reconstruction (50 default).
+        dit_attn_t: flow time at which to capture cross-attn (0.5 default).
+        average_last_n_blocks: average cross-attn over this many trailing
+                               DiT blocks (4 default).
+        flow_t_eps: epsilon for (1-t) clamp in velocity formula.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    images = images.to(device=device, dtype=dtype)
+    B, _, H_img, W_img = images.shape
+
+    K = int(model.num_slots)
+    grid = int(model.grid_size)
+    num_img = grid * grid
+    palette = _color_palette(K)
+    img_01 = (images.cpu().float() * 0.5 + 0.5).clamp(0, 1)
+
+    # ── 1) Encoder slot attention ──
+    encoder = (model.encoder.module if hasattr(model.encoder, "module")
+               else model.encoder)
+    _, enc_attn = encoder(images, return_attn=True)        # (B, N_enc, K)
+    H_feat, W_feat = encoder.feat_resolution
+    enc_seg = enc_attn.argmax(dim=-1).view(B, H_feat, W_feat)
+    enc_seg_up = F.interpolate(
+        enc_seg.float().unsqueeze(1),
+        size=(H_img, W_img), mode="nearest",
+    ).squeeze(1).long().cpu()
+    enc_seg_rgb = palette[enc_seg_up].permute(0, 3, 1, 2).contiguous()
+
+    # ── 2) DiT cross-attn at t=dit_attn_t ──
+    attn_mode = getattr(model, "dit_attn_mode", "self_concat")
+    n_dit_blocks = len(model.blocks)
+    in_context_start = int(getattr(model, "in_context_start", 0))
+    K_ic = int(getattr(model, "in_context_len", 0))
+
+    t = torch.full((B,), float(dit_attn_t), device=device)
+    e = torch.randn_like(images)
+    noisy = t.view(-1, 1, 1, 1) * images + (1 - t.view(-1, 1, 1, 1)) * e
+
+    with _CaptureSDPA() as cap:
+        _ = model(noisy, t, cond_image=images)
+
+    per_block = 2 if attn_mode == "cross" else 1
+    n_dit_caps = n_dit_blocks * per_block
+    if len(cap.attn_list) < n_dit_caps:
+        raise RuntimeError(
+            f"[slot-unified] expected ≥{n_dit_caps} attn captures, "
+            f"got {len(cap.attn_list)}.")
+    dit_caps = cap.attn_list[-n_dit_caps:]
+
+    n_avg = max(1, min(average_last_n_blocks, n_dit_blocks))
+    block_indices = list(range(n_dit_blocks - n_avg, n_dit_blocks))
+    accum = torch.zeros(B, num_img, K, device=device)
+    for bi in block_indices:
+        if attn_mode == "cross":
+            attn = dit_caps[bi * 2 + 1]                     # (B, H, num_img, K)
+            sub = attn
+        else:
+            attn = dit_caps[bi]
+            if bi < in_context_start:
+                slot_range = slice(0, K)
+                img_range = slice(K, K + num_img)
+            else:
+                slot_range = slice(0, K)
+                img_range = slice(K + K_ic, K + K_ic + num_img)
+            sub = attn[:, :, img_range, slot_range]
+        accum = accum + sub.mean(dim=1)
+    accum = accum / float(n_avg)
+    dit_seg = accum.argmax(dim=-1).view(B, grid, grid)
+    dit_seg_up = F.interpolate(
+        dit_seg.float().unsqueeze(1),
+        size=(H_img, W_img), mode="nearest",
+    ).squeeze(1).long().cpu()
+    dit_seg_rgb = palette[dit_seg_up].permute(0, 3, 1, 2).contiguous()
+
+    # ── 3) Reconstruction (Euler flow-matching, no CFG) ──
+    z = torch.randn(B, model._in_channels, model.latent_size,
+                    model.latent_size, device=device, dtype=dtype)
+    timesteps = torch.linspace(0.0, 1.0, num_sampling_steps + 1,
+                               device=device)
+    for i in range(num_sampling_steps):
+        t_cur = timesteps[i]
+        t_next = timesteps[i + 1]
+        dt = t_next - t_cur
+        t_batch = t_cur.expand(B)
+        t_expand = t_cur.view(1, 1, 1, 1)
+        x_pred = model(z, t_batch, cond_image=images)
+        v = (x_pred - z) / (1.0 - t_expand).clamp_min(flow_t_eps)
+        z = z + dt * v
+    recon_01 = (z.cpu().float() * 0.5 + 0.5).clamp(0, 1)
+
+    # ── 4) Compose: 4 panels per sample, one row per sample ──
+    row = torch.cat([img_01, enc_seg_rgb, dit_seg_rgb, recon_01], dim=-1)
+    # row: (B, 3, H, 4*W)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    save_image(make_grid(row, nrow=1, padding=2), save_path)

@@ -74,6 +74,9 @@ def parse_args():
     # --- paths ---
     p.add_argument("--output_dir", type=str, default="runs/text_cond_clevr")
     p.add_argument("--resume_dir", type=str, default=None)
+    p.add_argument("--eval_only", action="store_true",
+                   help="Resume from ckpt (--resume_dir or output_dir's latest), "
+                        "run evaluate_clevr once with --clevr_eval_samples, exit.")
     p.add_argument("--clevr_image_root", type=str, required=True)
     p.add_argument("--clevr_condition_dir", type=str, required=True)
     p.add_argument("--clevr_train_splits", type=str, nargs="+",
@@ -408,13 +411,20 @@ def load_checkpoint(accelerator, model, optimizer, args, ema=None):
     resume_dir = args.resume_dir or args.output_dir
     if not os.path.isdir(resume_dir):
         return 0
-    ckpt_dirs = sorted([
-        d for d in os.listdir(resume_dir)
-        if d.startswith("step") and os.path.isdir(os.path.join(resume_dir, d))
-    ])
-    if not ckpt_dirs:
-        return 0
-    latest = os.path.join(resume_dir, ckpt_dirs[-1])
+    # If resume_dir is itself a step* subdir (eval-only on a specific ckpt),
+    # use it directly; otherwise pick the latest step subdir under it.
+    bn = os.path.basename(resume_dir.rstrip("/"))
+    if bn.startswith("step") and os.path.isfile(
+            os.path.join(resume_dir, "model.pt")):
+        latest = resume_dir
+    else:
+        ckpt_dirs = sorted([
+            d for d in os.listdir(resume_dir)
+            if d.startswith("step") and os.path.isdir(os.path.join(resume_dir, d))
+        ])
+        if not ckpt_dirs:
+            return 0
+        latest = os.path.join(resume_dir, ckpt_dirs[-1])
     model_path = os.path.join(latest, "model.pt")
     if not os.path.isfile(model_path):
         return 0
@@ -424,10 +434,18 @@ def load_checkpoint(accelerator, model, optimizer, args, ema=None):
     sd = torch.load(model_path, map_location="cpu", weights_only=True)
     unwrapped.load_state_dict(sd, strict=True)
 
+    # In eval-only mode the optimizer is irrelevant and its saved state may
+    # have a different number of parameter groups than the freshly-built
+    # one (e.g. trained with --unfreeze_text_encoder, evaluated frozen).
+    # Skipping the optimizer load avoids that crash.
+    skip_optim = bool(getattr(args, "eval_only", False))
     opt_path = os.path.join(latest, "optimizer.pt")
-    if os.path.isfile(opt_path):
-        optimizer.load_state_dict(
-            torch.load(opt_path, map_location="cpu", weights_only=True))
+    if not skip_optim and os.path.isfile(opt_path):
+        try:
+            optimizer.load_state_dict(
+                torch.load(opt_path, map_location="cpu", weights_only=True))
+        except (ValueError, RuntimeError) as e:
+            accelerator.print(f"[resume] optimizer load skipped: {e}")
 
     meta_path = os.path.join(latest, "meta.pt")
     step = 0
@@ -706,6 +724,31 @@ def evaluate_clevr(model, val_dataset, args, accelerator, step,
         grid = make_grid(combined, nrow=min(8, n_total), padding=2)
         save_image(grid, os.path.join(save_dir, f"clevr_eval_step{step:07d}.png"))
 
+        # Save meta JSON so post-hoc annotation knows which condition each
+        # cell in the grid belongs to (mirrors what train_discrete_diffusion_v2
+        # writes alongside its grid).
+        meta_conditions = []
+        for i in selected_indices:
+            raw_cond = val_dataset.get_condition(i)
+            img_fn = os.path.basename(val_dataset.samples[i][0])
+            if isinstance(raw_cond, str):
+                meta_conditions.append({
+                    "text": raw_cond, "image_filename": img_fn,
+                    "split": _get_split_from_path(val_dataset.samples[i][0])})
+            elif isinstance(raw_cond, dict):
+                m = dict(raw_cond)
+                m.setdefault("image_filename", img_fn)
+                m.setdefault("split", _get_split_from_path(val_dataset.samples[i][0]))
+                meta_conditions.append(m)
+            else:
+                meta_conditions.append({"text": str(raw_cond),
+                                         "image_filename": img_fn})
+        meta_path = os.path.join(save_dir, f"clevr_eval_step{step:07d}_meta.json")
+        with open(meta_path, "w") as fmeta:
+            json.dump({"step": step, "n_samples": n_total,
+                       "splits": sample_splits,
+                       "conditions": meta_conditions}, fmeta, indent=2)
+
         # Condition eval with per-split breakdown
         if clevr_detector is not None and clevr_classifier is not None:
             try:
@@ -822,8 +865,12 @@ def train(args):
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "args.json"), "w") as f:
-            json.dump(vars(args), f, indent=2)
+        # In eval-only mode we must NOT clobber the original training
+        # args.json — sweepers re-run this script with overrides and we want
+        # the canonical config to stay readable.
+        if not getattr(args, "eval_only", False):
+            with open(os.path.join(args.output_dir, "args.json"), "w") as f:
+                json.dump(vars(args), f, indent=2)
     accelerator.init_trackers("text_cond_clevr")
 
     # ── Dataset ──
@@ -939,6 +986,29 @@ def train(args):
 
     # ── Resume ──
     global_step = load_checkpoint(accelerator, model, optimizer, args, ema=ema)
+
+    # ── Eval-only short-circuit ──
+    # `--eval_only` runs evaluate_clevr once on the loaded ckpt (use with
+    # `--resume_dir <step_dir>`) and exits. Useful for sweeping every saved
+    # ckpt with a fixed `--clevr_eval_samples`.
+    if getattr(args, "eval_only", False):
+        accelerator.print(f"[eval_only] step={global_step} "
+                          f"clevr_eval_samples={args.clevr_eval_samples}")
+        ema_for_eval = (ema if (ema is not None and args.ema_decay > 0)
+                        else None)
+        # Bring EMA shadow weights into a model copy if available
+        ema_eval_model = None
+        if ema_for_eval is not None:
+            from copy import deepcopy
+            ema_eval_model = deepcopy(accelerator.unwrap_model(model))
+            ema.copy_to(ema_eval_model)
+        evaluate_clevr(model, val_ds, args, accelerator, global_step,
+                       ema_model=ema_eval_model,
+                       num_samples=args.clevr_eval_samples,
+                       clevr_detector=clevr_detector,
+                       clevr_classifier=clevr_classifier)
+        accelerator.print("[eval_only] done")
+        return
 
     # ── Train loop ──
     accelerator.print(f"Starting training from step {global_step}")

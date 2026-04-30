@@ -26,8 +26,29 @@ if _CLEVR_EVAL_DIR not in sys.path:
     sys.path.insert(0, _CLEVR_EVAL_DIR)
 
 import config as clevr_cfg
-from models.detector import CenterDetector
-from models.classifier import AttributeClassifier
+
+# `models` is a package name that also exists under VAR/ and gets cached in
+# sys.modules first when this file is imported from VAR/train_clevr_text.py,
+# which shadows clevr_eval/models/. Load detector/classifier from file and
+# register them under `models.detector` / `models.classifier` in sys.modules
+# so both this file and clevr_eval/evaluate.py resolve to the right modules.
+import importlib.util as _ilu
+
+def _load_clevr_eval_module(dotted_name, file_path):
+    spec = _ilu.spec_from_file_location(dotted_name, file_path)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[dotted_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_detector_mod = _load_clevr_eval_module(
+    "models.detector",
+    os.path.join(_CLEVR_EVAL_DIR, "models", "detector.py"))
+_classifier_mod = _load_clevr_eval_module(
+    "models.classifier",
+    os.path.join(_CLEVR_EVAL_DIR, "models", "classifier.py"))
+CenterDetector = _detector_mod.CenterDetector
+AttributeClassifier = _classifier_mod.AttributeClassifier
 from evaluate import extract_peaks
 
 # ── Attribute vocab ──────────────────────────────────────────────────────

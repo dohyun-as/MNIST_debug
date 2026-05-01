@@ -329,10 +329,18 @@ def parse_args():
     p.add_argument("--guidance_scale", type=float, default=1.5)
     p.add_argument("--fid_num_samples", type=int, default=50000)
     p.add_argument("--eval_only", action="store_true")
+    p.add_argument("--eval_clevr_only", action="store_true",
+                   help="Run only the CLEVR detection+attribute eval (no FID, no training)")
     p.add_argument("--clevr_eval_every", type=int, default=0,
                    help="Run CLEVR detection+attribute eval every N steps (0=disabled)")
     p.add_argument("--clevr_eval_samples", type=int, default=30,
                    help="Number of val samples for CLEVR eval")
+    p.add_argument("--clevr_eval_n_annotated_random", type=int, default=8,
+                   help="Number of random samples to render with bboxes per CLEVR eval (0=off)")
+    p.add_argument("--clevr_eval_n_annotated_worst", type=int, default=4,
+                   help="Number of worst-scoring samples to render with bboxes per CLEVR eval (0=off)")
+    p.add_argument("--clevr_eval_annot_thresh", type=int, default=10,
+                   help="Distance threshold (px) used for matched/missed bbox coloring")
     p.add_argument("--num_workers", type=int, default=8)
 
     args = p.parse_args()
@@ -1093,8 +1101,14 @@ def generate_samples(model, val_dataset, scheduler, args, accelerator, step,
             slot_configs.append(total_slots)
     else:
         # Level configs: [all, N-1, ..., 1]
+        # Render per-level variants whenever the model was trained to be robust
+        # to missing levels — either via nested level drop OR via per-token
+        # random drop applied to all levels.
         num_levels = unwrapped.num_levels
-        if args.level_drop:
+        eval_per_level = args.level_drop or (
+            args.cond_token_drop_prob > 0 and args.cond_token_drop_all_levels
+        )
+        if eval_per_level:
             level_configs = list(range(num_levels, 0, -1))
         else:
             level_configs = [num_levels]
@@ -1300,6 +1314,94 @@ def evaluate_fid(model, val_dataset, scheduler, args, accelerator, step,
 #  CLEVR detection + attribute evaluation
 # ──────────────────────────────────────────────────────────────────
 
+def _clevr_load_font(size, bold=False):
+    from PIL import ImageFont
+    cands = []
+    if bold:
+        cands.append("/opt/conda/lib/python3.11/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf")
+    cands.append("/opt/conda/lib/python3.11/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans.ttf")
+    for p in cands:
+        if os.path.isfile(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _draw_clevr_bbox(draw, canvas_size, cx, cy, color, label, font, box_size=48):
+    """Draw a single bbox + colored label header."""
+    W, H = canvas_size
+    half = box_size // 2
+    x1 = max(int(cx) - half, 0)
+    y1 = max(int(cy) - half, 0)
+    x2 = min(int(cx) + half, W - 1)
+    y2 = min(int(cy) + half, H - 1)
+    draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+    if label:
+        tw = int(draw.textlength(label, font=font))
+        th = 12
+        ty = max(y1 - th - 1, 0)
+        tx = max(min(x1, W - tw - 4), 0)
+        draw.rectangle([tx, ty, tx + tw + 4, ty + th], fill=color)
+        draw.text((tx + 2, ty - 1), label, fill="white", font=font)
+
+
+def _annotate_clevr_pair(gt_pil, recon_pil, gt_centers, gt_attrs,
+                         peaks, peak_attr_idx, matched_pred, matched_gt,
+                         attr_names, clevr_cfg):
+    """Draw bboxes on (GT, GEN) PIL images.
+
+    GT side  : green = matched by detector, orange = missed
+    GEN side : green = matched + all attrs correct,
+               yellow = matched but >=1 attr wrong,
+               red    = no GT match (extra/spurious)
+    """
+    from PIL import ImageDraw
+
+    font = _clevr_load_font(10, bold=True)
+    matched_pred_set = set(int(p) for p in matched_pred)
+    matched_gt_set = set(int(g) for g in matched_gt)
+    pred_to_gt = {int(p): int(g) for p, g in zip(matched_pred, matched_gt)}
+
+    def _idx_label(attrs):
+        if isinstance(attrs, dict):
+            c = clevr_cfg.COLORS[attrs["color"]]
+            sh = clevr_cfg.SHAPES[attrs["shape"]]
+            sz = clevr_cfg.SIZES[attrs["size"]]
+            ma = clevr_cfg.MATERIALS[attrs["material"]]
+        else:
+            c = clevr_cfg.COLORS[attrs[0]]
+            sh = clevr_cfg.SHAPES[attrs[1]]
+            sz = clevr_cfg.SIZES[attrs[2]]
+            ma = clevr_cfg.MATERIALS[attrs[3]]
+        return f"{sz[:2]} {c[:2]} {ma[:2]} {sh[:2]}"
+
+    # GT side
+    gt_anno = gt_pil.copy()
+    d_gt = ImageDraw.Draw(gt_anno)
+    for gi, (gx, gy) in enumerate(gt_centers):
+        color = (16, 200, 64) if gi in matched_gt_set else (255, 140, 0)
+        _draw_clevr_bbox(d_gt, gt_anno.size, gx, gy, color,
+                         _idx_label(gt_attrs[gi]), font)
+
+    # GEN side
+    gen_anno = recon_pil.copy()
+    d_gen = ImageDraw.Draw(gen_anno)
+    for pi, (px, py) in enumerate(peaks):
+        if pi in matched_pred_set:
+            gi = pred_to_gt[pi]
+            ok = all(peak_attr_idx[pi][a] == gt_attrs[gi][ai]
+                     for ai, a in enumerate(attr_names))
+            color = (16, 200, 64) if ok else (240, 200, 0)
+        else:
+            color = (235, 50, 50)
+        _draw_clevr_bbox(d_gen, gen_anno.size, px, py, color,
+                         _idx_label(peak_attr_idx[pi]), font)
+
+    return gt_anno, gen_anno
+
+
 @torch.no_grad()
 def evaluate_clevr(model, val_dataset, args, accelerator, step,
                    vae=None, ema_model=None, num_samples=30):
@@ -1397,6 +1499,12 @@ def evaluate_clevr(model, val_dataset, args, accelerator, step,
             "total_gt": 0,
         }
 
+    # Per-sample annotation bookkeeping (only when at least one of N_random/N_worst > 0)
+    n_annot_rand = max(int(getattr(args, "clevr_eval_n_annotated_random", 0)), 0)
+    n_annot_worst = max(int(getattr(args, "clevr_eval_n_annotated_worst", 0)), 0)
+    save_annotated = (n_annot_rand + n_annot_worst) > 0
+    annot_records = []
+
     for idx in indices:
         img_path, class_idx = val_dataset.samples[idx]
 
@@ -1461,6 +1569,24 @@ def evaluate_clevr(model, val_dataset, args, accelerator, step,
         pred_heatmap = detector(det_input).cpu().numpy()[0, 0]
         peaks = extract_peaks(pred_heatmap, threshold=0.3)
 
+        # Pre-classify ALL peaks once (for annotation labels & per-sample score).
+        # Used only when save_annotated=True; cheap (one extra classifier call).
+        # NOTE: extract_peaks returns (x, y, score) tuples — unpack first 2 only.
+        peak_attr_idx = []
+        if save_annotated and len(peaks) > 0:
+            crops_all = []
+            half = clevr_cfg.CROP_SIZE // 2
+            for peak in peaks:
+                px, py = int(peak[0]), int(peak[1])
+                x1, y1 = max(px - half, 0), max(py - half, 0)
+                x2, y2 = min(px + half, w), min(py + half, h)
+                crops_all.append(crop_transform(recon_pil.crop((x1, y1, x2, y2))))
+            preds_all = classifier(torch.stack(crops_all).to(device))
+            for k in range(len(peaks)):
+                peak_attr_idx.append({
+                    a: int(preds_all[a][k].argmax().item()) for a in attr_names
+                })
+
         for t, s in stats.items():
             s["total_gt"] += n_gt
             s["total_pred"] += len(peaks)
@@ -1492,6 +1618,39 @@ def evaluate_clevr(model, val_dataset, args, accelerator, step,
                         all_ok = False
                 if all_ok:
                     s["correct_all"] += 1
+
+        # Record per-sample annotation data using the canonical threshold.
+        # Score = F1 over (correct = matched + all 4 attrs right):
+        #   2 * n_correct / (n_pred + n_gt)
+        if save_annotated:
+            ct = int(args.clevr_eval_annot_thresh)
+            mp_a, mg_a, _ = match_detections(peaks, gt_centers, ct) \
+                if len(peaks) > 0 and n_gt > 0 else ([], [], [])
+            n_correct_a = 0
+            for k_, (pi_, gi_) in enumerate(zip(mp_a, mg_a)):
+                if all(peak_attr_idx[pi_][a] == gt_attrs[gi_][ai]
+                       for ai, a in enumerate(attr_names)):
+                    n_correct_a += 1
+            score = (2.0 * n_correct_a) / max(len(peaks) + n_gt, 1)
+
+            gt_01 = (cond_img[0] * 0.5 + 0.5).clamp(0, 1)
+            gt_pil_anno = transforms.ToPILImage()(gt_01.cpu())
+            annot_records.append({
+                "idx": int(idx),
+                "score": float(score),
+                "n_gt": int(n_gt),
+                "n_pred": int(len(peaks)),
+                "n_correct": int(n_correct_a),
+                "gt_pil": gt_pil_anno,
+                "recon_pil": recon_pil,
+                "gt_centers": [list(map(int, c)) for c in gt_centers],
+                "gt_attrs": [list(map(int, a)) for a in gt_attrs],
+                "peaks": [[int(p[0]), int(p[1])] for p in peaks],
+                "peak_attr_idx": peak_attr_idx,
+                "matched_pred": list(mp_a),
+                "matched_gt": list(mg_a),
+                "img_path": img_path,
+            })
 
     # Print & log results
     results = {}
@@ -1528,6 +1687,46 @@ def evaluate_clevr(model, val_dataset, args, accelerator, step,
             "clevr/det_F1@10px": r["det_F1"],
             "clevr/all_attrs_acc@10px": r["all_attrs_acc"],
         }, step=step)
+
+    # ── Save annotated GT|GEN bbox grids (random + worst) ──
+    if save_annotated and annot_records:
+        out_dir = os.path.join(args.output_dir, "clevr_eval")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # worst = lowest F1 score; random = deterministic-but-varying per step
+        sorted_recs = sorted(annot_records, key=lambda r: r["score"])
+        worst_recs = sorted_recs[: min(n_annot_worst, len(annot_records))]
+        if n_annot_rand > 0:
+            rng2 = np.random.RandomState(args.seed + step)
+            n_rand = min(n_annot_rand, len(annot_records))
+            rand_idx = rng2.choice(len(annot_records), size=n_rand,
+                                   replace=False).tolist()
+            rand_recs = [annot_records[i] for i in rand_idx]
+        else:
+            rand_recs = []
+
+        for tag, recs in [("random", rand_recs), ("worst", worst_recs)]:
+            if not recs:
+                continue
+            tiles = []
+            for r in recs:
+                gt_a, gen_a = _annotate_clevr_pair(
+                    r["gt_pil"], r["recon_pil"],
+                    r["gt_centers"], r["gt_attrs"],
+                    r["peaks"], r["peak_attr_idx"],
+                    r["matched_pred"], r["matched_gt"],
+                    attr_names, clevr_cfg)
+                tiles.append(transforms.ToTensor()(gt_a))
+                tiles.append(transforms.ToTensor()(gen_a))
+            grid = make_grid(torch.stack(tiles), nrow=2,
+                             padding=4, pad_value=1.0)
+            grid_path = os.path.join(
+                out_dir, f"step_{step:07d}_annotated_{tag}.png")
+            save_image(grid, grid_path)
+            scores_str = ", ".join(f"{r['score']:.2f}" for r in recs)
+            accelerator.print(
+                f"[CLEVR eval] saved {tag} bbox grid: {grid_path} "
+                f"(scores=[{scores_str}])")
 
     # Cleanup: remove clevr_eval from sys.path to avoid conflicts
     if clevr_eval_dir in sys.path:
@@ -1800,6 +1999,14 @@ def train(args):
         ema_eval = ema.shadow if ema is not None else None
         evaluate_fid(model, val_ds, eval_scheduler, args, accelerator, global_step,
                      vae=get_eval_vae(), ema_model=ema_eval)
+        return
+
+    if args.eval_clevr_only:
+        accelerator.print(f"Running CLEVR eval only at step {global_step}...")
+        ema_eval = ema.shadow if ema is not None else None
+        evaluate_clevr(model, val_ds, args, accelerator, global_step,
+                       vae=get_eval_vae(), ema_model=ema_eval,
+                       num_samples=args.clevr_eval_samples)
         return
 
     # ── Train ──

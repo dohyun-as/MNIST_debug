@@ -87,3 +87,6 @@ accelerate launch \
     --mae_mask_ratio 0.0 \
     --clevr_eval_every 5000 \
     --clevr_eval_samples 50 \
+    --clevr_eval_n_annotated_random 8 \
+    --clevr_eval_n_annotated_worst 16 \
+    --clevr_eval_annot_thresh 10 \

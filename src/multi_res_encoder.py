@@ -36,7 +36,13 @@ Three encoder backends:
      - ``vit_init_clip``: CLIP ViT weights로 patch_embed / pos_emb /
        transformer 12 layers 초기화 (requires 256×256 image, patch=16,
        dim=768, depth=12, heads=12, no CNN stem).
-   MAE masking 사용 불가 (avg pool에 모든 token 필요).
+     - ``vit_global_pool_type``: 'avg' (default) or 'attn'. 'attn'은
+       level별 learnable query가 fine grid에 cross-attend하는 학습된
+       pooling — coarse level이 단순 평균이 아니라 학습된 aggregation
+       이 됨. Q/Output proj + FFN이 per-level이라 trainable capacity가
+       의미 있게 들어감. ``vit_global_pool_mlp_ratio`` (FFN expansion,
+       default 4) / ``vit_global_pool_use_ffn`` (default True)로 조절.
+   MAE masking 사용 불가 (pool에 모든 token 필요).
 
 Configurable parameters:
   - image_size: 원본 이미지 크기 (e.g. 256)
@@ -327,9 +333,10 @@ class CellViT(nn.Module):
         # Registered per level via build_scale_emb(), broadcast-added to all tokens.
         self.scale_embs = nn.ParameterDict()
 
-        # Positional embedding (max_tokens)
-        self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens, dim))
-        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+        # Per-level positional embedding (level may have different #tokens —
+        # e.g. 16×16 level uses tps=2 → 4 tokens, while other levels use
+        # tps=8 → 64 tokens). Built by build_pos_emb().
+        self.pos_embs = nn.ParameterDict()
 
         # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
@@ -374,11 +381,18 @@ class CellViT(nn.Module):
         self.scale_embs[key] = nn.Parameter(torch.zeros(1, 1, self.dim))
         nn.init.trunc_normal_(self.scale_embs[key], std=0.02)
 
+    def build_pos_emb(self, key: str, n_tokens: int):
+        """Build a learnable positional embedding for a hierarchy level."""
+        pe = nn.Parameter(torch.zeros(1, n_tokens, self.dim))
+        nn.init.trunc_normal_(pe, std=0.02)
+        self.pos_embs[key] = pe
+
     def forward(
         self,
         cells: torch.Tensor,
         level_key: str,
         vit_patch_size: int,
+        use_stem: bool = True,
         mae_mask_ratio: float = 0.0,
     ) -> torch.Tensor:
         """Encode a batch of grid cells → feature vectors.
@@ -389,6 +403,8 @@ class CellViT(nn.Module):
             level_key: str key for the patch projection.
             vit_patch_size: effective ViT patch size for this level
                 (after CNN stem if used).
+            use_stem: whether to apply the CNN stem for this level.
+                Small cells (e.g. 16×16 finest level) usually skip the stem.
             mae_mask_ratio: fraction of tokens to mask (training only).
 
         Returns:
@@ -396,8 +412,8 @@ class CellViT(nn.Module):
         """
         N, C, H, W = cells.shape
 
-        # Optional CNN stem
-        if self.cnn_stem is not None:
+        # Optional CNN stem (per-level toggle)
+        if use_stem and self.cnn_stem is not None:
             cells = self.cnn_stem(cells)  # (N, stem_ch, H', W')
             _, C, H, W = cells.shape
 
@@ -417,8 +433,11 @@ class CellViT(nn.Module):
         # Linear projection
         tokens = self.patch_projs[level_key](tokens)  # (N, n_tokens, dim)
 
-        # Positional embedding
-        tokens = tokens + self.pos_emb[:, :n_tokens, :]
+        # Per-level positional embedding (length matches this level's n_tokens)
+        assert self.pos_embs[level_key].shape[1] == n_tokens, \
+            f"pos_emb[{level_key}] has {self.pos_embs[level_key].shape[1]} tokens, " \
+            f"but cell yielded {n_tokens}"
+        tokens = tokens + self.pos_embs[level_key]
 
         # Scale embedding: broadcast to all tokens in this level
         if level_key in self.scale_embs:
@@ -582,6 +601,121 @@ class SwinPatchMerge(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Attention pool for vit_global learned downsampling
+# ──────────────────────────────────────────────────────────────────
+
+class AttnPool(nn.Module):
+    """Per-level cross-attention pool for `vit_global` learned downsampling.
+
+    Replaces the fixed ``avg_pool + grid_pos_emb`` path. For each spatial
+    level ``s``, ``s*s`` learnable query tokens cross-attend to the fine-grid
+    global ViT features and produce an ``(s, s)`` feature map. The
+    learnable queries also act as the level's 2D positional embedding
+    (so ``grid_pos_embs`` is *not* used when this pool is active).
+
+    K/V projection is **shared across levels** (computed once on the global
+    feature map). Q-projection, output projection and FFN are **per-level**
+    — this is where the level-specific trainable capacity lives.
+
+    Per-level capacity (enc_d=D, mlp_ratio=r, level=s):
+      * queries          : s² · D
+      * Wq + Wo + LN_q   : 2·D² + 2·D
+      * FFN (2-layer)    : 2·D · (r·D) + (r·D) + D
+    Shared capacity:
+      * LN_kv + Wkv      : D² + 2·D ·  (after concat Wk+Wv it's 2·D²)
+
+    Example (D=256, levels=[8,4,2,1], r=4):
+      * shared    ≈ 132K
+      * per-level ≈ 132K (attn) + 525K (FFN) = 657K
+      * total     ≈ 132K + 4 × 657K + ~22K queries ≈ 2.78M
+    """
+
+    def __init__(
+        self,
+        level_sizes: list[int],
+        enc_d: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        use_ffn: bool = True,
+    ):
+        super().__init__()
+        assert enc_d % num_heads == 0, \
+            f"enc_d({enc_d}) must be divisible by num_heads({num_heads})"
+        self.enc_d = enc_d
+        self.num_heads = num_heads
+        self.head_dim = enc_d // num_heads
+        self.use_ffn = use_ffn
+
+        # ── Shared K, V projection (computed once on the global features) ──
+        self.kv_norm = nn.LayerNorm(enc_d)
+        self.kv_proj = nn.Linear(enc_d, 2 * enc_d)
+
+        # ── Per-level: learnable queries (= 2D pos emb), Q/O projections,
+        #    optional FFN with pre-LN.
+        self.queries = nn.ParameterDict()
+        self.q_norms = nn.ModuleDict()
+        self.q_projs = nn.ModuleDict()
+        self.out_projs = nn.ModuleDict()
+        if use_ffn:
+            self.ffn_norms = nn.ModuleDict()
+            self.ffns = nn.ModuleDict()
+
+        hidden = int(enc_d * mlp_ratio)
+        for s in level_sizes:
+            key = str(s)
+            q = nn.Parameter(torch.zeros(1, s * s, enc_d))
+            nn.init.trunc_normal_(q, std=0.02)
+            self.queries[key] = q
+            self.q_norms[key] = nn.LayerNorm(enc_d)
+            self.q_projs[key] = nn.Linear(enc_d, enc_d)
+            self.out_projs[key] = nn.Linear(enc_d, enc_d)
+            if use_ffn:
+                self.ffn_norms[key] = nn.LayerNorm(enc_d)
+                self.ffns[key] = nn.Sequential(
+                    nn.Linear(enc_d, hidden),
+                    nn.GELU(),
+                    nn.Linear(hidden, enc_d),
+                )
+
+    def forward(self, feat: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Args:
+            feat: (B, enc_d, tps, tps) — global ViT output reshaped to 2D grid.
+
+        Returns:
+            {s: (B, enc_d, s, s)} for each level in ``self.queries``.
+        """
+        B = feat.shape[0]
+        H = self.num_heads
+        Dh = self.head_dim
+
+        # Shared K, V (B, tps², enc_d) → (B, H, tps², Dh)
+        kv_in = feat.flatten(2).transpose(1, 2)
+        kv_in = self.kv_norm(kv_in)
+        kv = self.kv_proj(kv_in)                # (B, N, 2·enc_d)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(B, -1, H, Dh).transpose(1, 2)
+        v = v.view(B, -1, H, Dh).transpose(1, 2)
+
+        out = {}
+        for key, q_param in self.queries.items():
+            s = int(key)
+            q_emb = q_param.expand(B, -1, -1)             # (B, s², enc_d)
+            q = self.q_projs[key](self.q_norms[key](q_emb))
+            q = q.view(B, s * s, H, Dh).transpose(1, 2)    # (B, H, s², Dh)
+
+            attn = F.scaled_dot_product_attention(q, k, v) # (B, H, s², Dh)
+            attn = attn.transpose(1, 2).contiguous().view(B, s * s, self.enc_d)
+            attn = self.out_projs[key](attn)
+
+            y = q_emb + attn                                # residual
+            if self.use_ffn:
+                y = y + self.ffns[key](self.ffn_norms[key](y))
+
+            out[s] = y.transpose(1, 2).view(B, self.enc_d, s, s)
+        return out
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Hierarchical Multi-Resolution Encoder
 # ──────────────────────────────────────────────────────────────────
 
@@ -652,6 +786,8 @@ class HierarchicalMultiResEncoder(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_use_cnn_stem: bool = True,
         vit_cnn_stem_reduction: int = 4,
+        vit_small_cell_tps: int = 2,
+        vit_default_tps: int | None = None,
         # ── Internal dim (encoder runs at this, projects to dim at output) ──
         encoder_internal_dim: int | None = None,
         # ── Swin-specific ──
@@ -666,6 +802,10 @@ class HierarchicalMultiResEncoder(nn.Module):
         # ── CLIP initialization for vit_global (optional) ──
         vit_init_clip: bool = False,
         clip_model_name: str = "openai/clip-vit-base-patch16",
+        # ── vit_global pooling backend ──
+        vit_global_pool_type: str = 'avg',
+        vit_global_pool_mlp_ratio: float = 4.0,
+        vit_global_pool_use_ffn: bool = True,
     ):
         super().__init__()
 
@@ -714,7 +854,8 @@ class HierarchicalMultiResEncoder(nn.Module):
             self._init_vit(in_channels, dim, image_size, min_patch_size,
                            vit_patch_size, vit_depth, vit_num_heads,
                            vit_mlp_ratio, vit_use_cnn_stem,
-                           vit_cnn_stem_reduction)
+                           vit_cnn_stem_reduction, vit_small_cell_tps,
+                           vit_default_tps)
         elif encoder_type == 'swin':
             self._init_swin(in_channels, dim, image_size,
                             swin_patch_size, swin_embed_dim,
@@ -724,11 +865,18 @@ class HierarchicalMultiResEncoder(nn.Module):
         elif encoder_type == 'vit_global':
             assert mae_mask_ratio == 0.0, \
                 "vit_global does not support MAE masking (all spatial tokens " \
-                "are needed for avg pooling to derive coarser levels)"
+                "are needed for pooling to derive coarser levels)"
+            assert vit_global_pool_type in ('avg', 'attn'), \
+                f"vit_global_pool_type must be 'avg' or 'attn', " \
+                f"got {vit_global_pool_type!r}"
+            self.vit_global_pool_type = vit_global_pool_type
             self._init_vit_global(in_channels, dim, image_size,
                                   vit_patch_size, vit_depth, vit_num_heads,
                                   vit_mlp_ratio, vit_use_cnn_stem,
-                                  vit_cnn_stem_reduction)
+                                  vit_cnn_stem_reduction,
+                                  pool_type=vit_global_pool_type,
+                                  pool_mlp_ratio=vit_global_pool_mlp_ratio,
+                                  pool_use_ffn=vit_global_pool_use_ffn)
             if vit_init_clip:
                 self.init_from_clip(clip_model_name)
         else:
@@ -767,11 +915,36 @@ class HierarchicalMultiResEncoder(nn.Module):
 
     def _init_vit(self, in_channels, dim, image_size, min_patch_size,
                   vit_patch_size, vit_depth, vit_num_heads, vit_mlp_ratio,
-                  vit_use_cnn_stem, vit_cnn_stem_reduction):
+                  vit_use_cnn_stem, vit_cnn_stem_reduction,
+                  vit_small_cell_tps, vit_default_tps=None):
         """Initialize ViT encoder backend.
 
         All levels share a single CellViT.  Each level has its own
-        patch projection (because effective patch dims differ).
+        patch projection, positional embedding, and (optionally) stem
+        usage.  Small cells (cell_size < stem_red × tokens_per_side)
+        skip the stem and use a reduced tokens_per_side (vit_small_cell_tps).
+
+        Anchor: the default config — tokens_per_side = min_patch_size //
+        vit_patch_size, with stem enabled — applies to cells with
+        cell_size ≥ stem_red × tokens_per_side.
+
+        Example (image=256, min_patch_size=16, vit_patch=4, stem_red=4,
+        small_cell_tps=2):
+          tokens_per_side = 16/4 = 4   (default for stemmed levels)
+          anchor_cell     = 4×4 = 16
+          Level 16: cell=16, ≥ anchor → stem on, tps=4, eff_p=1, 16 tokens
+          Level  8: cell=32, ≥ anchor → stem on, tps=4, eff_p=2, 16 tokens
+          Level  4: cell=64, ≥ anchor → stem on, tps=4, eff_p=4, 16 tokens
+          ...
+
+        Example (image=256, min_patch_size=32 keep, finest=8, then add a
+        synthetic finest 16 level with cell=16):
+          tokens_per_side = 32/4 = 8   (default)
+          anchor_cell     = 4×8 = 32
+          Level 16: cell=16 < anchor → stem off, tps=2 (small_cell_tps),
+                                       eff_p=8, 4 tokens
+          Level  8: cell=32 ≥ anchor → stem on, tps=8, eff_p=1, 64 tokens
+          ...
 
         When encoder_internal_dim is set (self._enc_dim != dim), the ViT
         runs at _enc_dim internally and a per-level 1×1 conv projects to dim.
@@ -779,14 +952,27 @@ class HierarchicalMultiResEncoder(nn.Module):
         enc_d = self._enc_dim  # internal dim (may differ from output dim)
 
         finest_cell = min_patch_size  # cell size at finest level
-        tokens_per_side = finest_cell // vit_patch_size
-        assert finest_cell % vit_patch_size == 0, \
-            f"min_patch_size({min_patch_size}) must be divisible by " \
-            f"vit_patch_size({vit_patch_size})"
-        self._tokens_per_side = tokens_per_side
-        self._vit_patch_size = vit_patch_size
+        if vit_default_tps is not None and vit_default_tps > 0:
+            # Explicit override — decouples default tps from min_patch_size.
+            # Use this when adding a small finest level (e.g. min_patch_size=16
+            # for a 16×16 finest, but coarser levels should keep tps=8).
+            tokens_per_side_default = vit_default_tps
+        else:
+            assert finest_cell % vit_patch_size == 0 or \
+                finest_cell % vit_small_cell_tps == 0, \
+                f"min_patch_size({min_patch_size}) not compatible with " \
+                f"vit_patch_size({vit_patch_size}) nor small_cell_tps " \
+                f"({vit_small_cell_tps})"
+            tokens_per_side_default = max(
+                1, min_patch_size // vit_patch_size,
+            )
 
-        max_tokens = tokens_per_side * tokens_per_side
+        stem_r = vit_cnn_stem_reduction if vit_use_cnn_stem else 1
+        anchor_cell = stem_r * tokens_per_side_default
+
+        self._tokens_per_side_default = tokens_per_side_default
+        self._vit_patch_size = vit_patch_size
+        self._anchor_cell = anchor_cell
 
         self.cell_vit = CellViT(
             in_channels=in_channels,
@@ -795,29 +981,53 @@ class HierarchicalMultiResEncoder(nn.Module):
             depth=vit_depth,
             num_heads=vit_num_heads,
             mlp_ratio=vit_mlp_ratio,
-            max_tokens=max_tokens,
+            max_tokens=tokens_per_side_default * tokens_per_side_default,
             use_cnn_stem=vit_use_cnn_stem,
             cnn_stem_reduction=vit_cnn_stem_reduction,
         )
 
-        # Compute per-level effective ViT patch size (after stem) and
-        # build linear projections
-        stem_r = vit_cnn_stem_reduction if vit_use_cnn_stem else 1
         stem_ch = self.cell_vit._stem_ch if vit_use_cnn_stem else in_channels
 
-        self._level_vit_info = {}  # level_size → (eff_vit_patch, level_key)
+        # Per-level decision: (eff_p, key, tps, use_stem)
+        self._level_vit_info = {}
         for s in self.level_sizes:
             cell_size = image_size // s  # pixel size of one cell
-            eff_cell = cell_size // stem_r  # after CNN stem
-            eff_p = eff_cell // tokens_per_side  # effective patch size after stem
+
+            if vit_use_cnn_stem and cell_size >= anchor_cell \
+                    and cell_size % anchor_cell == 0:
+                # "Normal" level — stem on, default tokens_per_side
+                use_stem_here = True
+                tps_here = tokens_per_side_default
+                eff_cell = cell_size // stem_r
+                ch_here = stem_ch
+            else:
+                # "Small cell" level (or stem disabled globally) — skip stem,
+                # use small_cell_tps if cell is below anchor, else default tps
+                use_stem_here = False
+                if vit_use_cnn_stem and cell_size < anchor_cell:
+                    tps_here = min(vit_small_cell_tps, cell_size)
+                else:
+                    tps_here = tokens_per_side_default
+                # Find largest tps_here that divides cell_size (must)
+                while cell_size % tps_here != 0 and tps_here > 1:
+                    tps_here //= 2
+                eff_cell = cell_size
+                ch_here = in_channels
+
+            assert eff_cell % tps_here == 0, \
+                f"Level {s}: eff_cell({eff_cell}) not divisible by tps({tps_here})"
+            eff_p = eff_cell // tps_here
             assert eff_p >= 1, \
-                f"Level {s}: eff_cell({eff_cell}) / tokens_per_side({tokens_per_side}) < 1. " \
+                f"Level {s}: eff_p({eff_p}) < 1. " \
                 f"Reduce vit_cnn_stem_reduction or vit_patch_size."
-            patch_dim = stem_ch * eff_p * eff_p
+
+            patch_dim = ch_here * eff_p * eff_p
+            n_tokens = tps_here * tps_here
             key = str(s)
             self.cell_vit.build_projection(key, patch_dim)
             self.cell_vit.build_scale_emb(key)
-            self._level_vit_info[s] = (eff_p, key)
+            self.cell_vit.build_pos_emb(key, n_tokens)
+            self._level_vit_info[s] = (eff_p, key, tps_here, use_stem_here)
 
         # Per-level positional embedding for the grid (2D) — at internal dim
         self.grid_pos_embs = nn.ParameterDict()
@@ -947,18 +1157,28 @@ class HierarchicalMultiResEncoder(nn.Module):
     def _init_vit_global(self, in_channels, dim, image_size,
                          vit_patch_size, vit_depth, vit_num_heads,
                          vit_mlp_ratio, vit_use_cnn_stem,
-                         vit_cnn_stem_reduction):
+                         vit_cnn_stem_reduction,
+                         pool_type: str = 'avg',
+                         pool_mlp_ratio: float = 4.0,
+                         pool_use_ffn: bool = True):
         """Initialize global ViT encoder (single forward).
 
-        전체 이미지를 ViT로 **한 번만** 처리한 뒤, level마다 avg pool만
+        전체 이미지를 ViT로 **한 번만** 처리한 뒤, level마다 pooling만
         다르게 적용.  Compute = 1× ViT forward (cell-based 대비 ~5× 저렴).
+
+        Pool backends (``pool_type``):
+          * ``'avg'`` (default): fixed avg_pool + per-level 2D grid_pos_emb.
+            Almost zero per-level trainable capacity.
+          * ``'attn'``: per-level learnable queries cross-attend to the
+            global fine-grid features. Queries replace grid_pos_emb;
+            Q/O/FFN are per-level → real per-level capacity.
 
         When ``encoder_internal_dim`` is set (self._enc_dim != dim), the ViT
         runs at _enc_dim internally (e.g. 768 for CLIP) and a per-level 1×1
         conv projects to `dim` (output feat_channels) as an information
         bottleneck — matches the ``vit`` mode design.
 
-        예) image=256, no stem, vit_patch=16, enc_d=768, dim=16:
+        예) image=256, no stem, vit_patch=16, enc_d=768, dim=16, pool='avg':
           ViT forward (한 번) → (B, 768, 16, 16)
           Level 8: avg_pool(2)  → (B, 768, 8, 8) → Conv2d(768→16) → (B, 16, 8, 8)
           Level 4: avg_pool(4)  → (B, 768, 4, 4) → Conv2d(768→16) → (B, 16, 4, 4)
@@ -1015,16 +1235,33 @@ class HierarchicalMultiResEncoder(nn.Module):
             encoder_layer, num_layers=vit_depth)
         self._global_norm = nn.LayerNorm(enc_d)
 
-        # Per-level 2D grid positional embedding — at INTERNAL dim (enc_d),
-        # added BEFORE output projection. Matches the `vit` mode pattern.
-        self.grid_pos_embs = nn.ParameterDict()
-        for s in self.level_sizes:
-            self.grid_pos_embs[str(s)] = nn.Parameter(
-                torch.zeros(1, enc_d, s, s))
-            nn.init.trunc_normal_(self.grid_pos_embs[str(s)], std=0.02)
+        # Pool backend
+        self._vit_global_pool_type = pool_type
+        if pool_type == 'avg':
+            # Per-level 2D grid positional embedding — at INTERNAL dim (enc_d),
+            # added BEFORE output projection. Matches the `vit` mode pattern.
+            self.grid_pos_embs = nn.ParameterDict()
+            for s in self.level_sizes:
+                self.grid_pos_embs[str(s)] = nn.Parameter(
+                    torch.zeros(1, enc_d, s, s))
+                nn.init.trunc_normal_(self.grid_pos_embs[str(s)], std=0.02)
+            self.attn_pool = None
+        elif pool_type == 'attn':
+            # Learnable per-level queries cross-attend to the global feature map.
+            # The queries themselves provide a 2D positional signal, so
+            # grid_pos_embs is not built.
+            self.attn_pool = AttnPool(
+                level_sizes=self.level_sizes,
+                enc_d=enc_d,
+                num_heads=vit_num_heads,
+                mlp_ratio=pool_mlp_ratio,
+                use_ffn=pool_use_ffn,
+            )
+        else:
+            raise ValueError(f"Unknown pool_type: {pool_type}")
 
         # Output projection: enc_d → dim (bottleneck, per-level Conv2d 1×1).
-        # Applied AFTER grid_pos_embs — same order as `vit` mode.
+        # Applied AFTER the pool — same order as `vit` mode.
         if enc_d != dim:
             self._vit_out_projs = nn.ModuleDict()
             for s in self.level_sizes:
@@ -1079,16 +1316,24 @@ class HierarchicalMultiResEncoder(nn.Module):
         # Reshape to 2D grid
         feat = tokens.transpose(1, 2).view(B, enc_d, tps, tps)
 
-        # Per-level: avg pool → + 2D pos emb (at enc_d) → (optional) Conv2d bottleneck
-        # Order matches the `vit` mode: pos_emb at internal dim, then project.
+        # Pool to each level (avg or attn), then (optional) Conv2d bottleneck.
+        # Order matches the `vit` mode: aggregation at internal dim, then project.
         level_features = {}
-        for s in self.level_sizes:
-            pool_k = tps // s
-            pooled = F.avg_pool2d(feat, kernel_size=pool_k) if pool_k > 1 else feat
-            pooled = pooled + self.grid_pos_embs[str(s)]        # at enc_d
-            if self._vit_out_projs is not None:
-                pooled = self._vit_out_projs[str(s)](pooled)    # enc_d → dim
-            level_features[s] = pooled
+        if self._vit_global_pool_type == 'attn':
+            pooled_by_s = self.attn_pool(feat)
+            for s in self.level_sizes:
+                pooled = pooled_by_s[s]
+                if self._vit_out_projs is not None:
+                    pooled = self._vit_out_projs[str(s)](pooled)
+                level_features[s] = pooled
+        else:
+            for s in self.level_sizes:
+                pool_k = tps // s
+                pooled = F.avg_pool2d(feat, kernel_size=pool_k) if pool_k > 1 else feat
+                pooled = pooled + self.grid_pos_embs[str(s)]    # at enc_d
+                if self._vit_out_projs is not None:
+                    pooled = self._vit_out_projs[str(s)](pooled)
+                level_features[s] = pooled
 
         return level_features
 
@@ -1320,11 +1565,12 @@ class HierarchicalMultiResEncoder(nn.Module):
             cells = cells.permute(0, 2, 3, 1, 4, 5).contiguous()
             cells = cells.view(B * s * s, C, cell_h, cell_w)
 
-        eff_p, key = self._level_vit_info[s]
+        eff_p, key, _tps, use_stem_here = self._level_vit_info[s]
         mae_ratio = self.mae_mask_ratio if self.training else 0.0
 
         feat = self.cell_vit(
             cells, level_key=key, vit_patch_size=eff_p,
+            use_stem=use_stem_here,
             mae_mask_ratio=mae_ratio,
         )  # (B*s*s, enc_dim) or (B, enc_dim) if s==1
 

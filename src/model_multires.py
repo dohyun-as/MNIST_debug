@@ -143,6 +143,8 @@ class MultiResConditionalUNet(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_use_cnn_stem: bool = True,
         vit_cnn_stem_reduction: int = 4,
+        vit_small_cell_tps: int = 2,
+        vit_default_tps: int | None = None,
         encoder_internal_dim: int | None = None,
         # --- Swin encoder ---
         swin_patch_size: int = 16,
@@ -154,6 +156,10 @@ class MultiResConditionalUNet(nn.Module):
         # --- CLIP init (vit_global only) ---
         vit_init_clip: bool = False,
         clip_model_name: str = "openai/clip-vit-base-patch16",
+        # --- vit_global pool backend ---
+        vit_global_pool_type: str = 'avg',
+        vit_global_pool_mlp_ratio: float = 4.0,
+        vit_global_pool_use_ffn: bool = True,
         # --- Discretization ---
         use_fsq: bool = False,
         fsq_levels: list[int] | None = None,
@@ -210,6 +216,8 @@ class MultiResConditionalUNet(nn.Module):
             vit_mlp_ratio=vit_mlp_ratio,
             vit_use_cnn_stem=vit_use_cnn_stem,
             vit_cnn_stem_reduction=vit_cnn_stem_reduction,
+            vit_small_cell_tps=vit_small_cell_tps,
+            vit_default_tps=vit_default_tps,
             encoder_internal_dim=encoder_internal_dim,
             swin_patch_size=swin_patch_size,
             swin_embed_dim=swin_embed_dim,
@@ -220,6 +228,9 @@ class MultiResConditionalUNet(nn.Module):
             level_sizes=level_sizes,
             vit_init_clip=vit_init_clip,
             clip_model_name=clip_model_name,
+            vit_global_pool_type=vit_global_pool_type,
+            vit_global_pool_mlp_ratio=vit_global_pool_mlp_ratio,
+            vit_global_pool_use_ffn=vit_global_pool_use_ffn,
         )
 
         # ── Discretizer (optional) ──
@@ -992,6 +1003,8 @@ class MultiResConditionalDiT(nn.Module):
         vit_mlp_ratio: float = 4.0,
         vit_use_cnn_stem: bool = True,
         vit_cnn_stem_reduction: int = 4,
+        vit_small_cell_tps: int = 2,
+        vit_default_tps: int | None = None,
         encoder_internal_dim: int | None = None,
         # --- Swin encoder ---
         swin_patch_size: int = 16,
@@ -1003,6 +1016,10 @@ class MultiResConditionalDiT(nn.Module):
         # --- CLIP init (vit_global only) ---
         vit_init_clip: bool = False,
         clip_model_name: str = "openai/clip-vit-base-patch16",
+        # --- vit_global pool backend ---
+        vit_global_pool_type: str = 'avg',
+        vit_global_pool_mlp_ratio: float = 4.0,
+        vit_global_pool_use_ffn: bool = True,
         # --- Discretization ---
         use_fsq: bool = False,
         fsq_levels: list[int] | None = None,
@@ -1079,6 +1096,8 @@ class MultiResConditionalDiT(nn.Module):
             vit_mlp_ratio=vit_mlp_ratio,
             vit_use_cnn_stem=vit_use_cnn_stem,
             vit_cnn_stem_reduction=vit_cnn_stem_reduction,
+            vit_small_cell_tps=vit_small_cell_tps,
+            vit_default_tps=vit_default_tps,
             encoder_internal_dim=encoder_internal_dim,
             swin_patch_size=swin_patch_size,
             swin_embed_dim=swin_embed_dim,
@@ -1089,6 +1108,9 @@ class MultiResConditionalDiT(nn.Module):
             level_sizes=level_sizes,
             vit_init_clip=vit_init_clip,
             clip_model_name=clip_model_name,
+            vit_global_pool_type=vit_global_pool_type,
+            vit_global_pool_mlp_ratio=vit_global_pool_mlp_ratio,
+            vit_global_pool_use_ffn=vit_global_pool_use_ffn,
         )
 
         # ── Discretizer (identical to UNet version) ──

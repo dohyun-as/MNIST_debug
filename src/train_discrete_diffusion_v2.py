@@ -44,7 +44,7 @@ import math
 import os
 import shutil
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -1111,11 +1111,13 @@ class CLEVRImageDataset(Dataset):
                    language captions).
     """
     def __init__(self, image_root, condition_dir=None, image_size=256,
-                 splits=("easy", "medium", "hard"), cond_type="json"):
+                 splits=("easy", "medium", "hard"), cond_type="json",
+                 max_per_split=None):
         self.image_paths = []
         self.labels = []
         self.conditions = []
         self.cond_type = cond_type
+        self.max_per_split = max_per_split
         self.transform = transforms.Compose([
             transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(image_size),
@@ -1137,9 +1139,12 @@ class CLEVRImageDataset(Dataset):
             split_dir = os.path.join(image_root, split)
             if not os.path.isdir(split_dir):
                 continue
-            for fn in sorted(os.listdir(split_dir)):
-                if not fn.lower().endswith((".png", ".jpg", ".jpeg")):
-                    continue
+            files = sorted(
+                fn for fn in os.listdir(split_dir)
+                if fn.lower().endswith((".png", ".jpg", ".jpeg")))
+            if max_per_split is not None and max_per_split > 0:
+                files = files[:max_per_split]
+            for fn in files:
                 img_path = os.path.join(split_dir, fn)
                 conds = cond_map.get(fn, [{}])
                 for cond in conds:
@@ -1169,32 +1174,36 @@ class CLEVRImageDataset(Dataset):
     def _load_text_conditions(self, condition_dir, splits, cond_map):
         """Load text caption conditions.
 
-        Supports two formats:
-          1. Combined: captions_{split}.json — list of {image_filename, split, captions}
-          2. Per-file: {split}/CLEVR_*.json — {image_filename, split, captions}
+        Supports three formats (auto-detected by per-caption structure):
+          1. Combined plain: captions_{split}.json — list of
+             {image_filename, split, captions: [str, ...]}
+          2. Per-file plain: {split}/CLEVR_*.json —
+             {image_filename, split, captions: [str, ...]}
+          3. Styled (coverage-complete families) per-file:
+             {split}/CLEVR_*.json — {image_filename, split, gt,
+              captions: [{family, variant, text, exposed}, ...]}
 
-        If only per-file JSONs exist, automatically builds and saves a combined
-        captions_{split}.json so subsequent runs load instantly.
-
-        Each caption becomes a separate dataset entry, stored as a dict with
-        "text", "image_filename", "split" keys (so eval can recover split info).
+        For plain captions, each caption becomes one entry with
+        {"text", "image_filename", "split"}.
+        For styled captions, each entry additionally carries
+        {"family", "variant", "exposed", "gt"} so eval can score against
+        the exposed mask.
         """
         for split in splits:
             combined = os.path.join(condition_dir, f"captions_{split}.json")
             if os.path.isfile(combined):
-                # Fast path: load combined JSON
                 print(f"[data] Loading combined captions: {combined}")
                 with open(combined) as f:
                     items = json.load(f)
             else:
-                # Slow path: read per-file JSONs, then save combined for next time
                 per_file_dir = os.path.join(condition_dir, split)
                 if not os.path.isdir(per_file_dir):
                     continue
                 files = sorted(fn for fn in os.listdir(per_file_dir) if fn.endswith(".json"))
                 print(f"[data] Building combined captions from {len(files)} per-file JSONs ({split})...")
                 from collections import defaultdict as _dd
-                per_image = _dd(lambda: {"image_filename": "", "split": split, "captions": []})
+                per_image = _dd(lambda: {"image_filename": "", "split": split,
+                                          "captions": [], "gt": None})
                 for fn in files:
                     fpath = os.path.join(per_file_dir, fn)
                     with open(fpath) as f:
@@ -1204,9 +1213,10 @@ class CLEVRImageDataset(Dataset):
                     entry = per_image[img_fn]
                     entry["image_filename"] = img_fn
                     entry["split"] = sp
+                    if data.get("gt") is not None:
+                        entry["gt"] = data["gt"]
                     entry["captions"].extend(data.get("captions", []))
                 items = list(per_image.values())
-                # Save combined JSON for future runs
                 try:
                     with open(combined, "w") as f:
                         json.dump(items, f)
@@ -1217,9 +1227,25 @@ class CLEVRImageDataset(Dataset):
             for item in items:
                 img_fn = item.get("image_filename", "")
                 sp = item.get("split", split)
+                gt = item.get("gt")
                 for cap in item.get("captions", []):
-                    cond_map[img_fn].append({
-                        "text": cap, "image_filename": img_fn, "split": sp})
+                    if isinstance(cap, str):
+                        cond_map[img_fn].append({
+                            "text": cap,
+                            "image_filename": img_fn,
+                            "split": sp,
+                        })
+                    elif isinstance(cap, dict):
+                        # Styled caption: preserve family/variant/exposed + gt.
+                        cond_map[img_fn].append({
+                            "text": cap.get("text", ""),
+                            "image_filename": img_fn,
+                            "split": sp,
+                            "family": cap.get("family"),
+                            "variant": cap.get("variant"),
+                            "exposed": cap.get("exposed"),
+                            "gt": gt,
+                        })
 
     def __len__(self):
         return len(self.image_paths)
@@ -3150,53 +3176,83 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
         print(f"[eval/debug] rank={rank} [{tag}] decode: {_t2-_t1:.1f}s", flush=True)
 
         # ── 3. Each rank runs condition eval on its own shard ──
-        my_eval_per_split = {}  # split -> {count_correct, entity_found, ...}
+        # Two eval pipelines are supported (auto-detected by caption shape):
+        #   - Plain text caption (legacy): parse text → condition JSON →
+        #     `eval_clevr_conditions` → (count, entity_presence, rel) per split.
+        #   - Styled caption (coverage-complete families): caption record
+        #     already carries an `exposed` mask → `eval_clevr_complex_text`
+        #     → per-family metrics, also bucketed per split.
+        my_eval_per_split = {}        # legacy aggregator (per split)
+        my_eval_per_split_fam = {}    # styled aggregator: split -> family -> dict
+        is_styled_eval = bool(my_cond_jsons) and isinstance(my_cond_jsons[0], dict) \
+            and my_cond_jsons[0].get("exposed") is not None
         can_eval_cond = has_eval_models
         if can_eval_cond and my_images is not None and my_n > 0:
             try:
                 from eval_clevr_condition import (
-                    eval_clevr_conditions, clevr_text_to_condition_json)
-                # For text conditions, parse captions to structured JSON for eval
-                eval_cond_jsons = my_cond_jsons
-                if args.clevr_cond_type == "text":
-                    def _to_eval_json(c):
-                        if isinstance(c, str):
-                            return clevr_text_to_condition_json(c)
-                        if isinstance(c, dict) and "text" in c:
-                            return clevr_text_to_condition_json(c["text"])
-                        return c
-                    eval_cond_jsons = [_to_eval_json(c) for c in my_cond_jsons]
-                # `decode_*_tokens_to_images` returns images in [-1, 1], but
-                # `eval_clevr_conditions` (and the underlying detector +
-                # classifier) expect them in [0, 1]. Rescale before eval —
-                # otherwise the detector input is normalized to roughly
-                # [-3, 1] and presence/relation scores collapse, even though
-                # the saved grid PNG looks fine (the grid-saver does its own
-                # 0.5+0.5 rescale).
+                    eval_clevr_conditions, eval_clevr_complex_text,
+                    clevr_text_to_condition_json)
+                # See note below on rescale: detector expects [0, 1].
                 my_images_eval = (my_images * 0.5 + 0.5).clamp(0, 1)
-                # Run eval on this rank's shard
-                my_eval = eval_clevr_conditions(
-                    my_images_eval, eval_cond_jsons,
-                    clevr_detector, clevr_classifier,
-                )
-                # Split results by difficulty
-                per_sample = my_eval["per_sample"]
-                for local_i, sp in enumerate(my_splits):
-                    if sp not in my_eval_per_split:
-                        my_eval_per_split[sp] = {
-                            "n": 0, "count_correct": 0,
-                            "entity_found": 0, "entity_total": 0,
+
+                if is_styled_eval:
+                    my_eval = eval_clevr_complex_text(
+                        my_images_eval, my_cond_jsons,
+                        clevr_detector, clevr_classifier,
+                    )
+                    per_sample = my_eval["per_sample"]
+                    for local_i, sp in enumerate(my_splits):
+                        fam = per_sample[local_i].get("family", "?")
+                        slot = my_eval_per_split_fam.setdefault(sp, {})
+                        d = slot.setdefault(fam, {
+                            "n": 0,
+                            "count_n": 0, "count_correct": 0,
+                            "entity_groups_found": 0, "entity_groups_total": 0,
                             "rel_correct": 0, "rel_total": 0,
-                        }
-                    d = my_eval_per_split[sp]
-                    r = per_sample[local_i]
-                    d["n"] += 1
-                    if r["count_correct"]:
-                        d["count_correct"] += 1
-                    d["entity_found"] += r["entity_found"]
-                    d["entity_total"] += r["entity_total"]
-                    d["rel_correct"] += r["rel_correct"]
-                    d["rel_total"] += r["rel_total"]
+                        })
+                        r = per_sample[local_i]
+                        d["n"] += 1
+                        if "count_correct" in r:
+                            d["count_n"] += 1
+                            d["count_correct"] += r["count_correct"]
+                        if "entity_groups_total" in r:
+                            d["entity_groups_found"] += r["entity_groups_found"]
+                            d["entity_groups_total"] += r["entity_groups_total"]
+                        if "rel_total" in r:
+                            d["rel_correct"] += r["rel_correct"]
+                            d["rel_total"] += r["rel_total"]
+                else:
+                    # Legacy: parse text → entity/relation JSON for scoring.
+                    eval_cond_jsons = my_cond_jsons
+                    if args.clevr_cond_type == "text":
+                        def _to_eval_json(c):
+                            if isinstance(c, str):
+                                return clevr_text_to_condition_json(c)
+                            if isinstance(c, dict) and "text" in c:
+                                return clevr_text_to_condition_json(c["text"])
+                            return c
+                        eval_cond_jsons = [_to_eval_json(c) for c in my_cond_jsons]
+                    my_eval = eval_clevr_conditions(
+                        my_images_eval, eval_cond_jsons,
+                        clevr_detector, clevr_classifier,
+                    )
+                    per_sample = my_eval["per_sample"]
+                    for local_i, sp in enumerate(my_splits):
+                        if sp not in my_eval_per_split:
+                            my_eval_per_split[sp] = {
+                                "n": 0, "count_correct": 0,
+                                "entity_found": 0, "entity_total": 0,
+                                "rel_correct": 0, "rel_total": 0,
+                            }
+                        d = my_eval_per_split[sp]
+                        r = per_sample[local_i]
+                        d["n"] += 1
+                        if r["count_correct"]:
+                            d["count_correct"] += 1
+                        d["entity_found"] += r["entity_found"]
+                        d["entity_total"] += r["entity_total"]
+                        d["rel_correct"] += r["rel_correct"]
+                        d["rel_total"] += r["rel_total"]
             except Exception as e:
                 accelerator.print(
                     f"[{log_prefix}/clevr] [{tag}] rank {rank} cond eval failed: {e}")
@@ -3208,22 +3264,44 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
               f"{_t3-_t0:.1f}s", flush=True)
 
         # ── 4. All-reduce eval counts across ranks ──
+        FAM_LIST = ["C", "E", "R", "C+E", "C+R", "E+R"]
+        STYLED_N_VALS = 7  # n, count_n, count_correct,
+                           # entity_groups_found, entity_groups_total,
+                           # rel_correct, rel_total
         if can_eval_cond:
-            # Build a flat tensor of counts: for each split, pack the scalars
-            # Order: n, count_correct, entity_found, entity_total,
-            #        rel_correct, rel_total  = 6 values per split
-            n_vals = 6
-            counts = torch.zeros(len(split_names) * n_vals, device=device)
-            for si, sp in enumerate(split_names):
-                if sp in my_eval_per_split:
-                    d = my_eval_per_split[sp]
-                    off = si * n_vals
-                    counts[off + 0] = d["n"]
-                    counts[off + 1] = d["count_correct"]
-                    counts[off + 2] = d["entity_found"]
-                    counts[off + 3] = d["entity_total"]
-                    counts[off + 4] = d["rel_correct"]
-                    counts[off + 5] = d["rel_total"]
+            if is_styled_eval:
+                counts = torch.zeros(
+                    len(split_names) * len(FAM_LIST) * STYLED_N_VALS,
+                    device=device)
+                for si, sp in enumerate(split_names):
+                    fam_slot = my_eval_per_split_fam.get(sp, {})
+                    for fi, fam in enumerate(FAM_LIST):
+                        if fam in fam_slot:
+                            d = fam_slot[fam]
+                            off = (si * len(FAM_LIST) + fi) * STYLED_N_VALS
+                            counts[off + 0] = d["n"]
+                            counts[off + 1] = d["count_n"]
+                            counts[off + 2] = d["count_correct"]
+                            counts[off + 3] = d["entity_groups_found"]
+                            counts[off + 4] = d["entity_groups_total"]
+                            counts[off + 5] = d["rel_correct"]
+                            counts[off + 6] = d["rel_total"]
+            else:
+                # Build a flat tensor of counts: for each split, pack the scalars
+                # Order: n, count_correct, entity_found, entity_total,
+                #        rel_correct, rel_total  = 6 values per split
+                n_vals = 6
+                counts = torch.zeros(len(split_names) * n_vals, device=device)
+                for si, sp in enumerate(split_names):
+                    if sp in my_eval_per_split:
+                        d = my_eval_per_split[sp]
+                        off = si * n_vals
+                        counts[off + 0] = d["n"]
+                        counts[off + 1] = d["count_correct"]
+                        counts[off + 2] = d["entity_found"]
+                        counts[off + 3] = d["entity_total"]
+                        counts[off + 4] = d["rel_correct"]
+                        counts[off + 5] = d["rel_total"]
 
             # all_reduce to sum across ranks
             print(f"[eval/debug] rank={rank} [{tag}] entering all_reduce", flush=True)
@@ -3280,7 +3358,81 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                 f"[{log_prefix}/clevr] step={step} [{tag}] saved → {img_path}")
 
             # ── 6. Log/save per-split + overall results (rank 0 only) ──
-            if can_eval_cond:
+            if can_eval_cond and is_styled_eval:
+                # Styled (family-aware) reporting: split × family.
+                eval_save = {"step": step, "sampler": tag,
+                             "per_split_family": {}, "overall_family": {}}
+                overall_fam: Dict[str, Dict[str, int]] = {}
+                log_dict = {}
+
+                for si, sp in enumerate(split_names):
+                    sp_block = {}
+                    for fi, fam in enumerate(FAM_LIST):
+                        off = (si * len(FAM_LIST) + fi) * STYLED_N_VALS
+                        n_sp = int(counts[off + 0].item())
+                        if n_sp == 0:
+                            continue
+                        cn = int(counts[off + 1].item())
+                        cc = int(counts[off + 2].item())
+                        ef = int(counts[off + 3].item())
+                        et = int(counts[off + 4].item())
+                        rc = int(counts[off + 5].item())
+                        rt = int(counts[off + 6].item())
+
+                        fam_result = _build_styled_eval_result(n_sp, cn, cc, ef, et, rc, rt)
+                        sp_block[fam] = fam_result
+                        accelerator.print(
+                            f"[{log_prefix}/clevr] step={step} [{tag}] "
+                            f"split={sp} fam={fam}: "
+                            f"{_format_styled_result(fam_result)}")
+
+                        # accumulate overall_family
+                        agg = overall_fam.setdefault(fam, {
+                            "n": 0, "count_n": 0, "count_correct": 0,
+                            "ef": 0, "et": 0, "rc": 0, "rt": 0})
+                        agg["n"] += n_sp; agg["count_n"] += cn
+                        agg["count_correct"] += cc
+                        agg["ef"] += ef; agg["et"] += et
+                        agg["rc"] += rc; agg["rt"] += rt
+
+                        if args.log_with:
+                            pfx = f"{log_prefix}/{tag}/{sp}/{fam}"
+                            if "count_accuracy" in fam_result:
+                                log_dict[f"{pfx}/count_acc"] = fam_result["count_accuracy"]
+                            if "entity_inv_accuracy" in fam_result:
+                                log_dict[f"{pfx}/entity_inv_acc"] = fam_result["entity_inv_accuracy"]
+                            if "rel_accuracy" in fam_result:
+                                log_dict[f"{pfx}/rel_acc"] = fam_result["rel_accuracy"]
+                    if sp_block:
+                        eval_save["per_split_family"][sp] = sp_block
+
+                for fam, agg in overall_fam.items():
+                    fam_result = _build_styled_eval_result(
+                        agg["n"], agg["count_n"], agg["count_correct"],
+                        agg["ef"], agg["et"], agg["rc"], agg["rt"])
+                    eval_save["overall_family"][fam] = fam_result
+                    accelerator.print(
+                        f"[{log_prefix}/clevr] step={step} [{tag}] "
+                        f"overall fam={fam}: "
+                        f"{_format_styled_result(fam_result)}")
+                    if args.log_with:
+                        pfx = f"{log_prefix}/{tag}/overall/{fam}"
+                        if "count_accuracy" in fam_result:
+                            log_dict[f"{pfx}/count_acc"] = fam_result["count_accuracy"]
+                        if "entity_inv_accuracy" in fam_result:
+                            log_dict[f"{pfx}/entity_inv_acc"] = fam_result["entity_inv_accuracy"]
+                        if "rel_accuracy" in fam_result:
+                            log_dict[f"{pfx}/rel_acc"] = fam_result["rel_accuracy"]
+
+                eval_path = os.path.join(
+                    save_dir,
+                    f"step_{step:07d}_clevr_{tag}_cond_eval.json")
+                with open(eval_path, "w") as f:
+                    json.dump(eval_save, f, indent=2)
+                if args.log_with and log_dict:
+                    accelerator.log(log_dict, step=step)
+
+            elif can_eval_cond:
                 overall = {"n": 0, "count_correct": 0,
                            "entity_found": 0, "entity_total": 0,
                            "rel_correct": 0, "rel_total": 0}
@@ -3305,7 +3457,6 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                         f"split={sp} ({n_sp} samples):")
                     accelerator.print(_format_split_result(sp_result))
 
-                    # Accumulate overall
                     overall["n"] += n_sp
                     overall["count_correct"] += cc
                     overall["entity_found"] += ef
@@ -3313,7 +3464,6 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                     overall["rel_correct"] += rc
                     overall["rel_total"] += rt
 
-                # Overall
                 if overall["n"] > 0:
                     overall_result = _build_eval_result(
                         overall["n"], overall["count_correct"],
@@ -3324,7 +3474,6 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                         f"overall ({overall['n']} samples):")
                     accelerator.print(_format_split_result(overall_result))
 
-                    # Save JSON with per-split breakdown
                     eval_save = {
                         "step": step, "sampler": tag,
                         "overall": overall_result,
@@ -3336,7 +3485,6 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                     with open(eval_path, "w") as f:
                         json.dump(eval_save, f, indent=2)
 
-                    # Tensorboard logging
                     if args.log_with:
                         log_dict = {}
                         for sp, sr in all_split_results.items():
@@ -3344,7 +3492,6 @@ def _eval_clevr(model, step, args, accelerator, save_dir,
                             log_dict[f"{pfx}/count_acc"] = sr["count_accuracy"]
                             log_dict[f"{pfx}/entity_presence_acc"] = sr["entity_presence_accuracy"]
                             log_dict[f"{pfx}/rel_acc"] = sr["rel_accuracy"]
-                        # Overall
                         pfx = f"{log_prefix}/{tag}/overall"
                         log_dict[f"{pfx}/count_acc"] = overall_result["count_accuracy"]
                         log_dict[f"{pfx}/entity_presence_acc"] = overall_result["entity_presence_accuracy"]
@@ -3385,6 +3532,46 @@ def _format_split_result(r):
     return "\n".join(lines)
 
 
+def _build_styled_eval_result(n, count_n, count_correct,
+                              entity_found, entity_total,
+                              rel_correct, rel_total):
+    """Result dict for a (split, family) cell of the styled-caption evaluator.
+
+    Only the metric fields applicable to the family are populated — e.g. a
+    C-family cell has `count_*` only, while an E-family cell has
+    `entity_inv_*` (and implicit count) but no relations.
+    """
+    out = {"n_samples": n}
+    if count_n > 0:
+        out["count_accuracy"] = count_correct / count_n * 100
+        out["count_correct"] = count_correct
+        out["count_n"] = count_n
+    if entity_total > 0:
+        out["entity_inv_accuracy"] = entity_found / entity_total * 100
+        out["entity_groups_found"] = entity_found
+        out["entity_groups_total"] = entity_total
+    if rel_total > 0:
+        out["rel_accuracy"] = rel_correct / rel_total * 100
+        out["rel_correct"] = rel_correct
+        out["rel_total"] = rel_total
+    return out
+
+
+def _format_styled_result(r):
+    """One-line summary for a (split, family) cell."""
+    bits = [f"n={r['n_samples']}"]
+    if "count_accuracy" in r:
+        bits.append(f"count={r['count_accuracy']:.1f}%"
+                    f" ({r['count_correct']}/{r['count_n']})")
+    if "entity_inv_accuracy" in r:
+        bits.append(f"entity_inv={r['entity_inv_accuracy']:.1f}%"
+                    f" ({r['entity_groups_found']}/{r['entity_groups_total']})")
+    if "rel_accuracy" in r:
+        bits.append(f"rel={r['rel_accuracy']:.1f}%"
+                    f" ({r['rel_correct']}/{r['rel_total']})")
+    return "  ".join(bits)
+
+
 # ────────────────────────────────────────────────────────────
 #  Args
 # ────────────────────────────────────────────────────────────
@@ -3415,6 +3602,12 @@ def parse_args():
                    help="Val condition dir (default: same as clevr_condition_dir).")
     p.add_argument("--clevr_train_splits", type=str, nargs="+",
                    default=["easy", "medium", "hard"])
+    p.add_argument("--max_train_samples_per_split", type=int, default=30000,
+                   help="Keep only the first N images (sorted by file name) "
+                        "per CLEVR train split. Default 30000 caps the train "
+                        "set at the original 30k per split regardless of how "
+                        "many extras are on disk; pass a larger N (e.g. 150000) "
+                        "to use more, or 0 to disable the cap.")
     p.add_argument("--clevr_val_splits", type=str, nargs="+",
                    default=["easy"])
     p.add_argument("--clevr_cond_type", type=str, default="json",
@@ -3788,7 +3981,8 @@ def main():
         train_img_ds = CLEVRImageDataset(
             args.dataset_root, condition_dir=args.clevr_condition_dir,
             image_size=args.image_size, splits=args.clevr_train_splits,
-            cond_type=cond_type)
+            cond_type=cond_type,
+            max_per_split=args.max_train_samples_per_split)
         val_img_ds = CLEVRImageDataset(
             val_image_root, condition_dir=val_cond_dir,
             image_size=args.image_size, splits=args.clevr_val_splits,
@@ -3798,7 +3992,8 @@ def main():
         # to avoid encoding the same image multiple times
         train_img_only = CLEVRImageDataset(
             args.dataset_root, condition_dir=None,
-            image_size=args.image_size, splits=args.clevr_train_splits)
+            image_size=args.image_size, splits=args.clevr_train_splits,
+            max_per_split=args.max_train_samples_per_split)
         val_img_only = CLEVRImageDataset(
             val_image_root, condition_dir=None,
             image_size=args.image_size, splits=args.clevr_val_splits)
@@ -3811,10 +4006,14 @@ def main():
             f"from {len(val_img_only)} unique images")
 
         cache_dir = args.token_cache_dir or os.path.join(args.output_dir, "token_cache")
+        # Train cache key depends on the per-split cap so different sample-size
+        # runs don't collide. Val cache is independent (val set never capped).
+        train_cap_tag = (f"_cap{args.max_train_samples_per_split}"
+                         if args.max_train_samples_per_split else "")
 
         if args.use_diffusion_head:
             # ── Continuous mode: extract feature vectors (no discretizer) ──
-            train_cache_path = os.path.join(cache_dir, "clevr_train_cont.pt")
+            train_cache_path = os.path.join(cache_dir, f"clevr_train{train_cap_tag}_cont.pt")
             val_cache_path = os.path.join(cache_dir, "clevr_val_cont.pt")
             train_feats_unique = cache_all_continuous_tokens(
                 encoder, train_img_only, accelerator.device,
@@ -3823,7 +4022,7 @@ def main():
                 encoder, val_img_only, accelerator.device,
                 batch_size=64, cache_path=val_cache_path, accelerator=accelerator)
         else:
-            train_cache_path = os.path.join(cache_dir, "clevr_train_tok.pt")
+            train_cache_path = os.path.join(cache_dir, f"clevr_train{train_cap_tag}_tok.pt")
             val_cache_path = os.path.join(cache_dir, "clevr_val_tok.pt")
             train_tok_unique = cache_all_tokens(
                 encoder, discretizer, train_img_only, accelerator.device,

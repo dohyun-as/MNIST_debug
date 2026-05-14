@@ -489,3 +489,310 @@ def format_eval_results(results: Dict) -> str:
     lines.append(f"  [3] Relation acc:        {results['rel_accuracy']:.1f}% "
                  f"({results['rel_correct']}/{results['rel_total']})")
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Complex-text evaluation (coverage-complete prompt families)
+#
+#  Works on the styled-caption records produced by
+#  `clevr-dataset-gen/generate_styled_captions.py`. Each caption record
+#  carries an `exposed` mask describing exactly which GT facts the caption
+#  reveals; this evaluator scores ONLY those exposed axes, so the headline
+#  metric for any family is unbiased by parts of the scene the caption never
+#  promised to convey.
+#
+#  Families and the axes they expose:
+#    C        : total count
+#    E        : entity inventory (schema-projected), implicit total count
+#    R        : relations + optional entity fallback groups
+#    C+E      : total count + partial entity inventory
+#    C+R      : total count + relations
+#    E+R      : entity inventory (remaining objects) + relations
+# ─────────────────────────────────────────────────────────────────────────
+
+from collections import Counter as _Counter
+
+
+def _find_detections_by_schema(target_attrs: Dict, schema: List[str],
+                               detected_objs: List[Dict]) -> List[int]:
+    """Detections whose `schema` attrs equal `target_attrs[schema]`.
+
+    Unlike `_find_matching_detections`, this only compares attrs explicitly
+    listed in `schema` — necessary when the caption exposed a strict subset
+    of attributes (e.g. `{color, shape}`) and we must allow detections with
+    any `size` / `material`.
+    """
+    if not schema:
+        return list(range(len(detected_objs)))
+    out = []
+    for di, det in enumerate(detected_objs):
+        if all(det.get(a) == target_attrs.get(a) for a in schema):
+            out.append(di)
+    return out
+
+
+def _score_entity_groups(detected_objs: List[Dict],
+                         entity_groups: List[Dict],
+                         schema: List[str]) -> Tuple[int, int, List[Dict]]:
+    """Multiset score over schema-projected (signature, count) groups.
+
+    Returns:
+        groups_found_full: how many groups had count_required ≤ count_in_image
+        groups_total: len(entity_groups)
+        per_group_details: list of {signature, required, observed, found}
+    """
+    # detections multiset by schema-projected signature
+    det_counter = _Counter(
+        tuple(det.get(a) for a in schema) for det in detected_objs
+    )
+    found = 0
+    details = []
+    for g in entity_groups:
+        sig_tuple = tuple(g["signature"].get(a) for a in schema)
+        required = g["count"]
+        observed = det_counter.get(sig_tuple, 0)
+        ok = observed >= required
+        if ok:
+            found += 1
+        details.append({
+            "signature": g["signature"],
+            "required": required,
+            "observed": observed,
+            "found": ok,
+        })
+    return found, len(entity_groups), details
+
+
+def _score_relations(detected_objs: List[Dict],
+                     exposed_relations: List[Dict],
+                     relation_margin: float = RELATION_MARGIN) -> Tuple[int, int, List[Dict]]:
+    """Relations whose subj/obj candidates exist and satisfy the spatial check.
+
+    `exposed_relations` entries follow generate_styled_captions.py:
+        {"subj": <gt_name>, "rel": <rel_key>,
+         "obj":  <gt_name>, "subj_ref": [attrs...], "obj_ref": [attrs...]}
+
+    The subj/obj reference attributes (a subset of {size,color,material,shape})
+    determine which detections are valid candidates. Pairs satisfying the
+    spatial relation are counted (any-pair, like the legacy evaluator).
+    """
+    correct = 0
+    details = []
+    for rel in exposed_relations:
+        subj_ref = rel.get("subj_ref", ["color", "shape"])
+        obj_ref = rel.get("obj_ref", ["color", "shape"])
+        subj_attrs = rel.get("subj_attrs") or rel.get("subj") or {}
+        obj_attrs = rel.get("obj_attrs") or rel.get("obj") or {}
+        # If only GT names are stored, look up via gt_entities (caller-injected).
+        subj_candidates = _find_detections_by_schema(subj_attrs, subj_ref, detected_objs)
+        obj_candidates = _find_detections_by_schema(obj_attrs, obj_ref, detected_objs)
+        if not subj_candidates or not obj_candidates:
+            details.append({**rel, "correct": False, "reason": "object_not_found"})
+            continue
+        ok = False
+        for si in subj_candidates:
+            for oi in obj_candidates:
+                if si == oi:
+                    continue
+                if check_relation(detected_objs[si]["center"],
+                                  detected_objs[oi]["center"],
+                                  rel["rel"], margin=relation_margin):
+                    ok = True
+                    break
+            if ok:
+                break
+        if ok:
+            correct += 1
+        details.append({**rel, "correct": ok})
+    return correct, len(exposed_relations), details
+
+
+def _resolve_relation_attrs(exposed_relations: List[Dict],
+                            gt_entities: List[Dict]) -> List[Dict]:
+    """Inline subj/obj GT attrs into each relation record.
+
+    The generator stores `subj`/`obj` as GT entity names (e.g. "A"). For
+    scoring we need the actual attribute values; this helper looks them up
+    and writes them into `subj_attrs` / `obj_attrs`.
+    """
+    by_name = {e["name"]: e["attrs"] for e in gt_entities}
+    out = []
+    for rel in exposed_relations:
+        rel = dict(rel)
+        if isinstance(rel.get("subj"), str):
+            rel["subj_attrs"] = by_name.get(rel["subj"], {})
+        if isinstance(rel.get("obj"), str):
+            rel["obj_attrs"] = by_name.get(rel["obj"], {})
+        out.append(rel)
+    return out
+
+
+def evaluate_complex_text_alignment(
+    detected_objs: List[Dict],
+    caption_record: Dict,
+    relation_margin: float = RELATION_MARGIN,
+) -> Dict:
+    """Score one image against one styled-caption record (exposed-aware).
+
+    Args:
+        detected_objs: detector+classifier output for the generated image.
+        caption_record: dict with keys {family, variant, text, exposed,
+                                        gt(optional)}. `gt` provides entity
+                        attrs needed to resolve relation references.
+
+    Returns: dict with `family` and only the metric fields applicable to
+    that family (others omitted):
+        count_correct, count_pred, count_gt
+        entity_groups_found, entity_groups_total, entity_details
+        rel_correct, rel_total, rel_details
+    """
+    exposed = caption_record.get("exposed", {})
+    family = caption_record.get("family", "?")
+    gt_entities = caption_record.get("gt", {}).get("entities", [])
+
+    out: Dict = {"family": family}
+    n_det = len(detected_objs)
+
+    # ── count ──
+    count_info = exposed.get("count") or {}
+    ctype = count_info.get("type")
+    if ctype in ("total", "implicit_total"):
+        gt_count = int(count_info.get("value", 0))
+        out["count_pred"] = n_det
+        out["count_gt"] = gt_count
+        out["count_correct"] = int(n_det == gt_count)
+
+    # ── entity inventory ──
+    schema = exposed.get("entity_schema")
+    groups = exposed.get("entity_groups") or []
+    if schema and groups:
+        f, t, det = _score_entity_groups(detected_objs, groups, schema)
+        out["entity_groups_found"] = f
+        out["entity_groups_total"] = t
+        out["entity_details"] = det
+
+    # ── relations ──
+    rels = exposed.get("relations") or []
+    if rels:
+        rels_resolved = _resolve_relation_attrs(rels, gt_entities)
+        c, t, det = _score_relations(detected_objs, rels_resolved,
+                                     relation_margin=relation_margin)
+        out["rel_correct"] = c
+        out["rel_total"] = t
+        out["rel_details"] = det
+
+    return out
+
+
+@torch.no_grad()
+def eval_clevr_complex_text(
+    images: torch.Tensor,
+    caption_records: List[Dict],
+    detector: torch.nn.Module,
+    classifier: torch.nn.Module,
+    det_threshold: float = 0.3,
+    relation_margin: float = RELATION_MARGIN,
+) -> Dict:
+    """Batch evaluation against styled-caption records.
+
+    Args:
+        images: (B, 3, H, W) tensor in [0, 1].
+        caption_records: list of B caption-record dicts (see
+            generate_styled_captions.py output). Each must carry `family`,
+            `exposed`, and (for R/C+R/E+R) `gt.entities`.
+
+    Returns:
+        {
+            "n_samples": B,
+            "per_sample": [...],  # per-image dicts
+            # aggregates keyed by family ("C","E","R","C+E","C+R","E+R","overall"):
+            "by_family": {
+               family: {
+                  "n_samples": int,
+                  "count_accuracy", "count_correct",
+                  "entity_inv_accuracy", "entity_groups_found", "entity_groups_total",
+                  "rel_accuracy", "rel_correct", "rel_total",
+               }
+            }
+        }
+    """
+    B = images.shape[0]
+    assert len(caption_records) == B
+
+    detected_all = detect_and_classify(images, detector, classifier,
+                                       det_threshold=det_threshold)
+
+    per_sample = []
+    agg: Dict[str, Dict[str, int]] = {}
+
+    def _bump(family: str, r: Dict) -> None:
+        slot = agg.setdefault(family, {
+            "n_samples": 0,
+            "count_has": 0, "count_correct": 0,
+            "entity_groups_found": 0, "entity_groups_total": 0,
+            "rel_correct": 0, "rel_total": 0,
+        })
+        slot["n_samples"] += 1
+        if "count_correct" in r:
+            slot["count_has"] += 1
+            slot["count_correct"] += r["count_correct"]
+        if "entity_groups_total" in r:
+            slot["entity_groups_found"] += r["entity_groups_found"]
+            slot["entity_groups_total"] += r["entity_groups_total"]
+        if "rel_total" in r:
+            slot["rel_correct"] += r["rel_correct"]
+            slot["rel_total"] += r["rel_total"]
+
+    for b in range(B):
+        r = evaluate_complex_text_alignment(
+            detected_all[b], caption_records[b],
+            relation_margin=relation_margin)
+        per_sample.append(r)
+        _bump(r["family"], r)
+        _bump("overall", r)
+
+    by_family = {}
+    for fam, slot in agg.items():
+        out = {"n_samples": slot["n_samples"]}
+        if slot["count_has"]:
+            out["count_accuracy"] = slot["count_correct"] / slot["count_has"] * 100
+            out["count_correct"] = slot["count_correct"]
+            out["count_n"] = slot["count_has"]
+        if slot["entity_groups_total"]:
+            out["entity_inv_accuracy"] = (slot["entity_groups_found"]
+                                          / slot["entity_groups_total"] * 100)
+            out["entity_groups_found"] = slot["entity_groups_found"]
+            out["entity_groups_total"] = slot["entity_groups_total"]
+        if slot["rel_total"]:
+            out["rel_accuracy"] = slot["rel_correct"] / slot["rel_total"] * 100
+            out["rel_correct"] = slot["rel_correct"]
+            out["rel_total"] = slot["rel_total"]
+        by_family[fam] = out
+
+    return {
+        "n_samples": B,
+        "per_sample": per_sample,
+        "by_family": by_family,
+    }
+
+
+def format_complex_text_results(results: Dict) -> str:
+    """Pretty-print eval_clevr_complex_text output."""
+    lines = [f"  Samples: {results['n_samples']}"]
+    fams = ["C", "E", "R", "C+E", "C+R", "E+R", "overall"]
+    for fam in fams:
+        if fam not in results["by_family"]:
+            continue
+        d = results["by_family"][fam]
+        bits = [f"n={d['n_samples']}"]
+        if "count_accuracy" in d:
+            bits.append(f"count={d['count_accuracy']:.1f}%"
+                        f" ({d['count_correct']}/{d['count_n']})")
+        if "entity_inv_accuracy" in d:
+            bits.append(f"entity_inv={d['entity_inv_accuracy']:.1f}%"
+                        f" ({d['entity_groups_found']}/{d['entity_groups_total']})")
+        if "rel_accuracy" in d:
+            bits.append(f"rel={d['rel_accuracy']:.1f}%"
+                        f" ({d['rel_correct']}/{d['rel_total']})")
+        lines.append(f"    [{fam:7}] {'  '.join(bits)}")
+    return "\n".join(lines)

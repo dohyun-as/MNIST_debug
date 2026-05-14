@@ -139,6 +139,18 @@ def parse_args():
                    help="Disable CNN stem")
     p.add_argument("--vit_cnn_stem_reduction", type=int, default=4,
                    help="CNN stem spatial reduction factor")
+    p.add_argument("--vit_small_cell_tps", type=int, default=2,
+                   help="tokens_per_side for cells smaller than "
+                        "stem_reduction × default_tokens_per_side. Stem "
+                        "is auto-disabled for those small-cell levels. "
+                        "Set to 2 for cheap 16×16 finest level (4 tokens/cell), "
+                        "or 4 for slightly heavier (16 tokens/cell).")
+    p.add_argument("--vit_default_tps", type=int, default=None,
+                   help="Explicit tokens_per_side for 'normal' (stemmed) "
+                        "levels. If unset, defaults to min_patch_size // "
+                        "vit_patch_size. Use this when min_patch_size is "
+                        "small (e.g. 16) but you want coarser levels to keep "
+                        "tps=8 — set --vit_default_tps 8.")
 
     # --- CLIP init for vit_global ---
     p.add_argument("--vit_init_clip", action="store_true", default=False,
@@ -148,6 +160,19 @@ def parse_args():
     p.add_argument("--clip_model_name", type=str,
                    default="openai/clip-vit-base-patch16",
                    help="HuggingFace CLIP model to load weights from")
+
+    # --- vit_global pool backend ---
+    p.add_argument("--vit_global_pool_type", type=str, default="avg",
+                   choices=["avg", "attn"],
+                   help="vit_global downsampling: 'avg' (fixed avg_pool + "
+                        "per-level grid_pos_emb, ~0 trainable per-level capacity) "
+                        "or 'attn' (per-level learnable queries cross-attend to "
+                        "global features; Q/O/FFN are per-level)")
+    p.add_argument("--vit_global_pool_mlp_ratio", type=float, default=4.0,
+                   help="FFN expansion ratio for attn pool (when pool_type=attn)")
+    p.add_argument("--vit_global_pool_no_ffn", action="store_true", default=False,
+                   help="Disable per-level FFN in attn pool (attn only). "
+                        "Reduces per-level capacity ~5× but cheaper.")
 
     p.add_argument("--encoder_internal_dim", type=int, default=None,
                    help="Encoder internal dim (ViT hidden dim). If set, encoder runs at this dim "
@@ -287,6 +312,12 @@ def parse_args():
                    help="ODE solver for flow matching sampling")
 
     # --- training ---
+    p.add_argument("--max_train_samples_per_class", type=int, default=30000,
+                   help="Keep only the first N samples (sorted by file path) "
+                        "from each ImageFolder class for training. Default 30000 "
+                        "caps CLEVR splits at the original 30k regardless of how "
+                        "many extras are on disk; pass a larger N (e.g. 150000) "
+                        "to use more, or 0 to disable the cap.")
     p.add_argument("--max_train_steps", type=int, default=500000)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--blr", type=float, default=2.5e-5,
@@ -414,14 +445,45 @@ def build_datasets(args):
     return train_ds, val_ds
 
 
-def _resolve_local_cache_subdir(args, root_dir):
+def cap_samples_per_class(ds, max_n):
+    """Wrap ds in a Subset that keeps only the first max_n samples per class.
+
+    Selection is by file-path order, which for ImageFolder/MemmapImageDataset is
+    alphanumeric — so for CLEVR (filenames CLEVR_<split>_000000.png ...) this
+    deterministically picks the original 0..N-1 indices regardless of how many
+    extra images were added later.
+    """
+    if max_n is None or max_n <= 0:
+        return ds
+    samples = getattr(ds, "samples", None)
+    targets = getattr(ds, "targets", None)
+    if samples is None or targets is None:
+        raise RuntimeError(
+            f"--max_train_samples_per_class requires a dataset with .samples / "
+            f".targets (ImageFolder-like); got {type(ds).__name__}")
+    from collections import defaultdict
+    by_class = defaultdict(list)
+    for i, t in enumerate(targets):
+        by_class[int(t)].append((samples[i][0], i))
+    keep = []
+    for c, items in by_class.items():
+        items.sort(key=lambda x: x[0])  # sort by path for determinism
+        keep.extend(idx for _p, idx in items[:max_n])
+    keep.sort()
+    return torch.utils.data.Subset(ds, keep)
+
+
+def _resolve_local_cache_subdir(args, root_dir, max_per_class=None):
     base = args.local_cache_dir or "/workspace/cache"
     # Name subdir after the leaf of root_dir + image_size (so train/val don't collide).
     tag = os.path.basename(os.path.normpath(root_dir)) or "root"
+    if max_per_class:
+        tag = f"{tag}_cap{int(max_per_class)}"
     return os.path.join(base, f"{tag}_{args.image_size}")
 
 
-def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name):
+def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name,
+                             max_per_class=None):
     """Build (on main proc) or reuse a uint8 memmap cache of an ImageFolder.
 
     Layout:
@@ -429,8 +491,12 @@ def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name)
       {cache_dir}/{name}.meta.json  — num_images, image_size, labels, classes, samples
     Other ranks wait on accelerator.wait_for_everyone() until main finishes.
     Returns a dict with the meta fields + bin_path.
+
+    If max_per_class is set, only the first N samples (sorted by file path) of
+    each class are cached.
     """
     from PIL import Image
+    from collections import defaultdict
 
     os.makedirs(cache_dir, exist_ok=True)
     bin_path = os.path.join(cache_dir, f"{name}.bin")
@@ -445,7 +511,8 @@ def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name)
                 expected_bytes = meta["num_images"] * 3 * image_size * image_size
                 if (meta.get("image_size") == image_size
                         and os.path.getsize(bin_path) == expected_bytes
-                        and meta.get("root_dir") == os.path.abspath(root_dir)):
+                        and meta.get("root_dir") == os.path.abspath(root_dir)
+                        and meta.get("max_per_class") == max_per_class):
                     need_build = False
                     accelerator.print(f"[memmap-cache] Reuse {name}: {bin_path} "
                                       f"({meta['num_images']} imgs)")
@@ -455,7 +522,20 @@ def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name)
         if need_build:
             accelerator.print(f"[memmap-cache] Building {name}: {bin_path}")
             base = datasets.ImageFolder(root_dir)
-            num_images = len(base.samples)
+            base_samples = base.samples
+            if max_per_class:
+                by_class = defaultdict(list)
+                for path, label in base_samples:
+                    by_class[int(label)].append((path, int(label)))
+                kept = []
+                for c in sorted(by_class.keys()):
+                    items = sorted(by_class[c], key=lambda x: x[0])
+                    kept.extend(items[:int(max_per_class)])
+                base_samples = kept
+                accelerator.print(
+                    f"[memmap-cache] {name}: capped per class to "
+                    f"{max_per_class} -> {len(base_samples)} imgs")
+            num_images = len(base_samples)
             arr = np.memmap(bin_path, dtype=np.uint8, mode='w+',
                             shape=(num_images, 3, image_size, image_size))
             resize = transforms.Resize(
@@ -464,7 +544,7 @@ def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name)
             crop = transforms.CenterCrop(image_size)
             labels, samples = [], []
             for i, (path, label) in enumerate(
-                    tqdm(base.samples, desc=f"Preload {name}")):
+                    tqdm(base_samples, desc=f"Preload {name}")):
                 img = Image.open(path).convert("RGB")
                 img = crop(resize(img))
                 hwc = np.asarray(img, dtype=np.uint8)
@@ -484,6 +564,7 @@ def build_memmap_image_cache(root_dir, cache_dir, image_size, accelerator, name)
                 "classes": list(base.classes),
                 "samples": samples,
                 "root_dir": os.path.abspath(root_dir),
+                "max_per_class": max_per_class,
             }
             with open(meta_path, "w") as f:
                 json.dump(meta, f)
@@ -782,6 +863,8 @@ def build_model(args):
             vit_mlp_ratio=args.vit_mlp_ratio,
             vit_use_cnn_stem=args.vit_use_cnn_stem and not args.vit_no_cnn_stem,
             vit_cnn_stem_reduction=args.vit_cnn_stem_reduction,
+            vit_small_cell_tps=args.vit_small_cell_tps,
+            vit_default_tps=args.vit_default_tps,
             encoder_internal_dim=args.encoder_internal_dim,
             swin_patch_size=args.swin_patch_size,
             swin_embed_dim=args.swin_embed_dim,
@@ -791,6 +874,9 @@ def build_model(args):
             swin_mlp_ratio=args.swin_mlp_ratio,
             vit_init_clip=args.vit_init_clip,
             clip_model_name=args.clip_model_name,
+            vit_global_pool_type=args.vit_global_pool_type,
+            vit_global_pool_mlp_ratio=args.vit_global_pool_mlp_ratio,
+            vit_global_pool_use_ffn=not args.vit_global_pool_no_ffn,
             use_fsq=args.use_fsq,
             fsq_levels=args.fsq_levels,
             fsq_drop_quant_p=args.fsq_drop_quant_p,
@@ -871,8 +957,13 @@ def build_model(args):
         vit_mlp_ratio=args.vit_mlp_ratio,
         vit_use_cnn_stem=args.vit_use_cnn_stem and not args.vit_no_cnn_stem,
         vit_cnn_stem_reduction=args.vit_cnn_stem_reduction,
+        vit_small_cell_tps=args.vit_small_cell_tps,
+        vit_default_tps=args.vit_default_tps,
         vit_init_clip=args.vit_init_clip,
         clip_model_name=args.clip_model_name,
+        vit_global_pool_type=args.vit_global_pool_type,
+        vit_global_pool_mlp_ratio=args.vit_global_pool_mlp_ratio,
+        vit_global_pool_use_ffn=not args.vit_global_pool_no_ffn,
         use_fsq=args.use_fsq,
         fsq_levels=args.fsq_levels,
         fsq_drop_quant_p=args.fsq_drop_quant_p,
@@ -1858,13 +1949,21 @@ def train(args):
         accelerator.print(f"Train (cached): {len(train_ds)} per rank")
     else:
         train_img_dir = args.train_dir or os.path.join(args.dataset_root, "train")
+        cap = args.max_train_samples_per_class
         if args.cache_to_local_disk:
-            cache_sub = _resolve_local_cache_subdir(args, train_img_dir)
+            cache_sub = _resolve_local_cache_subdir(args, train_img_dir, max_per_class=cap)
             meta = build_memmap_image_cache(
-                train_img_dir, cache_sub, args.image_size, accelerator, "train")
+                train_img_dir, cache_sub, args.image_size, accelerator, "train",
+                max_per_class=cap)
             train_ds = MemmapImageDataset(meta, train=True)
         else:
             train_ds, _ = build_datasets(args)
+            if cap:
+                n_before = len(train_ds)
+                train_ds = cap_samples_per_class(train_ds, cap)
+                accelerator.print(
+                    f"Train: capped per class to {cap} "
+                    f"({n_before} -> {len(train_ds)})")
         accelerator.print(f"Train: {len(train_ds)}")
 
     # Val dataset (always raw images for FID/sampling)
@@ -1893,17 +1992,21 @@ def train(args):
     # Train dataset with val transform for sampling grid (no augmentation)
     sample_train_ds = None
     if val_dir != train_img_dir:
+        cap = args.max_train_samples_per_class
         if args.cache_to_local_disk:
             # Reuse train cache built above (or build here if train path took cache branch)
-            sample_cache_sub = _resolve_local_cache_subdir(args, train_img_dir)
+            sample_cache_sub = _resolve_local_cache_subdir(args, train_img_dir, max_per_class=cap)
             sample_meta = build_memmap_image_cache(
-                train_img_dir, sample_cache_sub, args.image_size, accelerator, "train")
+                train_img_dir, sample_cache_sub, args.image_size, accelerator, "train",
+                max_per_class=cap)
             sample_train_ds = MemmapImageDataset(sample_meta, train=False)
         else:
             sample_train_ds = datasets.ImageFolder(
                 train_img_dir,
                 transform=build_val_transform(args.image_size),
             )
+            if cap:
+                sample_train_ds = cap_samples_per_class(sample_train_ds, cap)
 
     if preload_sharded:
         # Data already split per rank → no DistributedSampler, just shuffle

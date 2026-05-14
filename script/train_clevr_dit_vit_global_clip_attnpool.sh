@@ -1,19 +1,26 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-#  CLEVR 256×256 — Multi-Resolution DiT + ViT encoder
-#  (continuous features, no FSQ) — random per-token drop on ALL levels
+#  CLEVR 256×256 — Multi-Res DiT + ViT-Global encoder (CLIP init)
+#                  + LEARNED ATTENTION POOL (no FFN)
 # ──────────────────────────────────────────────────────────────────
 #
-#  Multi-resolution feature (1×1, 2×2, 4×4, 8×8) 모두 추출하되,
-#  nested level drop은 끄고, 모든 level의 토큰을 sample 마다
-#  p~Uniform(0, cond_token_drop_prob) 확률로 random drop.
-#    - --no_level_drop                : nested level drop 비활성
-#    - --cond_token_drop_prob X       : per-sample drop ratio 상한
-#    - --cond_token_drop_all_levels   : 1×1 ~ 8×8 모든 level 에 적용
+#  Base: train_clevr_dit_vit_global_clip.sh
+#  Diff: fixed avg_pool → learnable per-level cross-attention pool.
+#
+#  Pool details (enc_d=768, levels=[8,4,2,1]):
+#    Shared : LN_kv + Wkv  (~1.18M)
+#    Per-lv : queries (s²·768) + Wq + Wo  (~1.18M each)
+#    Total pool params: ~5.98M (+6.9% over avg-pool baseline)
+#    No FFN — isolates "learned aggregation" effect from extra MLP capacity.
+#    Per-level trainable capacity: ~50K (avg) → ~1.18M (attn no-FFN), ~24×.
+#
+#  Hypothesis: coarse-level features (level 1/2) should improve the most
+#  because they currently are pure averages of fine-grid tokens; learned
+#  queries can compute task-specific global summaries instead.
 #
 #  Usage:
-#    bash script/train_clevr_dit_our_continuous_random_drop.sh
-#    GPUS=0,1 bash script/train_clevr_dit_our_continuous_random_drop.sh
+#    bash script/train_clevr_dit_vit_global_clip_attnpool.sh
+#    GPUS=0,1 bash script/train_clevr_dit_vit_global_clip_attnpool.sh
 
 set -e
 
@@ -21,21 +28,21 @@ set -e
 export CUDA_VISIBLE_DEVICES="${GPUS:-0,1,2,3}"
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
-BATCH_PER_GPU=128
-GRAD_ACCUM=2
+BATCH_PER_GPU=256
+GRAD_ACCUM=1
 
 echo "GPUs: $CUDA_VISIBLE_DEVICES ($NUM_GPUS), batch/gpu=$BATCH_PER_GPU, accum=$GRAD_ACCUM, effective=$((BATCH_PER_GPU * NUM_GPUS * GRAD_ACCUM))"
 
 # ── Data ──
-CLEVR_DIR="../clevr-dataset-gen/output/clevr_256_varied/images"
-CLEVR_VAL="../clevr-dataset-gen/output/clevr_256_varied_val/images"
+CLEVR_DIR="../clevr_output/clevr_256_varied/images"
+CLEVR_VAL="../clevr_output/clevr_256_varied_val/images"
 
 accelerate launch \
     --num_processes $NUM_GPUS \
     --multi_gpu \
     src/main_multires.py \
     --backbone dit \
-    --output_dir runs/clevr/backbone/out16_randomdrop_alllvl_multi_res \
+    --output_dir runs/clevr/backbone/vit_global_clip_out16_attnpool \
     --train_dir "$CLEVR_DIR" \
     --val_dir "$CLEVR_VAL" \
     --dataset_root "$CLEVR_DIR" \
@@ -44,10 +51,17 @@ accelerate launch \
     --vae_downsample_factor 1 \
     --min_patch_size 32 \
     --feat_channels 16 \
-    --encoder_internal_dim 256 \
-    --depth_per_level 2 \
-    --cnn_base_channels 64 \
-    --encoder_type vit \
+    --encoder_internal_dim 768 \
+    --encoder_type vit_global \
+    --vit_patch_size 16 \
+    --vit_depth 12 \
+    --vit_num_heads 12 \
+    --vit_mlp_ratio 4.0 \
+    --vit_no_cnn_stem \
+    --vit_init_clip \
+    --clip_model_name openai/clip-vit-base-patch16 \
+    --vit_global_pool_type attn \
+    --vit_global_pool_no_ffn \
     --dit_patch_size 16 \
     --dit_hidden_size 768 \
     --dit_n_heads 12 \
@@ -73,9 +87,9 @@ accelerate launch \
     --mixed_precision bf16 \
     --ema_decay 0 \
     --uncond_drop_prob 0.1 \
-    --no_level_drop \
-    --cond_token_drop_prob 1.0 \
-    --cond_token_drop_all_levels \
+    --level_drop \
+    --min_keep_levels 1 \
+    --level_drop_after_steps 10000 \
     --guidance_scale 3.0 \
     --log_every 100 \
     --save_every 10000 \
@@ -87,9 +101,3 @@ accelerate launch \
     --mae_mask_ratio 0.0 \
     --clevr_eval_every 5000 \
     --clevr_eval_samples 50 \
-    --clevr_eval_n_annotated_random 8 \
-    --clevr_eval_n_annotated_worst 16 \
-    --clevr_eval_annot_thresh 10 \
-    --cache_to_local_disk \
-    --local_cache_dir /workspace/cache \
-    # --max_train_samples_per_class 150000

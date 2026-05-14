@@ -19,13 +19,13 @@ set -e
 GPUS=${GPUS:-"0,1,2,3"}
 NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
 
-PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/clevr/backbone/256_dit_vit_flow_cont_out16_only8x8_tokdrop1.0"}
-CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied/images"}
-CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied/conditions_text"}
+PRETRAINED_DIR=${PRETRAINED_DIR:-"./runs/clevr/backbone/out16_randomdrop_alllvl_linear_multi_res"}
+CLEVR_IMAGE_ROOT=${CLEVR_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied_merged/images"}
+CLEVR_COND_DIR=${CLEVR_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied_merged/conditions_text"}
 CLEVR_VAL_IMAGE_ROOT=${CLEVR_VAL_IMAGE_ROOT:-"../clevr-dataset-gen/output/clevr_256_varied_val/images"}
 CLEVR_VAL_COND_DIR=${CLEVR_VAL_COND_DIR:-"../clevr-dataset-gen/output/clevr_256_varied_val/conditions_text"}
 # semi-AR로 돌리려면 COMMON_ARGS에 --semi_autoregressive 추가
-OUTPUT_DIR="./runs/clevr/masked_diff/ours_text_diffhead_clip_dit_vit_flow_cont_out16_only8x8_tokdrop1.0"
+OUTPUT_DIR="./runs/clevr/masked_diff/out16_randomdrop_alllvl_linear_multi_res_merged_full_data"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -45,7 +45,7 @@ COMMON_ARGS="--output_dir ${OUTPUT_DIR} \
   --clevr_val_splits easy medium hard \
   --pretrained_output_dir ${PRETRAINED_DIR} \
   --image_size 256 \
-  --max_train_steps 200000 \
+  --max_train_steps 400000 \
   --batch_size 256 \
   --lr 3e-4 \
   --weight_decay 0.0 \

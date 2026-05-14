@@ -313,6 +313,10 @@ def parse_args():
                         "kept level (not just the finest). Useful when "
                         "level_drop is disabled and you want random drop "
                         "across all multi-res levels.")
+    p.add_argument("--cond_token_drop_linear", action="store_true",
+                   default=False,
+                   help="Sample drop ratio from linear distribution f(p)=2p "
+                        "(biased toward higher masking) instead of uniform.")
     p.add_argument("--ema_decay", type=float, default=0.999,
                    help="EMA decay rate (0=disabled)")
     p.add_argument("--cond_use_latent", action="store_true", default=False,
@@ -797,6 +801,7 @@ def build_model(args):
             level_sizes=args.level_sizes,
             cond_token_drop_prob=args.cond_token_drop_prob,
             cond_token_drop_all_levels=args.cond_token_drop_all_levels,
+            cond_token_drop_linear=args.cond_token_drop_linear,
         )
 
     # ── UNet backbone (original) ──

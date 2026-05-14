@@ -1021,6 +1021,7 @@ class MultiResConditionalDiT(nn.Module):
         # --- Per-token random drop (train-only regularizer) ---
         cond_token_drop_prob: float = 0.0,
         cond_token_drop_all_levels: bool = False,
+        cond_token_drop_linear: bool = False,
     ):
         super().__init__()
 
@@ -1033,6 +1034,7 @@ class MultiResConditionalDiT(nn.Module):
         self.cond_noise_relative = cond_noise_relative
         self.cond_token_drop_prob = cond_token_drop_prob
         self.cond_token_drop_all_levels = cond_token_drop_all_levels
+        self.cond_token_drop_linear = cond_token_drop_linear
         self.level_drop = level_drop
         self.min_keep_levels = min_keep_levels
         self.level_drop_after_steps = level_drop_after_steps
@@ -1473,8 +1475,10 @@ class MultiResConditionalDiT(nn.Module):
             # keep_levels[b]=0 (fully uncond) 인 샘플은 kept level 자체가
             # 없으므로 drop 대상 없음 → 자동 skip.
             if self.training and self.cond_token_drop_prob > 0.0:
-                p_sample = (torch.rand(B, 1, device=device)
-                            * self.cond_token_drop_prob)       # (B, 1)
+                u = torch.rand(B, 1, device=device)
+                if self.cond_token_drop_linear:
+                    u = u.sqrt()                               # PDF f(p)=2p, biased toward 1
+                p_sample = u * self.cond_token_drop_prob       # (B, 1)
                 finest_kept_cf_idx = keep_levels - 1           # (B,)
                 for i, s in enumerate(self.encoder.level_sizes):
                     cf_idx = self._size_to_cf_idx[s]

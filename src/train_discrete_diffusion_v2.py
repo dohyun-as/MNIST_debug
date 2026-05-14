@@ -1173,37 +1173,53 @@ class CLEVRImageDataset(Dataset):
           1. Combined: captions_{split}.json — list of {image_filename, split, captions}
           2. Per-file: {split}/CLEVR_*.json — {image_filename, split, captions}
 
+        If only per-file JSONs exist, automatically builds and saves a combined
+        captions_{split}.json so subsequent runs load instantly.
+
         Each caption becomes a separate dataset entry, stored as a dict with
         "text", "image_filename", "split" keys (so eval can recover split info).
         """
         for split in splits:
-            # Try combined JSON first
             combined = os.path.join(condition_dir, f"captions_{split}.json")
             if os.path.isfile(combined):
+                # Fast path: load combined JSON
+                print(f"[data] Loading combined captions: {combined}")
                 with open(combined) as f:
                     items = json.load(f)
-                for item in items:
-                    img_fn = item.get("image_filename", "")
-                    sp = item.get("split", split)
-                    for cap in item.get("captions", []):
-                        cond_map[img_fn].append({
-                            "text": cap, "image_filename": img_fn, "split": sp})
             else:
-                # Fallback: per-file conditions
+                # Slow path: read per-file JSONs, then save combined for next time
                 per_file_dir = os.path.join(condition_dir, split)
                 if not os.path.isdir(per_file_dir):
                     continue
-                for fn in sorted(os.listdir(per_file_dir)):
-                    if not fn.endswith(".json"):
-                        continue
+                files = sorted(fn for fn in os.listdir(per_file_dir) if fn.endswith(".json"))
+                print(f"[data] Building combined captions from {len(files)} per-file JSONs ({split})...")
+                from collections import defaultdict as _dd
+                per_image = _dd(lambda: {"image_filename": "", "split": split, "captions": []})
+                for fn in files:
                     fpath = os.path.join(per_file_dir, fn)
                     with open(fpath) as f:
                         data = json.load(f)
                     img_fn = data.get("image_filename", "")
                     sp = data.get("split", split)
-                    for cap in data.get("captions", []):
-                        cond_map[img_fn].append({
-                            "text": cap, "image_filename": img_fn, "split": sp})
+                    entry = per_image[img_fn]
+                    entry["image_filename"] = img_fn
+                    entry["split"] = sp
+                    entry["captions"].extend(data.get("captions", []))
+                items = list(per_image.values())
+                # Save combined JSON for future runs
+                try:
+                    with open(combined, "w") as f:
+                        json.dump(items, f)
+                    print(f"[data] Saved combined captions: {combined} ({len(items)} images)")
+                except OSError as e:
+                    print(f"[data] Warning: could not save combined captions: {e}")
+
+            for item in items:
+                img_fn = item.get("image_filename", "")
+                sp = item.get("split", split)
+                for cap in item.get("captions", []):
+                    cond_map[img_fn].append({
+                        "text": cap, "image_filename": img_fn, "split": sp})
 
     def __len__(self):
         return len(self.image_paths)
